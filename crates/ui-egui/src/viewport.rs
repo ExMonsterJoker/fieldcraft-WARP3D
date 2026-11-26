@@ -97,6 +97,7 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui) {
     }
     crate::results_panel::show(app, ui, rect, &t);
     crate::path_panel::overlay(app, &painter, rect, &t);
+    crate::ffs_panel::overlay(app, &painter, rect, &t);
     axis_view(app, ui, content);
     navigation::bar(app, ui, content);
     status_toast(app, ui, content);

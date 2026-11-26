@@ -75,6 +75,7 @@ impl ModelApp {
             reactions,
             xy,
             path_editor,
+            ffs,
             reply,
             features_open,
             results_shown: shown,
@@ -159,6 +160,7 @@ impl ModelApp {
         *reactions = None;
         *xy = None;
         *path_editor = None;
+        *ffs = None;
         *reply = None;
         features_open.clear();
         // The new document's stage chose the workspace: results it opens with bring no tab.
@@ -210,6 +212,7 @@ impl UiState {
             show_timeline: _,
             history_dock: _,
             status_bar: _,
+            show_ffs,
             nav_preset: _,
             reverse_zoom: _,
             workspace: _,
@@ -219,6 +222,7 @@ impl UiState {
             menu,
         } = self;
         *menu = None;
+        *show_ffs = false;
         if let Some(tab) = tab {
             self.select_tab(tab);
         }

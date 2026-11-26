@@ -35,6 +35,7 @@ pub mod describe;
 mod document;
 pub mod elide;
 pub mod feature_graph;
+pub mod ffs_panel;
 pub mod fields;
 pub mod files;
 pub mod form;
@@ -138,6 +139,8 @@ pub struct UiState {
     /// The status bar along the window's bottom edge (Settings › General › Window; off by default,
     /// remembered per user).
     pub status_bar: bool,
+    /// The Fitness-for-Service (FFS / FAD) panel (bottom).
+    pub show_ffs: bool,
     /// The mouse navigation preset ([`navigation::NAV_PRESETS`] id; remembered per user).
     pub nav_preset: String,
     /// The wheel zooms the other way (remembered per user).
@@ -174,6 +177,7 @@ impl Default for UiState {
             show_timeline: true,
             history_dock: shell::HistoryDock::default(),
             status_bar: false,
+            show_ffs: false,
             nav_preset: navigation::DEFAULT_PRESET.into(),
             reverse_zoom: false,
             workspace: Workspace::default(),
@@ -405,6 +409,7 @@ struct CachedCrackFront {
     symmetric: Option<bool>,
     rings: Option<usize>,
     interaction_integral: Option<bool>,
+    every_step: Option<bool>,
     function_type: String,
 }
 
@@ -424,11 +429,12 @@ impl CachedCrackFront {
         let symmetric = obj.get("symmetric").and_then(Value::as_bool);
         let rings = obj.get("rings").and_then(Value::as_u64).and_then(|r| usize::try_from(r).ok()).filter(|r| (1..=20).contains(r));
         let interaction_integral = obj.get("interaction_integral").and_then(Value::as_bool);
+        let every_step = obj.get("every_step").and_then(Value::as_bool);
         let function_type = match obj.get("function_type").and_then(Value::as_str) {
             Some("front_average") => "front_average".to_string(),
             _ => "pointwise".to_string(),
         };
-        Some(Self { set, normal, symmetric, rings, interaction_integral, function_type })
+        Some(Self { set, normal, symmetric, rings, interaction_integral, every_step, function_type })
     }
 
     fn to_json(&self) -> Value {
@@ -445,6 +451,9 @@ impl CachedCrackFront {
         }
         if let Some(ii) = self.interaction_integral {
             obj.insert("interaction_integral".into(), json!(ii));
+        }
+        if let Some(es) = self.every_step {
+            obj.insert("every_step".into(), json!(es));
         }
         obj.insert("function_type".into(), json!(self.function_type));
         Value::Object(obj)
@@ -527,6 +536,8 @@ pub struct ModelApp {
     pub xy: Option<XyPlot>,
     /// Reference-coordinate path editor; numerical samples remain engine session state.
     pub path_editor: Option<path_panel::Editor>,
+    /// Container-agnostic FFS crack-front and API 579 FAD state.
+    pub(crate) ffs: Option<ffs_panel::FfsState>,
     /// The last command reply with more to it than its status line, shown in the context panel.
     pub reply: Option<reply::Reply>,
     /// The Feature Graph rows opened to their details: (body, feature id).
@@ -705,6 +716,7 @@ impl ModelApp {
             reactions: None,
             xy: None,
             path_editor: None,
+            ffs: None,
             reply: None,
             features_open: Default::default(),
             results_shown: false,
@@ -869,13 +881,26 @@ impl ModelApp {
             self.model_changed();
         }
         // The results display commands reply with what is shown, which the viewport shows.
-        let display = (id.starts_with("results.") && !matches!(id, "results.reactions" | "results.read")) || id == "solve.run";
+        let display = (id.starts_with("results.") && !matches!(id, "results.reactions" | "results.read" | "results.ffs")) || id == "solve.run";
         // The reaction sums show in the results panel, however they were asked for.
         if id == "results.reactions"
             && let Ok(v) = &r
         {
             self.reactions = Some(v.clone());
             self.shown_units = self.session.units().label();
+        }
+        if id == "results.clear" && r.is_ok() {
+            self.ffs = None;
+            self.ui.show_ffs = false;
+        }
+        if id == "results.ffs"
+            && params.get("path").is_none()
+            && let Ok(v) = &r
+            && let Some(ffs) = self.ffs.as_mut()
+            && let Ok(report) = serde_json::from_value::<fieldcraft_engine::ffs::FfsReport>(v.clone())
+        {
+            ffs.cached_report = Some(report);
+            ffs.last_error = None;
         }
         // The XY plot's series, however it was asked for; the panel opens on it.
         if id == "results.xy" && (r.is_ok() || params.get("path").is_none()) {
@@ -925,9 +950,9 @@ impl ModelApp {
             return;
         }
         // A reply reads as one line; the whole of a rich one shows in the context panel (the
-        // reaction sums have their own place in the results panel).
+        // reaction sums and FFS assessment have their own panels).
         let mut line = format!("{label}: {}", reply::summary_in(id, v, Some(self.session.units())));
-        if reply::is_rich(v) && !(id == "results.reactions" && self.plot().is_some()) {
+        if reply::is_rich(v) && !(matches!(id, "results.reactions" | "results.ffs") && self.plot().is_some()) {
             line.push_str(" (details in the panel)");
             // Kept with their units: a live reply runs again in whatever units are shown then.
             let params = self.session.params_with_units(id, params);
@@ -2712,6 +2737,7 @@ impl ModelApp {
         if self.ui.show_timeline {
             timeline::timeline(self, &mut over);
         }
+        ffs_panel::panel(self, &mut over);
         // What a docked host left of the view (none once every card floats).
         let view = over.available_rect_before_wrap();
         if self.ui.show_tree {
@@ -4711,6 +4737,16 @@ mod tests {
         app.run("warp3d.check", json!({"crack_front": {"set": "cf_old", "rings": 6, "symmetric": true}})).unwrap();
         assert_eq!(app.active_crack_front.as_ref().map(|c| c.set.as_str()), Some("cf_old"));
 
+        // `every_step` survives CachedCrackFront round-trip on WARP3D deck.write / solve forms.
+        app.active_crack_front = CachedCrackFront::from_json(&json!({
+            "set": "cf_old",
+            "rings": 6,
+            "symmetric": true,
+            "every_step": true,
+            "function_type": "pointwise"
+        }));
+        assert_eq!(app.active_crack_front.as_ref().and_then(|c| c.every_step), Some(true));
+
         app.run("model.rename", json!({"kind": "set", "from": "cf_old", "to": "cf_new"})).unwrap();
         assert_eq!(app.active_crack_front.as_ref().map(|c| c.set.as_str()), Some("cf_new"));
 
@@ -4718,6 +4754,7 @@ mod tests {
         app.open_form("warp3d.check", json!({}));
         let check_params: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();
         assert_eq!(check_params["crack_front"]["set"], "cf_new");
+        assert_eq!(check_params["crack_front"]["every_step"], true);
         assert!(check_params.get("crack_face").is_none_or(Value::is_null));
 
         app.open_form("deck.write", json!({"format": "warp3d"}));

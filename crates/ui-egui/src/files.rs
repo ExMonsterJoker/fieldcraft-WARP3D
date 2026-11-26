@@ -1578,6 +1578,7 @@ impl ModelApp {
         let what = match command {
             "results.xy" => "xy".to_string(),
             "results.path" => "path".to_string(),
+            "results.ffs" => "ffs".to_string(),
             _ => part("what"),
         };
         let name = format!("{}-{}-{what}.csv", self.model_name(), part("step"));
@@ -1668,6 +1669,7 @@ impl ModelApp {
             "solve.run" => self.solve_all(),
             "results.xy" => self.open_xy(),
             "results.path" => self.open_path_plot(),
+            "results.ffs" => self.open_ffs(),
             "deck.write" if can_save => match preset.get("format").and_then(Value::as_str) {
                 Some(f) => self.write_deck(f),
                 None => return false,
@@ -1823,14 +1825,15 @@ pub fn show(app: &mut ModelApp, ctx: &egui::Context) {
                     next.name(),
                 ),
             };
-            let (closed, action) = kit::Confirm::new(egui::Id::unique("fc_unpersisted_fracture"), "results.export.csv", "Unpersisted fracture results")
-                .tone(kit::Tone::Warning)
-                .actions("Export Fracture CSV…", "Cancel", Some("Discard & Continue"))
-                .secondary_left()
-                .show(ctx, true, |ui| {
-                    message(ui, &question);
-                    note(ui, "Discarding continues without saving these domain integrals.");
-                });
+            let (closed, action) =
+                kit::Confirm::new(egui::Id::unique("fc_unpersisted_fracture"), "results.export.csv", "Unpersisted fracture results")
+                    .tone(kit::Tone::Warning)
+                    .actions("Export Fracture CSV…", "Cancel", Some("Discard & Continue"))
+                    .secondary_left()
+                    .show(ctx, true, |ui| {
+                        message(ui, &question);
+                        note(ui, "Discarding continues without saving these domain integrals.");
+                    });
             if let Some(a) = answer(closed, action, FracturePromptAnswer::Export, FracturePromptAnswer::Discard, FracturePromptAnswer::Cancel) {
                 app.answer_unpersisted_fracture(a);
             }
@@ -3785,6 +3788,7 @@ elements
             symmetric: None,
             rings: Some(4),
             interaction_integral: None,
+            every_step: None,
             function_type: "pointwise".into(),
         });
 
@@ -3919,6 +3923,7 @@ elements
             symmetric: Some(true),
             rings: Some(5),
             interaction_integral: None,
+            every_step: None,
             function_type: "pointwise".into(),
         });
 

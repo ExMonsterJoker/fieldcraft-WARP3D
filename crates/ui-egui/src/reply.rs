@@ -111,6 +111,23 @@ pub fn summary_in(command: &str, v: &Value, units: Option<&DisplaySystem>) -> St
             Ok(f) => format!("total reaction force ({})", with_unit(components(&f, 0.0), unit(Quantity::Force, units).as_deref())),
             Err(_) => scalars(v),
         },
+        "results.ffs" => {
+            if let Some(path) = v.get("path").and_then(Value::as_str) {
+                let rows = v.get("rows").and_then(Value::as_u64).unwrap_or(0);
+                format!("wrote {} to {}", plural(rows, "row"), crate::files::file_name(path))
+            } else {
+                let step = v.get("step").and_then(Value::as_str).unwrap_or("step");
+                let stations = count("active_profiles") as u64;
+                if let Some(verdict) = v.get("fad").and_then(|f| f.get("active_verdict")).filter(|x| !x.is_null()) {
+                    let ok = if verdict["acceptable"].as_bool() == Some(true) { "acceptable" } else { "unacceptable" };
+                    let rf = verdict["reserve_factor"].as_f64().map_or_else(|| "—".to_string(), number);
+                    format!("{step}: {}, FAD {ok} (RF {rf})", plural(stations, "station"))
+                } else {
+                    let spread = v.get("max_ring_spread").and_then(Value::as_f64).map_or_else(|| "—".to_string(), |s| format!("{:.1}%", s * 100.0));
+                    format!("{step}: {}, max spread {spread}", plural(stations, "station"))
+                }
+            }
+        }
         _ => scalars(v),
     };
     if line.is_empty() { "done".into() } else { one_line(&line) }
@@ -189,6 +206,15 @@ pub fn done(command: &str, label: &str, params: &Value, v: &Value) -> String {
             let points = v.get("points").and_then(Value::as_u64).unwrap_or(0);
             let what = v.pointer("/y/label").and_then(Value::as_str).unwrap_or("the series");
             Some(format!("Plotted {what}: {}", plural(points, "point")))
+        }
+        "results.ffs" => {
+            if let Some(path) = v.get("path").and_then(Value::as_str) {
+                Some(format!("Wrote FFS report {}", crate::files::file_name(path)))
+            } else {
+                let step_name = v.get("step").and_then(Value::as_str).unwrap_or(step);
+                let stations = v.get("active_profiles").and_then(Value::as_array).map_or(0, Vec::len);
+                Some(format!("Evaluated FFS for {step_name} ({})", plural(stations as u64, "station")))
+            }
         }
         "file.sample" => {
             let label = v.get("sample").and_then(Value::as_str).and_then(fieldcraft_engine::sample::find).map(|s| s.label);
@@ -324,11 +350,9 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens) {
             "deck.read" => {
                 kit::status_line(ui, &deck_read_notice(&reply.value), kit::StatusTone::Dim);
                 if let Some(w) = reply.value.get("warnings").and_then(Value::as_array) {
-                    for x in w {
-                        ui.add(
-                            egui::Label::new(RichText::new(format!("⚠ {}", inline(x).unwrap_or_else(|| crate::context::value_text(x)))).color(t.warm))
-                                .wrap(),
-                        );
+                    for (i, x) in w.iter().enumerate() {
+                        let text = inline(x).unwrap_or_else(|| crate::context::value_text(x));
+                        kit::check_status_line(ui, &format!("fc_deck_read_warning:{i}"), &text, kit::CheckStatus::Warning);
                     }
                 }
                 let (bc_count, load_count) = if !app.session.model.boundary_conditions().is_empty() || !app.session.model.loads().is_empty() {
@@ -345,9 +369,9 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens) {
                     && (bc_count > 0 || load_count > 0)
                 {
                     let banner = if load_count > 0 {
-                        "⚠ Imported WARP3D loads are unscaled patterns; create a step and activate the loads to apply before solving."
+                        "Imported WARP3D loads are unscaled patterns; create a step and activate the loads to apply before solving."
                     } else {
-                        "⚠ Imported WARP3D boundary conditions have no active step yet; create a step before solving."
+                        "Imported WARP3D boundary conditions have no active step yet; create a step before solving."
                     };
                     ui.add_space(4.0);
                     egui::Frame::NONE
@@ -356,7 +380,7 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens) {
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .corner_radius(4.0)
                         .show(ui, |ui| {
-                            ui.add(egui::Label::new(RichText::new(banner).color(t.warm)).wrap());
+                            kit::check_status_line(ui, "fc_deck_read_warp3d_banner", banner, kit::CheckStatus::Warning);
                             ui.add_space(4.0);
                             if kit::button(ui, "Create Step…", kit::Button::Normal).clicked() {
                                 acts.push(Act::CreateWarp3dStep);
@@ -1132,27 +1156,28 @@ fn fracture_summary(ui: &mut egui::Ui, t: &Tokens, domains: &[Value], root: &Map
         .id_salt("fc_reply_solve_fracture")
         .default_open(true)
         .show(ui, |ui| {
-            egui::ScrollArea::horizontal().id_salt("fc_reply_solve_fracture_scroll").show(ui, |ui| {
-                egui::Grid::new("fc_reply_solve_fracture_grid").striped(true).spacing(vec2(10.0, 2.0)).show(ui, |ui| {
-                    for hdr in ["Domain".to_string(), "s".to_string(), fracture_unit_header("J", j_unit.as_deref()), "Spread".to_string()]
-                        .into_iter()
-                        .chain(opt_cols.iter().map(|(_, h)| h.clone()))
-                    {
-                        ui.label(RichText::new(hdr).small().color(t.text_dim));
+            let headings: Vec<String> = ["Domain".to_string(), "s".to_string(), fracture_unit_header("J", j_unit.as_deref()), "Spread".to_string()]
+                .into_iter()
+                .chain(opt_cols.iter().map(|(_, h)| h.clone()))
+                .collect();
+            let heading_refs: Vec<&str> = headings.iter().map(String::as_str).collect();
+            let rows: Vec<Vec<String>> = domains
+                .iter()
+                .take(MAX_ROWS)
+                .map(|d| {
+                    let mut row = vec![
+                        d.get("domain_id").and_then(Value::as_str).unwrap_or("—").to_string(),
+                        fracture_opt_number(d, "s_position"),
+                        fracture_opt_number(d, "j_mean"),
+                        fracture_opt_number(d, "ring_spread"),
+                    ];
+                    for (key, _) in &opt_cols {
+                        row.push(fracture_opt_number(d, key));
                     }
-                    ui.end_row();
-                    for d in domains.iter().take(MAX_ROWS) {
-                        ui.label(d.get("domain_id").and_then(Value::as_str).unwrap_or("—"));
-                        ui.label(fracture_opt_number(d, "s_position"));
-                        ui.label(fracture_opt_number(d, "j_mean"));
-                        ui.label(fracture_opt_number(d, "ring_spread"));
-                        for (key, _) in &opt_cols {
-                            ui.label(fracture_opt_number(d, key));
-                        }
-                        ui.end_row();
-                    }
-                });
-            });
+                    row
+                })
+                .collect();
+            text_table(ui, "fc_reply_solve_fracture_grid", &heading_refs, &rows);
             more(ui, t, domains.len());
             for (i, d) in domains.iter().take(MAX_ROWS).enumerate() {
                 fracture_domain_details(ui, t, i, d, j_unit.as_deref(), k_unit, p_unit.as_deref(), area_unit.as_deref());
@@ -1176,40 +1201,30 @@ fn fracture_domain_details(
         .id_salt(("fc_reply_solve_fracture_dom", idx))
         .default_open(false)
         .show(ui, |ui| {
-            egui::Grid::new(("fc_reply_solve_fracture_dom_meta", idx)).num_columns(2).spacing(vec2(10.0, 2.0)).show(ui, |ui| {
-                if let Some(nodes) = d.get("front_nodes").and_then(Value::as_array).filter(|a| !a.is_empty()) {
-                    let joined: Vec<String> = nodes.iter().filter_map(|n| n.as_u64().map(|u| u.to_string())).collect();
-                    if !joined.is_empty() {
-                        ui.label(RichText::new("Front nodes").color(t.text_dim));
-                        ui.add(egui::Label::new(joined.join(", ")).wrap());
-                        ui.end_row();
-                    }
+            if let Some(nodes) = d.get("front_nodes").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+                let joined: Vec<String> = nodes.iter().filter_map(|n| n.as_u64().map(|u| u.to_string())).collect();
+                if !joined.is_empty() {
+                    kit::row(ui, "Front nodes", |ui| kit::text(ui, &joined.join(", "), kit::Text::Cell));
                 }
-                if let Some(area) = d.get("area_aq").and_then(Value::as_f64) {
-                    ui.label(RichText::new("Area A_q").color(t.text_dim));
-                    ui.label(with_unit(number(area), area_unit));
-                    ui.end_row();
+            }
+            if let Some(area) = d.get("area_aq").and_then(Value::as_f64) {
+                kit::row(ui, "Area A_q", |ui| kit::text(ui, &with_unit(number(area), area_unit), kit::Text::Cell));
+            }
+            for (key, label) in [("normal", "Normal (x2)"), ("tangent", "Tangent (x3)"), ("advance", "Advance (x1)")] {
+                if let Some(vec_text) = d.get(key).and_then(inline) {
+                    kit::row(ui, label, |ui| kit::text(ui, &vec_text, kit::Text::Cell));
                 }
-                for (key, label) in [("normal", "Normal (x2)"), ("tangent", "Tangent (x3)"), ("advance", "Advance (x1)")] {
-                    if let Some(vec_text) = d.get(key).and_then(inline) {
-                        ui.label(RichText::new(label).color(t.text_dim));
-                        ui.label(vec_text);
-                        ui.end_row();
-                    }
+            }
+            for (key, label, u) in [
+                ("j_total", "J total", j_unit),
+                ("k_j_plane_strain", "K_J (plane strain)", k_unit),
+                ("k_j_plane_stress", "K_J (plane stress)", k_unit),
+                ("t_33_mean", "T_33", p_unit),
+            ] {
+                if let Some(val) = d.get(key).and_then(Value::as_f64) {
+                    kit::row(ui, label, |ui| kit::text(ui, &with_unit(number(val), u), kit::Text::Cell));
                 }
-                for (key, label, u) in [
-                    ("j_total", "J total", j_unit),
-                    ("k_j_plane_strain", "K_J (plane strain)", k_unit),
-                    ("k_j_plane_stress", "K_J (plane stress)", k_unit),
-                    ("t_33_mean", "T_33", p_unit),
-                ] {
-                    if let Some(val) = d.get(key).and_then(Value::as_f64) {
-                        ui.label(RichText::new(label).color(t.text_dim));
-                        ui.label(with_unit(number(val), u));
-                        ui.end_row();
-                    }
-                }
-            });
+            }
             if let Some(rings) = d.get("rings").and_then(Value::as_array).filter(|a| !a.is_empty()) {
                 let ring_cols: Vec<(&'static str, String)> = [
                     ("k_i", "K_I", k_unit),
@@ -1222,24 +1237,22 @@ fn fracture_domain_details(
                 .filter(|(key, _, _)| rings.iter().any(|r| r.get(*key).and_then(Value::as_f64).is_some()))
                 .map(|(key, label, u)| (key, fracture_unit_header(label, u)))
                 .collect();
-                egui::ScrollArea::horizontal().id_salt(("fc_reply_solve_fracture_rings_scroll", idx)).show(ui, |ui| {
-                    egui::Grid::new(("fc_reply_solve_fracture_rings", idx)).striped(true).spacing(vec2(8.0, 2.0)).show(ui, |ui| {
-                        ui.label(RichText::new("Ring").small().color(t.text_dim));
-                        ui.label(RichText::new(fracture_unit_header("J", j_unit)).small().color(t.text_dim));
-                        for (_, hdr) in &ring_cols {
-                            ui.label(RichText::new(hdr).small().color(t.text_dim));
+                let mut ring_headings = vec!["Ring".to_string(), fracture_unit_header("J", j_unit)];
+                ring_headings.extend(ring_cols.iter().map(|(_, h)| h.clone()));
+                let ring_heading_refs: Vec<&str> = ring_headings.iter().map(String::as_str).collect();
+                let ring_rows: Vec<Vec<String>> = rings
+                    .iter()
+                    .take(MAX_ROWS)
+                    .map(|r| {
+                        let mut row =
+                            vec![r.get("ring").and_then(Value::as_u64).map_or_else(|| "—".into(), |n| n.to_string()), fracture_opt_number(r, "j")];
+                        for (key, _) in &ring_cols {
+                            row.push(fracture_opt_number(r, key));
                         }
-                        ui.end_row();
-                        for r in rings.iter().take(MAX_ROWS) {
-                            ui.label(r.get("ring").and_then(Value::as_u64).map_or_else(|| "—".into(), |n| n.to_string()));
-                            ui.label(fracture_opt_number(r, "j"));
-                            for (key, _) in &ring_cols {
-                                ui.label(fracture_opt_number(r, key));
-                            }
-                            ui.end_row();
-                        }
-                    });
-                });
+                        row
+                    })
+                    .collect();
+                text_table(ui, &format!("fc_reply_solve_fracture_rings_{idx}"), &ring_heading_refs, &ring_rows);
                 more(ui, t, rings.len());
             }
         });
@@ -1653,7 +1666,7 @@ mod tests {
         // 2. Render reply::show (interaction_integral: true case with K_I and T_11).
         let ctx = egui::Context::default();
         let t = Tokens::get(false);
-        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 900.0)));
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 1200.0)));
         let mut out = ctx.run_ui(egui::RawInput { screen_rect: screen, ..Default::default() }, |ui| {
             show(&mut app, ui, &t);
         });
@@ -1702,7 +1715,7 @@ mod tests {
         let details_pos = {
             fn find(shape: &egui::Shape) -> Option<egui::Pos2> {
                 match shape {
-                    egui::Shape::Text(t) if t.galley.text() == "Details" => Some(t.pos + t.galley.size() * 0.5),
+                    egui::Shape::Text(t) if t.galley.text().eq_ignore_ascii_case("Details") => Some(t.pos + t.galley.size() * 0.5),
                     egui::Shape::Vec(v) => v.iter().find_map(find),
                     _ => None,
                 }
@@ -1842,14 +1855,14 @@ mod tests {
         });
         let ctx = egui::Context::default();
         let t = Tokens::get(false);
-        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 900.0)));
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 1200.0)));
         let mut out = ctx.run_ui(egui::RawInput { screen_rect: screen, ..Default::default() }, |ui| {
             show(&mut app, ui, &t);
         });
         out.textures_delta.clear();
         let mut texts = Vec::new();
         collect_texts(&out.shapes, &mut texts);
-        assert!(texts.iter().any(|s| s.contains("⚠") && s.contains("in-lbf-s-psi")), "expected amber warning row in {texts:?}");
+        assert!(texts.iter().any(|s| s == "!") && texts.iter().any(|s| s.contains("in-lbf-s-psi")), "expected amber warning row in {texts:?}");
         assert!(!texts.iter().any(|s| s == "warnings"), "warnings should not duplicate in table: {texts:?}");
         assert!(texts.iter().any(|s| s == "units source"), "{texts:?}");
         assert!(!texts.iter().any(|s| s.contains("Create Step")), "loadless WARP3D deck must not add Create Step banner: {texts:?}");
@@ -1949,7 +1962,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let t = crate::theme::Tokens::get(false);
-        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 900.0)));
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 1200.0)));
 
         // Thermal/unsupported-only WARP3D deck.read with empty steps must show NO Create Step banner.
         let mut app = ModelApp::new(fieldcraft_engine::Session::default());
@@ -2042,6 +2055,6 @@ mod tests {
         ready_out.textures_delta.clear();
         let mut ready_texts = Vec::new();
         collect_texts(&ready_out.shapes, &mut ready_texts);
-        assert!(ready_texts.iter().any(|s| s == "✔ The model is ready to solve."), "{ready_texts:?}");
+        assert!(ready_texts.iter().any(|s| s == "The model is ready to solve."), "{ready_texts:?}");
     }
 }

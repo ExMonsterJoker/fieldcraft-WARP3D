@@ -321,6 +321,7 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
             "recent": app.recent.paths,
             "version": crate::VERSION,
             "path_plot":app.path_editor.as_ref().map(|e|json!({"params":e.params(&app.session).ok(),"picking":e.picking,"selected":e.selected})),
+            "ffs": app.ffs.as_ref().map(|f| f.inspect_json(app.ui.show_ffs)),
         })),
         "ui.toolbar" => ok(crate::toolbar::describe(app)),
         "ui.path" => wrap(path_action(app, p)),
