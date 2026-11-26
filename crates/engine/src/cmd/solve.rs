@@ -377,6 +377,10 @@ fn structural_backend(p: &Value) -> Result<StructuralBackend> {
     }
 }
 
+pub(crate) fn effective_structural_backend_is_warp3d(p: &Value) -> bool {
+    structural_backend(p) == Ok(StructuralBackend::Warp3d)
+}
+
 fn optional_deck_path(s: &Session, p: &Value, backend: StructuralBackend) -> Result<Option<std::path::PathBuf>> {
     match p.get("deck_path") {
         None | Some(Value::Null) => Ok(None),
@@ -459,6 +463,7 @@ fn run_warp3d_bridged(
     crack_front: Option<&fieldcraft_warp3d::CrackFrontSpec>,
     threads: usize,
     deck_path: Option<&std::path::Path>,
+    bin_override: Option<&std::path::Path>,
 ) -> Result<fieldcraft_warp3d::Warp3dSolution> {
     use std::sync::atomic::AtomicBool;
     #[cfg(not(target_arch = "wasm32"))]
@@ -477,17 +482,17 @@ fn run_warp3d_bridged(
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             });
-            let out = fieldcraft_warp3d::run_warp3d(model, step_name, crack_front, threads, deck_path, &cancel);
+            let out = fieldcraft_warp3d::run_warp3d_with_override(model, step_name, crack_front, threads, deck_path, &cancel, bin_override);
             done.store(true, Ordering::Release);
             out
         })
     } else {
-        fieldcraft_warp3d::run_warp3d(model, step_name, crack_front, threads, deck_path, &cancel)
+        fieldcraft_warp3d::run_warp3d_with_override(model, step_name, crack_front, threads, deck_path, &cancel, bin_override)
     };
     #[cfg(target_arch = "wasm32")]
     let res = {
-        let _ = (model, step_name, crack_front, threads, deck_path, &cancel);
-        fieldcraft_warp3d::run_warp3d(model, step_name, crack_front, threads, deck_path, &cancel)
+        let _ = (model, step_name, crack_front, threads, deck_path, &cancel, bin_override);
+        fieldcraft_warp3d::run_warp3d_with_override(model, step_name, crack_front, threads, deck_path, &cancel, bin_override)
     };
     res.map_err(warp3d_to_engine)
 }
@@ -559,7 +564,7 @@ fn run_static(s: &mut Session, p: &Value) -> Result<Value> {
     let thread_count = threads(s, p)?;
     if backend == StructuralBackend::Warp3d {
         let step_name = select_warp3d_step(&s.model, step.as_deref(), false)?.name.clone();
-        let sol = run_warp3d_bridged(&s.model, &step_name, crack_front.as_ref(), thread_count, deck_path.as_deref())?;
+        let sol = run_warp3d_bridged(&s.model, &step_name, crack_front.as_ref(), thread_count, deck_path.as_deref(), s.warp3d_bin.as_deref())?;
         let mut summary = static_summary(&sol.static_result, s.units());
         summary["backend"] = json!("warp3d");
         if !sol.fracture.is_empty() {
@@ -585,7 +590,7 @@ fn run_nonlinear(s: &mut Session, p: &Value) -> Result<Value> {
     let thread_count = threads(s, p)?;
     if backend == StructuralBackend::Warp3d {
         let step_name = select_warp3d_step(&s.model, step.as_deref(), true)?.name.clone();
-        let sol = run_warp3d_bridged(&s.model, &step_name, crack_front.as_ref(), thread_count, deck_path.as_deref())?;
+        let sol = run_warp3d_bridged(&s.model, &step_name, crack_front.as_ref(), thread_count, deck_path.as_deref(), s.warp3d_bin.as_deref())?;
         let mut summary = nonlinear_summary(&sol.static_result, s.units());
         summary["backend"] = json!("warp3d");
         if !sol.fracture.is_empty() {
@@ -5058,5 +5063,15 @@ pub(crate) mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn solve_commands_reject_warp3d_bin_json_key() {
+        let mut s = Session::default();
+        s.execute("file.sample", &serde_json::json!({"name": "cantilever"})).unwrap();
+        for cmd in ["solve.static", "solve.nonlinear"] {
+            let err = s.execute(cmd, &serde_json::json!({"backend": "warp3d", "warp3d_bin": "/tmp/evil"})).unwrap_err().to_string();
+            assert!(err.contains("warp3d_bin"), "{cmd} unexpectedly accepted or misreported warp3d_bin: {err}");
+        }
     }
 }

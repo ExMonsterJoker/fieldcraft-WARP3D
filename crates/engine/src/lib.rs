@@ -26,9 +26,13 @@ pub use cmd::file::OpenFileKind;
 pub use cmd::replace::{MESHERS, Replacement, replacement, thousands};
 pub use cmd::update::enable_checks as enable_update_checks;
 pub use cmd::{DeckFormatInfo, deck_format_info};
+pub use cmd::{effective_structural_backend, warp3d_binary_status, warp3d_check_preview, warp3d_quick_note};
 /// Write an output (a picture, an export) where a user named, never over a model or design.
 pub use fieldcraft_io::fs::write_output;
 pub use fieldcraft_io::{Item as ViewItem, ItemKind};
+pub use fieldcraft_warp3d::{
+    CheckScope, DiagnosticSeverity, Warp3dBinarySource, Warp3dBinaryStatus, Warp3dCheckReport, Warp3dDiagnostic, Warp3dQuickNote,
+};
 pub mod history;
 pub mod linearise;
 pub mod path;
@@ -456,6 +460,9 @@ pub struct Session {
     pub path_index: path::Cache,
     /// Last successful path query, in SI reference coordinates. Never journalled or saved.
     pub path_plot: Option<Arc<path::Plot>>,
+    /// Desktop-only WARP3D executable override path hydrated from host preferences. Never
+    /// serialized in `.fieldcraft` files, recorded in the journal, or exposed to commands/MCP.
+    pub warp3d_bin: Option<std::path::PathBuf>,
 }
 
 impl Session {
@@ -946,6 +953,7 @@ impl Session {
             run: self.run.clone(),
             solver_diagnostics: self.solver_diagnostics.clone(),
             origin: self.origin,
+            warp3d_bin: self.warp3d_bin.clone(),
             ..Session::default()
         }
     }
@@ -1011,6 +1019,7 @@ impl Session {
             origin: self.origin,
             default_units: self.default_units.clone(),
             camera_requests: self.camera_requests,
+            warp3d_bin: self.warp3d_bin.clone(),
             ..Session::default()
         }
     }
@@ -1056,7 +1065,7 @@ mod tests {
     fn command_ids_are_unique_and_well_formed() {
         let mut ids: Vec<&str> = commands().iter().map(|c| c.id).collect();
         for id in &ids {
-            assert!(id.split('.').count() >= 2 && id.chars().all(|c| c.is_ascii_lowercase() || c == '.' || c == '_'), "{id}");
+            assert!(id.split('.').count() >= 2 && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_'), "{id}");
         }
         ids.sort_unstable();
         let n = ids.len();
@@ -1153,6 +1162,13 @@ mod tests {
             json!({"points": [[1e308, -1e308, 0], [0, 0, 0]]}),
             json!({"points": [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]]}),
             json!({"points": vec![[1, 1, 1]; 30_000]}),
+            // WARP3D pre-flight check hostile inputs.
+            json!({"step": 123}),
+            json!({"step": "x".repeat(100_000)}),
+            json!({"crack_face": []}),
+            json!({"crack_face": "x".repeat(100_000)}),
+            json!({"crack_front": "bad"}),
+            json!({"crack_front": {"set": null, "normal": [f64::NAN, 0, 1], "rings": -5}}),
             // Stress classification lines.
             json!({"step": "Bend", "from": [f64::NAN, 0, 0], "to": [1, 0, 0]}),
             json!({"step": "Bend", "from": [1e308, 0, 0], "to": [-1e308, 0, 0]}),
@@ -1598,5 +1614,19 @@ mod tests {
         s.execute("file.sample", &json!({"name": "cantilever"})).unwrap();
         assert_eq!(s.path, None, "a sample must not save over the last opened file");
         assert!(s.execute("file.save", &json!({})).is_err());
+    }
+
+    #[test]
+    fn warp3d_bin_survives_engine_session_propagation_paths() {
+        let custom = std::path::PathBuf::from("/opt/warp3d-custom/bin/warp3d");
+        let mut s = Session { warp3d_bin: Some(custom.clone()), ..Session::default() };
+
+        assert_eq!(s.lightweight_solve_session().warp3d_bin.as_ref(), Some(&custom));
+        assert_eq!(s.empty_like().warp3d_bin.as_ref(), Some(&custom));
+        assert_eq!(s.empty_like_preserving_units().warp3d_bin.as_ref(), Some(&custom));
+
+        let replacement = Session::default();
+        s.replace_with(replacement);
+        assert_eq!(s.warp3d_bin.as_ref(), Some(&custom));
     }
 }

@@ -123,6 +123,20 @@ impl eframe::App for App {
         }
     }
     fn on_exit(&mut self) {
+        let handles = self.app.cancel_loading_for_exit();
+        if !handles.is_empty() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline && handles.iter().any(|h| !h.is_finished()) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            for h in handles {
+                if h.is_finished() {
+                    let _ = h.join();
+                } else {
+                    log::warn!("detaching background worker that did not exit within 2s on shutdown");
+                }
+            }
+        }
         if let Some(a) = self.autosaver.take()
             && let Err(e) = a.close(&self.app.session)
         {

@@ -61,7 +61,7 @@ pub fn summary_in(command: &str, v: &Value, units: Option<&DisplaySystem>) -> St
     }
     let count = |key: &str| v.get(key).map_or(0, |x| x.as_array().map(Vec::len).or_else(|| x.as_object().map(Map::len)).unwrap_or(0));
     let line = match command {
-        "model.check" => {
+        "model.check" | "warp3d.check" => {
             let (e, w) = (v["errors"].as_u64().unwrap_or(0), v["warnings"].as_u64().unwrap_or(0));
             if e + w == 0 { "ready to solve, no issues".to_string() } else { format!("{}, {}", plural(e, "error"), plural(w, "warning")) }
         }
@@ -300,14 +300,14 @@ enum Act {
         name: String,
         features: Vec<u64>,
     },
+    /// Open `model.step.create` prefilled with WARP3D-supported structural BCs and loads.
+    CreateWarp3dStep,
 }
 
 /// The reply's section of the context panel.
 pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens) {
     let Some(reply) = app.reply.clone() else { return };
     let mut acts = Vec::new();
-    // One form: the kit's buttons and rows, the rows sharing one label column sized to the
-    // longest key.
     kit::scope(ui, |ui| {
         ui.add_space(4.0);
         if kit::button(ui, "Run again", kit::Button::Normal)
@@ -331,9 +331,24 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens) {
                         );
                     }
                 }
+                let (bc_count, load_count) = if !app.session.model.boundary_conditions().is_empty() || !app.session.model.loads().is_empty() {
+                    let (bcs, loads) = crate::warp3d_step_prefill_entities(&app.session.model);
+                    (bcs.len() as u64, loads.len() as u64)
+                } else {
+                    (
+                        reply.value.get("boundary_conditions").and_then(Value::as_u64).unwrap_or(0),
+                        reply.value.get("loads").and_then(Value::as_u64).unwrap_or(0),
+                    )
+                };
                 if reply.value.get("format").and_then(Value::as_str) == Some("warp3d")
-                    && reply.value.get("loads").and_then(Value::as_u64).unwrap_or(0) > 0
+                    && app.session.model.steps().is_empty()
+                    && (bc_count > 0 || load_count > 0)
                 {
+                    let banner = if load_count > 0 {
+                        "⚠ Imported WARP3D loads are unscaled patterns; create a step and activate the loads to apply before solving."
+                    } else {
+                        "⚠ Imported WARP3D boundary conditions have no active step yet; create a step before solving."
+                    };
                     ui.add_space(4.0);
                     egui::Frame::NONE
                         .fill(t.subheading_bg)
@@ -341,18 +356,10 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens) {
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .corner_radius(4.0)
                         .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(
-                                        "⚠ Imported WARP3D loads are unscaled patterns; create a step and activate the loads to apply before solving.",
-                                    )
-                                    .color(t.warm),
-                                )
-                                .wrap(),
-                            );
+                            ui.add(egui::Label::new(RichText::new(banner).color(t.warm)).wrap());
                             ui.add_space(4.0);
                             if kit::button(ui, "Create Step…", kit::Button::Normal).clicked() {
-                                acts.push(Act::Start("model.step.create"));
+                                acts.push(Act::CreateWarp3dStep);
                             }
                         });
                     ui.add_space(4.0);
@@ -363,7 +370,7 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens) {
                 };
                 value(ui, t, egui::Id::unique("fc_deck_read"), &filtered, 0);
             }
-            "model.check" => diagnostics(app, ui, &reply.value, &mut acts),
+            "model.check" | "warp3d.check" => diagnostics(app, ui, &reply.value, &mut acts),
             c if SOLVES.contains(&c) => solve_summary(ui, t, &reply.value, units),
             "model.activity" => activity(ui, t, &reply.value),
             "geometry.bodies" => bodies(ui, t, &reply.value, app.session.units(), &mut acts),
@@ -424,6 +431,7 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens) {
                 }
                 let _ = set_defeature(app, &name, all);
             }
+            Act::CreateWarp3dStep => app.open_warp3d_create_step(),
         }
     }
 }
@@ -665,6 +673,10 @@ fn diagnostics(app: &ModelApp, ui: &mut egui::Ui, v: &Value, acts: &mut Vec<Act>
         if i + 1 < list.len() {
             kit::divider(ui, &format!("fc_check:{i}"));
         }
+    }
+    if let Some(truncated) = v.get("truncated").and_then(Value::as_u64).filter(|&n| n > 0) {
+        kit::divider(ui, "fc_check:truncated");
+        kit::status_line(ui, &format!("… and {truncated} more diagnostics omitted"), kit::StatusTone::Dim);
     }
 }
 
@@ -1929,5 +1941,107 @@ mod tests {
         );
         click_out.textures_delta.clear();
         assert_eq!(app.dialog.as_ref().map(|d| d.command), Some("model.step.create"));
+    }
+
+    #[test]
+    fn warp3d_check_not_in_live_and_bc_only_and_truncated_banner_behave_cleanly() {
+        assert!(!LIVE.contains(&"warp3d.check"));
+
+        let ctx = egui::Context::default();
+        let t = crate::theme::Tokens::get(false);
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 900.0)));
+
+        // Thermal/unsupported-only WARP3D deck.read with empty steps must show NO Create Step banner.
+        let mut app = ModelApp::new(fieldcraft_engine::Session::default());
+        app.session.model.set_node(1, [0.0, 0.0, 0.0]).unwrap();
+        app.session.model.add_set("s1", fieldcraft_model::Set { nodes: vec![1], ..Default::default() }).unwrap();
+        app.session
+            .model
+            .add_boundary_condition(
+                "tbc",
+                fieldcraft_model::BoundaryCondition::Temperature { target: fieldcraft_model::Target::Set("s1".into()), value: 50.0 },
+            )
+            .unwrap();
+        app.reply = Some(Reply {
+            command: "deck.read".into(),
+            label: "Read Solver Deck".into(),
+            params: json!({"format": "warp3d"}),
+            value: json!({"format": "warp3d", "nodes": 1, "elements": {}, "boundary_conditions": 1, "loads": 0, "warnings": [], "unknown": [], "unknown_count": 0}),
+        });
+        let mut therm_out = ctx.run_ui(egui::RawInput { screen_rect: screen, ..Default::default() }, |ui| show(&mut app, ui, &t));
+        therm_out.textures_delta.clear();
+        let mut therm_texts = Vec::new();
+        collect_texts(&therm_out.shapes, &mut therm_texts);
+        assert!(!therm_texts.iter().any(|s| s.contains("Create Step")), "{therm_texts:?}");
+
+        // Structural BC-only WARP3D import renders Create Step… and opens prefilled model.step.create.
+        app.session
+            .model
+            .add_boundary_condition("disp", fieldcraft_model::BoundaryCondition::Fixed { target: fieldcraft_model::Target::Set("s1".into()) })
+            .unwrap();
+        let mut bc_out = ctx.run_ui(egui::RawInput { time: Some(1.0), screen_rect: screen, ..Default::default() }, |ui| show(&mut app, ui, &t));
+        bc_out.textures_delta.clear();
+        let mut bc_texts = Vec::new();
+        collect_texts(&bc_out.shapes, &mut bc_texts);
+        assert!(bc_texts.iter().any(|s| s.contains("boundary conditions") && s.contains("step")), "{bc_texts:?}");
+        let btn_pos = {
+            fn find(s: &egui::Shape) -> Option<egui::Pos2> {
+                match s {
+                    egui::Shape::Text(tx) if tx.galley.text() == "Create Step…" => Some(tx.pos + tx.galley.size() * 0.5),
+                    egui::Shape::Vec(v) => v.iter().find_map(find),
+                    _ => None,
+                }
+            }
+            bc_out.shapes.iter().find_map(|cs| find(&cs.shape)).expect("Create Step… button")
+        };
+        let mut bc_click = ctx.run_ui(
+            egui::RawInput {
+                time: Some(2.0),
+                screen_rect: screen,
+                events: vec![
+                    egui::Event::PointerMoved(btn_pos),
+                    egui::Event::PointerButton { pos: btn_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                    egui::Event::PointerButton { pos: btn_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+                ],
+                ..Default::default()
+            },
+            |ui| show(&mut app, ui, &t),
+        );
+        bc_click.textures_delta.clear();
+        assert_eq!(app.dialog.as_ref().map(|d| d.command), Some("model.step.create"));
+        let created_json: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();
+        assert_eq!(created_json["boundary_conditions"], json!(["disp"]));
+
+        // warp3d.check diagnostics + truncated footer + empty ready message.
+        app.reply = Some(Reply {
+            command: "warp3d.check".into(),
+            label: "Check WARP3D Model".into(),
+            params: json!({}),
+            value: json!({
+                "ready": false,
+                "errors": 1,
+                "warnings": 1,
+                "diagnostics": [{"severity": "error", "code": "warp3d.test", "subject": "model", "message": "Sample error"}],
+                "truncated": 7
+            }),
+        });
+        let mut chk_out = ctx.run_ui(egui::RawInput { time: Some(3.0), screen_rect: screen, ..Default::default() }, |ui| show(&mut app, ui, &t));
+        chk_out.textures_delta.clear();
+        let mut chk_texts = Vec::new();
+        collect_texts(&chk_out.shapes, &mut chk_texts);
+        assert!(chk_texts.iter().any(|s| s.contains("Sample error")), "{chk_texts:?}");
+        assert!(chk_texts.iter().any(|s| s.contains("7 more diagnostics omitted")), "{chk_texts:?}");
+
+        app.reply = Some(Reply {
+            command: "warp3d.check".into(),
+            label: "Check WARP3D Model".into(),
+            params: json!({}),
+            value: json!({"ready": true, "errors": 0, "warnings": 0, "diagnostics": [], "truncated": 0}),
+        });
+        let mut ready_out = ctx.run_ui(egui::RawInput { time: Some(4.0), screen_rect: screen, ..Default::default() }, |ui| show(&mut app, ui, &t));
+        ready_out.textures_delta.clear();
+        let mut ready_texts = Vec::new();
+        collect_texts(&ready_out.shapes, &mut ready_texts);
+        assert!(ready_texts.iter().any(|s| s == "✔ The model is ready to solve."), "{ready_texts:?}");
     }
 }

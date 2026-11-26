@@ -11,6 +11,28 @@ use fieldcraft_model::Model;
 use crate::{CrackFrontSpec, Result, Warp3dError, Warp3dSolution};
 
 #[cfg(not(target_arch = "wasm32"))]
+const MAX_BINARY_PATH_BYTES: usize = 4096;
+
+/// How FieldCraft resolved the external `warp3d` executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Warp3dBinarySource {
+    PrefsOverride,
+    EnvFieldcraftBin,
+    EnvWarp3dHome,
+    Path,
+    NotFound,
+}
+
+/// Resolution result for the external `warp3d` executable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warp3dBinaryStatus {
+    pub source: Warp3dBinarySource,
+    pub path: Option<PathBuf>,
+    pub valid: bool,
+    pub error: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_SOLVER_TIMEOUT_SECS: u64 = 86_400;
 #[cfg(not(target_arch = "wasm32"))]
 const LOG_TAIL_LINES: usize = 40;
@@ -41,17 +63,73 @@ fn home_subdirs() -> &'static [&'static str] {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn find_warp3d_binary_in(
+fn is_unc_or_network_path(raw: &Path) -> bool {
+    let bytes = raw.as_os_str().as_encoded_bytes();
+    if bytes.starts_with(b"\\\\") {
+        return true;
+    }
+    if cfg!(windows) && bytes.starts_with(b"//") {
+        return true;
+    }
+    matches!(
+        raw.components().next(),
+        Some(std::path::Component::Prefix(p))
+            if matches!(p.kind(), std::path::Prefix::UNC(_, _) | std::path::Prefix::VerbatimUNC(_, _))
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_binary_path(raw: &Path) -> std::result::Result<(), String> {
+    let os = raw.as_os_str();
+    if os.is_empty() {
+        return Err("executable path must not be empty".into());
+    }
+    let bytes = os.as_encoded_bytes();
+    if bytes.len() > MAX_BINARY_PATH_BYTES {
+        return Err(format!("executable path exceeds {MAX_BINARY_PATH_BYTES} bytes"));
+    }
+    if bytes.contains(&0) {
+        return Err("executable path must not contain NUL bytes".into());
+    }
+    if is_unc_or_network_path(raw) {
+        return Err(format!("network/UNC executable path `{}` is not allowed", raw.display()));
+    }
+    if !raw.is_absolute() {
+        return Err(format!("executable path `{}` must be absolute", raw.display()));
+    }
+    if !raw.is_file() {
+        return Err(format!("`{}` is not a file", raw.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_warp3d_binary_in(
+    override_bin: Option<&Path>,
     bin_env: Option<&std::ffi::OsStr>,
     home_env: Option<&std::ffi::OsStr>,
     path_env: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf> {
+) -> Warp3dBinaryStatus {
+    if let Some(raw) = override_bin {
+        return match validate_binary_path(raw) {
+            Ok(()) => Warp3dBinaryStatus { source: Warp3dBinarySource::PrefsOverride, path: Some(raw.to_path_buf()), valid: true, error: None },
+            Err(msg) => {
+                Warp3dBinaryStatus { source: Warp3dBinarySource::PrefsOverride, path: Some(raw.to_path_buf()), valid: false, error: Some(msg) }
+            }
+        };
+    }
+
     if let Some(bin) = bin_env.filter(|v| !v.is_empty()) {
         let p = PathBuf::from(bin);
-        if p.is_file() {
-            return Ok(p);
-        }
-        return Err(Warp3dError::BinaryNotFound(format!("FIELDCRAFT_WARP3D_BIN points to `{}` which is not a file", p.display())));
+        return match validate_binary_path(&p) {
+            Ok(()) => Warp3dBinaryStatus { source: Warp3dBinarySource::EnvFieldcraftBin, path: Some(p), valid: true, error: None },
+            Err(msg) => Warp3dBinaryStatus {
+                source: Warp3dBinarySource::EnvFieldcraftBin,
+                path: Some(p.clone()),
+                valid: false,
+                error: Some(format!("FIELDCRAFT_WARP3D_BIN points to `{}` ({msg})", p.display())),
+            },
+        };
     }
 
     if let Some(home) = home_env.filter(|v| !v.is_empty()) {
@@ -60,8 +138,8 @@ fn find_warp3d_binary_in(
             let base = if sub.is_empty() { home_dir.clone() } else { home_dir.join(sub) };
             for name in candidate_binary_names() {
                 let candidate = base.join(name);
-                if candidate.is_file() {
-                    return Ok(candidate);
+                if validate_binary_path(&candidate).is_ok() {
+                    return Warp3dBinaryStatus { source: Warp3dBinarySource::EnvWarp3dHome, path: Some(candidate), valid: true, error: None };
                 }
             }
         }
@@ -71,14 +149,56 @@ fn find_warp3d_binary_in(
         for dir in std::env::split_paths(path_var) {
             for name in candidate_binary_names() {
                 let candidate = dir.join(name);
-                if candidate.is_file() {
-                    return Ok(candidate);
+                if validate_binary_path(&candidate).is_ok() {
+                    return Warp3dBinaryStatus { source: Warp3dBinarySource::Path, path: Some(candidate), valid: true, error: None };
                 }
             }
         }
     }
 
-    Err(Warp3dError::BinaryNotFound("neither FIELDCRAFT_WARP3D_BIN, WARP3D_HOME, nor PATH contains a warp3d executable".into()))
+    Warp3dBinaryStatus {
+        source: Warp3dBinarySource::NotFound,
+        path: None,
+        valid: false,
+        error: Some("neither FIELDCRAFT_WARP3D_BIN, WARP3D_HOME, nor PATH contains a warp3d executable".into()),
+    }
+}
+
+/// Resolve the external WARP3D executable and its provenance, honoring an optional override path.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_warp3d_binary(override_bin: Option<&Path>) -> Warp3dBinaryStatus {
+    resolve_warp3d_binary_in(
+        override_bin,
+        std::env::var_os("FIELDCRAFT_WARP3D_BIN").as_deref(),
+        std::env::var_os("WARP3D_HOME").as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// Resolve the external WARP3D executable (desktop-only; returns `NotFound` on wasm32 targets).
+#[cfg(target_arch = "wasm32")]
+pub fn resolve_warp3d_binary(_override_bin: Option<&Path>) -> Warp3dBinaryStatus {
+    Warp3dBinaryStatus {
+        source: Warp3dBinarySource::NotFound,
+        path: None,
+        valid: false,
+        error: Some("WARP3D execution is available only in the desktop app".into()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn find_warp3d_binary_in(
+    bin_env: Option<&std::ffi::OsStr>,
+    home_env: Option<&std::ffi::OsStr>,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    let status = resolve_warp3d_binary_in(None, bin_env, home_env, path_env);
+    if status.valid
+        && let Some(path) = status.path
+    {
+        return Ok(path);
+    }
+    Err(Warp3dError::BinaryNotFound(status.error.unwrap_or_else(|| "no valid WARP3D executable found".into())))
 }
 
 /// Locate the WARP3D executable via `FIELDCRAFT_WARP3D_BIN`, `WARP3D_HOME`, or `PATH`.
@@ -108,15 +228,23 @@ impl Drop for TempDirGuard {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn extra_linux_lib_dir(bin: &Path) -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("WARP3D_HOME").filter(|v| !v.is_empty()) {
+fn extra_linux_lib_dir_in(bin: &Path, from_override: bool, home_env: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let sibling = bin.parent().and_then(|p| p.parent()).map(|p| p.join("linux_packages").join("lib")).filter(|p| p.is_dir());
+    if from_override && sibling.is_some() {
+        return sibling;
+    }
+    if let Some(home) = home_env.filter(|v| !v.is_empty()) {
         let candidate = PathBuf::from(home).join("linux_packages").join("lib");
         if candidate.is_dir() {
             return Some(candidate);
         }
     }
-    let candidate = bin.parent()?.parent()?.join("linux_packages").join("lib");
-    candidate.is_dir().then_some(candidate)
+    sibling
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn extra_linux_lib_dir(bin: &Path, from_override: bool) -> Option<PathBuf> {
+    extra_linux_lib_dir_in(bin, from_override, std::env::var_os("WARP3D_HOME").as_deref())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -259,7 +387,23 @@ pub fn run_warp3d(
     deck_path: Option<&Path>,
     cancel: &AtomicBool,
 ) -> Result<Warp3dSolution> {
-    run_warp3d_inner(model, step, crack, threads, deck_path, cancel, None, std::time::Duration::from_secs(DEFAULT_SOLVER_TIMEOUT_SECS))
+    run_warp3d_with_override(model, step, crack, threads, deck_path, cancel, None)
+}
+
+/// Generate a WARP3D deck in SI (`Preset::MKgS`), run the external WARP3D solver using an optional
+/// override executable path, and parse flat-file and domain-integral results back into FieldCraft types.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments, reason = "matches existing run_warp3d interface plus optional override path")]
+pub fn run_warp3d_with_override(
+    model: &Model,
+    step: &str,
+    crack: Option<&CrackFrontSpec>,
+    threads: usize,
+    deck_path: Option<&Path>,
+    cancel: &AtomicBool,
+    bin_override: Option<&Path>,
+) -> Result<Warp3dSolution> {
+    run_warp3d_inner(model, step, crack, threads, deck_path, cancel, bin_override, std::time::Duration::from_secs(DEFAULT_SOLVER_TIMEOUT_SECS))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -309,6 +453,23 @@ fn run_warp3d_inner(
         return Err(Warp3dError::Cancelled);
     }
 
+    // Validate and resolve the WARP3D executable before generating or writing any deck files.
+    let bin_status = resolve_warp3d_binary(bin_override);
+    let from_override = bin_status.source == Warp3dBinarySource::PrefsOverride;
+    let bin = if bin_status.valid
+        && let Some(path) = bin_status.path
+    {
+        path
+    } else if from_override {
+        let shown = bin_status.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        let detail = bin_status.error.unwrap_or_else(|| "invalid executable path".into());
+        return Err(Warp3dError::BinaryNotFound(format!(
+            "configured WARP3D executable `{shown}` is unavailable ({detail}); update it in Help > Settings"
+        )));
+    } else {
+        return Err(Warp3dError::BinaryNotFound(bin_status.error.unwrap_or_else(|| "no valid WARP3D executable found".into())));
+    };
+
     let step_opt = (!step.is_empty()).then_some(step);
     let written = crate::write_deck(model, step_opt, crack, fieldcraft_model::units::Preset::MKgS)?;
 
@@ -318,11 +479,6 @@ fn run_warp3d_inner(
         }
         std::fs::write(out_path, written.text.as_bytes())?;
     }
-
-    let bin = match bin_override {
-        Some(p) => p.to_path_buf(),
-        None => find_warp3d_binary()?,
-    };
 
     static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -345,7 +501,7 @@ fn run_warp3d_inner(
         if let Some(bin_dir) = bin.parent().filter(|p| p.is_dir()) {
             prepend_search_path(&mut cmd, "PATH", bin_dir);
         }
-    } else if let Some(lib_dir) = extra_linux_lib_dir(&bin) {
+    } else if let Some(lib_dir) = extra_linux_lib_dir(&bin, from_override) {
         prepend_search_path(&mut cmd, "LD_LIBRARY_PATH", &lib_dir);
     }
 
@@ -438,6 +594,21 @@ pub fn run_warp3d(
     _threads: usize,
     _deck_path: Option<&Path>,
     _cancel: &AtomicBool,
+) -> Result<Warp3dSolution> {
+    Err(Warp3dError::Unsupported("external WARP3D execution is not available on wasm targets".into()))
+}
+
+/// Generate a WARP3D deck and run the external WARP3D solver with override (unsupported on wasm32 targets).
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_arguments, reason = "matches existing run_warp3d interface plus optional override path")]
+pub fn run_warp3d_with_override(
+    _model: &Model,
+    _step: &str,
+    _crack: Option<&CrackFrontSpec>,
+    _threads: usize,
+    _deck_path: Option<&Path>,
+    _cancel: &AtomicBool,
+    _bin_override: Option<&Path>,
 ) -> Result<Warp3dSolution> {
     Err(Warp3dError::Unsupported("external WARP3D execution is not available on wasm targets".into()))
 }
@@ -996,6 +1167,70 @@ printf "WARP3D late domain complete\n"
             assert!(sol.stdout_log.contains("WARP3D late domain complete"));
             assert!(progress.observations() > 0);
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn override_precedence_path_safety_and_preflight_binary_before_deck() {
+        let dir = temp_dir("override_safety");
+        let ovr = dir.join("ovr").join("run_linux").join("warp3d.exe");
+        fs::create_dir_all(ovr.parent().unwrap()).unwrap();
+        fs::write(&ovr, b"").unwrap();
+        let ovr_lib = dir.join("ovr").join("linux_packages").join("lib");
+        fs::create_dir_all(&ovr_lib).unwrap();
+
+        let env_bin = dir.join("env_warp3d.exe");
+        fs::write(&env_bin, b"").unwrap();
+
+        let home = dir.join("home");
+        fs::create_dir_all(home.join("run_linux")).unwrap();
+        fs::create_dir_all(home.join("run_windows")).unwrap();
+        let home_lib = home.join("linux_packages").join("lib");
+        fs::create_dir_all(&home_lib).unwrap();
+        fs::write(home.join("run_linux").join("warp3d.exe"), b"").unwrap();
+        fs::write(home.join("run_windows").join("warp3d.exe"), b"").unwrap();
+
+        // 1. PrefsOverride beats FIELDCRAFT_WARP3D_BIN, WARP3D_HOME, and PATH.
+        let s = resolve_warp3d_binary_in(Some(&ovr), Some(env_bin.as_os_str()), Some(home.as_os_str()), None);
+        assert_eq!(s.source, Warp3dBinarySource::PrefsOverride);
+        assert!(s.valid);
+        assert_eq!(s.path.as_deref(), Some(ovr.as_path()));
+
+        // 2. Invalid/missing override never silently falls back to env or WARP3D_HOME.
+        let missing = dir.join("no_such_warp3d");
+        let s_bad = resolve_warp3d_binary_in(Some(&missing), Some(env_bin.as_os_str()), Some(home.as_os_str()), None);
+        assert_eq!(s_bad.source, Warp3dBinarySource::PrefsOverride);
+        assert!(!s_bad.valid);
+
+        let s_empty = resolve_warp3d_binary_in(Some(Path::new("")), Some(env_bin.as_os_str()), Some(home.as_os_str()), None);
+        assert_eq!(s_empty.source, Warp3dBinarySource::PrefsOverride);
+        assert!(!s_empty.valid);
+
+        // 3. Invalid FIELDCRAFT_WARP3D_BIN keeps EnvFieldcraftBin source and does not fall through.
+        let s_env_bad = resolve_warp3d_binary_in(None, Some(missing.as_os_str()), Some(home.as_os_str()), None);
+        assert_eq!(s_env_bad.source, Warp3dBinarySource::EnvFieldcraftBin);
+        assert!(!s_env_bad.valid);
+
+        // 4. Relative, UNC, oversized, and NUL paths are rejected cleanly.
+        assert!(!resolve_warp3d_binary_in(Some(Path::new("relative/warp3d")), None, None, None).valid);
+        let unc = resolve_warp3d_binary_in(Some(Path::new(r"\\server\share\warp3d.exe")), None, None, None);
+        assert!(!unc.valid);
+        assert!(unc.error.as_deref().unwrap_or("").contains("UNC"));
+        let too_long = PathBuf::from(format!("/{}.exe", "a".repeat(4100)));
+        assert!(!resolve_warp3d_binary_in(Some(&too_long), None, None, None).valid);
+
+        // 5. Linux sibling library directory takes precedence under override.
+        assert_eq!(extra_linux_lib_dir_in(&ovr, true, Some(home.as_os_str())).as_deref(), Some(ovr_lib.as_path()));
+        assert_eq!(extra_linux_lib_dir_in(&ovr, false, Some(home.as_os_str())).as_deref(), Some(home_lib.as_path()));
+
+        // 6. Missing override fails with BinaryNotFound before write_deck / deck_path file creation.
+        let bad_model = Model::default();
+        let deck_out = dir.join("should_not_exist").join("out.inp");
+        let cancel = AtomicBool::new(false);
+        let err = run_warp3d_with_override(&bad_model, "", None, 1, Some(&deck_out), &cancel, Some(&missing)).unwrap_err();
+        assert!(matches!(err, Warp3dError::BinaryNotFound(ref msg) if msg.contains("Help > Settings")), "got {err}");
+        assert!(!deck_out.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

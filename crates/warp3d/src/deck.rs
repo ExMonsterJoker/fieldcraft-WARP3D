@@ -8,8 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fieldcraft_model::units::{DisplaySystem, Preset};
 use fieldcraft_model::{
-    BoundaryCondition, Elastic, ElementKind, Hardening, HardeningPoint, Integration, Load, Model, Plastic, Procedure, Resolved, SectionKind, Step,
-    Target,
+    BoundaryCondition, Elastic, ElementKind, HardeningPoint, Integration, Load, Model, Plastic, Procedure, Resolved, Step, Target,
 };
 
 use crate::fracture::{emit_domain_commands, push_wrapped};
@@ -117,183 +116,37 @@ fn format_element_spec(kind: ElementKind, nlgeom: bool, integration: Integration
 /// all geometry, materials, constraints, and loads via [`DisplaySystem`] for WARP3D's unitless
 /// deck.
 pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSpec>, units: Preset) -> Result<WrittenDeck> {
-    // 1. Validate & resolve in SI first so FieldCraft's SI magnitude checks remain calibrated.
+    // 1. Validate & resolve in SI first via the shared pre-flight validator.
     let si_resolved = model.resolve()?;
-    let mut warnings: Vec<String> = si_resolved.warnings.iter().map(ToString::to_string).collect();
+    let report = crate::check::validate_resolved(model, &si_resolved, step, crack, None, crate::check::CheckScope::Export);
+    if !report.ready {
+        let reasons: BTreeSet<String> =
+            report.diagnostics.iter().filter(|d| d.severity == crate::check::DiagnosticSeverity::Error).map(|d| d.message.clone()).collect();
+        let joined = reasons.into_iter().collect::<Vec<_>>().join("; ");
+        return Err(Warp3dError::Unsupported(joined));
+    }
+    let warnings: Vec<String> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == crate::check::DiagnosticSeverity::Warning)
+        .map(|d| if d.message.starts_with(&d.subject) { d.message.clone() } else { format!("{}: {}", d.subject, d.message) })
+        .collect();
 
     // 2. Convert coordinates, material properties, BCs, and loads into `units`.
     let display = DisplaySystem::new(units);
     let expressed = model.converted(&|q, v| display.express(q, v).ok())?;
     let resolved: Resolved = expressed.resolve()?;
 
-    let mut reasons: BTreeSet<String> = BTreeSet::new();
-
-    if !expressed.couplings().is_empty() {
-        reasons.insert("couplings (`coupling`) are not supported in WARP3D".into());
-    }
-    if !expressed.reference_points().is_empty() {
-        reasons.insert("reference points are not supported in WARP3D".into());
-    }
-    if !expressed.contacts().is_empty() {
-        reasons.insert("contact pairs are not supported in WARP3D".into());
-    }
-    if !expressed.ties().is_empty() {
-        reasons.insert("tied surface pairs are not supported in WARP3D".into());
-    }
-    if !expressed.masses().is_empty() {
-        reasons.insert("point masses are not supported in WARP3D".into());
-    }
-    if !expressed.springs().is_empty() {
-        reasons.insert("discrete springs and dashpots are not supported in WARP3D".into());
-    }
-    if !expressed.initial_fields().is_empty() {
-        reasons.insert("initial fields are not supported in WARP3D".into());
-    }
-    if expressed.nodes().is_empty() || expressed.elements().is_empty() {
-        reasons.insert("model must contain nodes and 3D solid elements".into());
-    }
-
-    for (elem_id, elem) in expressed.elements() {
-        if !matches!(elem.kind, ElementKind::Hex8 | ElementKind::Hex20 | ElementKind::Tet4 | ElementKind::Tet10) {
-            reasons.insert(format!("only 3D solid elements (Hex8, Hex20, Tet4, Tet10) are supported; element {elem_id} is `{}`", elem.kind.name()));
-        }
-    }
-
-    let step_ref = match select_step(&expressed, step) {
-        Ok(s) => Some(s),
-        Err(msg) => {
-            reasons.insert(msg);
-            None
-        }
-    };
-
-    if let Some(st) = step_ref {
-        match &st.procedure {
-            Procedure::Static {} => {}
-            Procedure::NonlinearStatic(nl) => {
-                if nl.arc_length.is_some() {
-                    reasons.insert("arc-length (Riks) control is not supported in WARP3D".into());
-                }
-                if nl.imperfection.is_some() {
-                    reasons.insert("buckling-mode imperfections are not supported in WARP3D".into());
-                }
-                if !nl.load_paths.is_empty() {
-                    reasons.insert("per-load `load_paths` are not supported in WARP3D Stage 1".into());
-                }
-            }
-            other => {
-                reasons.insert(format!("procedure for step `{}` ({other:?}) is not a structural static or nonlinear static step", st.name));
-            }
-        }
-    }
-
-    // Build section lookup per element and validate sections/materials.
     let mut elem_section: BTreeMap<u32, String> = BTreeMap::new();
     for (sec_name, sec) in expressed.sections() {
-        if !matches!(sec.kind, SectionKind::Solid {}) {
-            reasons.insert(format!("section `{sec_name}` has kind `{}` (WARP3D only supports 3D solid sections)", sec.kind.name()));
-        }
         if let Some(rset) = resolved.sets.get(&sec.set) {
             for &eid in &rset.elements {
                 elem_section.entry(eid).or_insert_with(|| sec_name.clone());
             }
         }
-        if sec.formulation.incompatible_modes {
-            warnings.push(format!("section `{sec_name}` requests incompatible modes; WARP3D uses B-bar (order 2x2x2 bbar) instead"));
-        }
-        if let Some(mat) = expressed.material(&sec.material) {
-            if mat.hyperelastic.is_some() {
-                reasons.insert(format!("material `{}` uses hyperelasticity, which is not supported in WARP3D Stage 1", sec.material));
-            }
-            if mat.thermal.as_ref().and_then(|t| t.expansion).is_some() {
-                reasons.insert(format!("material `{}` defines thermal expansion, which is not supported in WARP3D Stage 1", sec.material));
-            }
-            match mat.elastic {
-                Some(Elastic::Isotropic { .. }) => {}
-                Some(Elastic::EngineeringConstants { .. }) => {
-                    reasons.insert(format!(
-                        "material `{}` uses orthotropic engineering constants; WARP3D adapter requires isotropic elasticity",
-                        sec.material
-                    ));
-                }
-                None => {
-                    reasons.insert(format!("material `{}` has no elastic properties", sec.material));
-                }
-            }
-            match &mat.plastic {
-                None => {}
-                Some(Plastic::Bilinear { hardening, .. }) => {
-                    if *hardening == Hardening::Kinematic {
-                        reasons.insert(format!(
-                            "material `{}` uses kinematic hardening; WARP3D bilinear plasticity supports isotropic hardening",
-                            sec.material
-                        ));
-                    }
-                }
-                Some(Plastic::Table { points }) => {
-                    if points.is_empty() {
-                        reasons.insert(format!("material `{}` has an empty hardening table", sec.material));
-                    }
-                }
-                Some(Plastic::JohnsonCook { .. }) => {
-                    reasons
-                        .insert(format!("material `{}` uses Johnson-Cook plasticity, which is not supported in WARP3D static decks", sec.material));
-                }
-            }
-        } else {
-            reasons.insert(format!("section `{sec_name}` references missing material `{}`", sec.material));
-        }
     }
 
-    if let Some(st) = step_ref {
-        for bc_name in &st.boundary_conditions {
-            if let Some(bc) = expressed.boundary_condition(bc_name) {
-                match bc {
-                    BoundaryCondition::Fixed { target: Target::Set(_) }
-                    | BoundaryCondition::Displacement { target: Target::Set(_), .. }
-                    | BoundaryCondition::Symmetry { target: Target::Set(_), .. } => {}
-                    BoundaryCondition::Temperature { .. } => {
-                        reasons.insert(format!("temperature BC `{bc_name}` is not supported in WARP3D"));
-                    }
-                    _ => {
-                        reasons.insert(format!("boundary condition `{bc_name}` target is not supported in WARP3D"));
-                    }
-                }
-            }
-        }
-        for load_name in &st.loads {
-            if let Some(load) = expressed.load(load_name) {
-                match load {
-                    Load::Force { target: Target::Set(_), .. } | Load::Traction { .. } | Load::Pressure { .. } | Load::BodyForce { .. } => {}
-                    Load::Gravity { set, .. } => {
-                        let target_elems: Vec<u32> = match set.as_deref() {
-                            Some(s) => resolved.sets.get(s).map(|rs| rs.elements.clone()).unwrap_or_default(),
-                            None => expressed.elements().keys().copied().collect(),
-                        };
-                        for eid in target_elems {
-                            if let Some(sec_name) = elem_section.get(&eid)
-                                && let Some(sec) = expressed.section(sec_name)
-                                && let Some(mat) = expressed.material(&sec.material)
-                                && mat.density.is_none()
-                            {
-                                reasons.insert(format!("gravity load `{load_name}` requires `density` on material `{}`", sec.material));
-                            }
-                        }
-                    }
-                    _ => {
-                        reasons.insert(format!("load `{load_name}` kind is not supported in WARP3D structural static decks"));
-                    }
-                }
-            }
-        }
-    }
-
-    if !reasons.is_empty() {
-        let joined = reasons.into_iter().collect::<Vec<_>>().join("; ");
-        return Err(Warp3dError::Unsupported(joined));
-    }
-
-    let step_ref = step_ref.ok_or_else(|| Warp3dError::Unsupported("missing step".into()))?;
+    let step_ref = select_step(&expressed, step).map_err(Warp3dError::Unsupported)?;
     let label_map = LabelMap::from_model(&expressed);
 
     let mut used_idents: BTreeSet<String> = BTreeSet::new();
@@ -360,26 +213,14 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
                 }
             }
             BoundaryCondition::Displacement { target: Target::Set(set_name), values } => {
-                if values.get(3..6).is_some_and(|rots| rots.iter().any(Option::is_some)) {
-                    warnings.push(format!("boundary condition `{bc_name}` prescribes rotations on solid nodes without rotational DOFs (ignored)"));
-                }
                 if let Some(rset) = resolved.sets.get(set_name) {
                     for fc_node in &rset.nodes {
                         if let Some(&wn) = label_map.fc_node_to_warp.get(fc_node) {
                             let entry = nodal_bcs.entry(wn).or_insert([None; 3]);
                             for dof in 0..3 {
-                                if let Some(val) = values.get(dof).and_then(|v| *v) {
-                                    let Some(slot) = entry.get_mut(dof) else {
-                                        continue;
-                                    };
-                                    if let Some(prev) = *slot
-                                        && (prev - val).abs() > 1.0e-15
-                                    {
-                                        return Err(Warp3dError::Unsupported(format!(
-                                            "conflicting prescribed displacements on node {fc_node} DOF {}",
-                                            dof + 1
-                                        )));
-                                    }
+                                if let Some(val) = values.get(dof).and_then(|v| *v)
+                                    && let Some(slot) = entry.get_mut(dof)
+                                {
                                     *slot = Some(val);
                                 }
                             }
@@ -485,9 +326,6 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
 
     let has_loads = !nodal_forces.is_empty() || !pressure_loads.is_empty() || !body_forces.is_empty();
     let has_constraints = !nodal_bcs.is_empty() || !mpc_lines.is_empty();
-    if !has_loads && !has_constraints {
-        return Err(Warp3dError::Unsupported(format!("step `{}` has no active structural loads or boundary conditions", step_ref.name)));
-    }
 
     // 3. Emit WARP3D deck sections.
     let mut out = String::with_capacity(4096);
@@ -730,8 +568,8 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
 #[cfg(test)]
 mod tests {
     use fieldcraft_model::{
-        BoundaryCondition, ElementKind, Integration, Load, Material, Model, NonlinearStatic, Plastic, Procedure, Section, SectionKind, Set, Step,
-        Target,
+        BoundaryCondition, ElementKind, Hardening, Integration, Load, Material, Model, NonlinearStatic, Plastic, Procedure, Section, SectionKind,
+        Set, Step, Target,
     };
 
     use super::*;
@@ -1005,5 +843,64 @@ mod tests {
                 assert!(line.len() <= 72, "line exceeded 72 chars ({}): {line}", line.len());
             }
         }
+    }
+
+    #[test]
+    fn write_deck_matches_validate_resolved_and_preserves_model_resolve_error() {
+        // 1. Model::resolve() error still returns Warp3dError::Model.
+        let mut unresolved = unit_hex8_model();
+        unresolved.remove_section("solid").unwrap();
+        assert!(matches!(write_deck(&unresolved, None, None, Preset::MKgS), Err(Warp3dError::Model(_))));
+
+        // 2. Hard rejection parity (`Wedge6`) with validate_resolved.
+        let mut wedge_model = unit_hex8_model();
+        wedge_model.set_element(2, ElementKind::Wedge6, vec![1, 2, 3, 5, 6, 7]).unwrap();
+        wedge_model.replace_set("all", Set { elements: vec![1, 2], ..Set::default() }).unwrap();
+        let resolved = wedge_model.resolve().unwrap();
+        let report = crate::check::validate_resolved(&wedge_model, &resolved, None, None, None, crate::check::CheckScope::Export);
+        assert!(!report.ready);
+        assert!(matches!(write_deck(&wedge_model, None, None, Preset::MKgS), Err(Warp3dError::Unsupported(_))));
+
+        // 3. Warning parity (incompatible modes + rotational DOF + plasticity in Static step).
+        let mut warn_model = unit_hex8_model();
+        warn_model
+            .replace_material(
+                "Steel",
+                Material {
+                    elastic: Some(Elastic::Isotropic { young: 2.1e11, poisson: 0.3 }),
+                    density: Some(7850.0),
+                    plastic: Some(Plastic::Bilinear { yield_stress: 2.5e8, hardening_modulus: 0.0, hardening: Hardening::Isotropic }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        warn_model
+            .replace_section(
+                "solid",
+                Section {
+                    set: "all".into(),
+                    material: "Steel".into(),
+                    kind: SectionKind::Solid {},
+                    formulation: fieldcraft_model::Formulation { incompatible_modes: true, ..Default::default() },
+                },
+            )
+            .unwrap();
+        warn_model
+            .add_boundary_condition(
+                "rot",
+                BoundaryCondition::Displacement { target: Target::Set("tip".into()), values: [None, None, None, Some(0.01), None, None] },
+            )
+            .unwrap();
+        let mut st = warn_model.step("Pull").unwrap().clone();
+        st.boundary_conditions.insert("rot".into());
+        warn_model.replace_step(st).unwrap();
+
+        let si_res = warn_model.resolve().unwrap();
+        let report_w = crate::check::validate_resolved(&warn_model, &si_res, None, None, None, crate::check::CheckScope::Export);
+        let written = write_deck(&warn_model, None, None, Preset::MKgS).unwrap();
+        assert_eq!(written.warnings.len(), report_w.warnings);
+        assert!(written.warnings.iter().any(|w| w.contains("B-bar")));
+        assert!(written.warnings.iter().any(|w| w.contains("rotations")));
+        assert!(written.warnings.iter().any(|w| w.contains("plasticity")));
     }
 }

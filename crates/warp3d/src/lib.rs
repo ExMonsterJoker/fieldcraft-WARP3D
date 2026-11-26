@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod check;
 pub mod deck;
 pub mod fracture;
 pub mod reader;
@@ -28,9 +29,12 @@ use fieldcraft_solver::StaticResult;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use check::{
+    CheckScope, DiagnosticSeverity, Warp3dCheckReport, Warp3dDiagnostic, Warp3dQuickNote, quick_note, validate_model, validate_resolved,
+};
 pub use deck::write_deck;
 pub use results::{parse_domain_integrals, read_results_dir};
-pub use runner::{find_warp3d_binary, run_warp3d};
+pub use runner::{Warp3dBinarySource, Warp3dBinaryStatus, find_warp3d_binary, resolve_warp3d_binary, run_warp3d, run_warp3d_with_override};
 
 /// Errors returned by the FieldCraft ↔ WARP3D adapter.
 #[derive(Debug, Error)]

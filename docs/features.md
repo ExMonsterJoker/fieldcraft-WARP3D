@@ -133,7 +133,7 @@ the control channel and AI agents over MCP (docs/mcp.md) run the same commands.
 | Panel | Capability | Status | Command |
 |---|---|---|---|
 | Run | Solve — Solve every step in order and show the results | ready | `solve.run` |
-| Check | Check Model — Name every missing or bad definition before writing or solving | ready | `model.check` |
+| Check | Check Model — Name every missing or bad definition before writing or solving | ready | `model.check`, `warp3d.check` |
 | Decks | Abaqus Input — Write an Abaqus input file (.inp) | ready | `deck.write {"format":"abaqus"}` |
 | Decks | Nastran Deck — Write Nastran bulk data (SOL 101, 103) | ready | `deck.write {"format":"nastran"}` |
 | Decks | LS-DYNA Deck — Write an LS-DYNA keyword file | ready | `deck.write {"format":"lsdyna"}` |

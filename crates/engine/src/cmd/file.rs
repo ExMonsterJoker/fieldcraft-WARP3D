@@ -436,7 +436,7 @@ impl Session {
 
     /// Replace this session with `opened`, keeping its undo memory limit, its work caps and its
     /// file access (and where its commands come from); the history starts empty.
-    pub(super) fn replace_with(&mut self, mut opened: Session) {
+    pub(crate) fn replace_with(&mut self, mut opened: Session) {
         opened.history = std::mem::take(&mut self.history);
         opened.limits = self.limits;
         opened.file_access = std::mem::take(&mut self.file_access);
@@ -444,6 +444,7 @@ impl Session {
         opened.solver_diagnostics = self.solver_diagnostics.take();
         opened.origin = self.origin;
         opened.default_units = self.default_units.clone();
+        opened.warp3d_bin = self.warp3d_bin.clone();
         // The hosts count camera requests across documents.
         opened.camera_requests = self.camera_requests;
         opened.clear_history();

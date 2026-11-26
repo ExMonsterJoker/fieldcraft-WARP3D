@@ -110,6 +110,8 @@ pub(crate) enum PickerAction {
         opening: u64,
         field_path: String,
     },
+    #[cfg(not(target_arch = "wasm32"))]
+    Warp3dBin,
 }
 
 /// The status when the native file chooser fails inside the host ([`ModelApp::poll_picker`]).
@@ -362,6 +364,9 @@ pub struct Prefs {
     /// A preset or unit this version does not know reads as the default system.
     #[serde(deserialize_with = "known_or_default")]
     pub units: fieldcraft_model::DisplaySystem,
+    /// Optional desktop-only override path for the external `warp3d` executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warp3d_bin: Option<String>,
     /// Interface language preference (`system`, `en`, `he`).
     pub language: String,
     /// The browser card's width, in points.
@@ -400,6 +405,7 @@ impl Default for Prefs {
             update_checked_at: 0,
             update_skip: String::new(),
             units: fieldcraft_model::DisplaySystem::default(),
+            warp3d_bin: None,
             language: crate::i18n::ENGLISH.into(),
             browser_width: crate::browser::WIDTH,
             browser_collapsed: false,
@@ -463,6 +469,9 @@ pub struct Loading {
     /// Control-channel requests waiting for its reply (`engine.execute` of a long command,
     /// `job.wait`): each gets the command's result, or why it has none.
     pub waiters: Vec<Sender<Value>>,
+    /// Worker thread handle retained so shutdown can bound wait for active/cancelled solves.
+    #[cfg(not(target_arch = "wasm32"))]
+    join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Loading {
@@ -669,13 +678,18 @@ fn with_extension(path: String, ext: &str) -> String {
 
 /// Run `work` off the window thread (inline on the web, which has no threads).
 pub(crate) fn off_thread(name: String, work: impl FnOnce() + Send + 'static) {
-    if let Some(work) = start(name, Box::new(work)) {
+    let (pending, _join) = start(name, Box::new(work));
+    if let Some(work) = pending {
         work();
     }
 }
 
 /// A background job's work.
 type Work = Box<dyn FnOnce() + Send>;
+#[cfg(not(target_arch = "wasm32"))]
+type WorkerJoin = std::thread::JoinHandle<()>;
+#[cfg(target_arch = "wasm32")]
+type WorkerJoin = ();
 
 /// What a background job sends back: the command's reply and what it made, or why it failed.
 type Finished = Result<(Value, Product), crate::Failure>;
@@ -715,19 +729,22 @@ fn reads_only(command: &str) -> bool {
 
 /// Start `work` on a worker thread. The web has no threads: the work comes back, to run on the
 /// window thread once the window has shown that it runs ([`Loading::shown`]).
-fn start(name: String, work: Work) -> Option<Work> {
+fn start(name: String, work: Work) -> (Option<Work>, Option<WorkerJoin>) {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if let Err(e) = std::thread::Builder::new().name(name.clone()).spawn(work) {
-            // The work went with the closure: a job then reports that it could not start.
-            log::warn!("{name}: no worker thread: {e}");
+        match std::thread::Builder::new().name(name.clone()).spawn(work) {
+            Ok(handle) => (None, Some(handle)),
+            Err(e) => {
+                // The work went with the closure: a job then reports that it could not start.
+                log::warn!("{name}: no worker thread: {e}");
+                (None, None)
+            }
         }
-        None
     }
     #[cfg(target_arch = "wasm32")]
     {
         let _ = name;
-        Some(work)
+        (Some(work), None)
     }
 }
 
@@ -740,9 +757,9 @@ fn spawn(
     params: Value,
     progress: Arc<Progress>,
     drawn: Option<Arc<fieldcraft_geometry::Design>>,
-) -> (Inbox<Finished>, Option<Work>) {
+) -> (Inbox<Finished>, Option<Work>, Option<WorkerJoin>) {
     let (tx, rx) = crate::inbox::channel();
-    let work = start(
+    let (work, join) = start(
         format!("fieldcraft {command}"),
         Box::new(move || {
             let mut s = session;
@@ -761,15 +778,20 @@ fn spawn(
             let _ = tx.send(r);
         }),
     );
-    (rx, work)
+    (rx, work, join)
 }
 
 /// Run a `SOLVE_BACKGROUND` command on a lightweight snapshot without cloning `History` or `Design`.
-fn spawn_solve(session: &Session, command: &'static str, params: Value, progress: Arc<Progress>) -> (Inbox<Finished>, Option<Work>) {
+fn spawn_solve(
+    session: &Session,
+    command: &'static str,
+    params: Value,
+    progress: Arc<Progress>,
+) -> (Inbox<Finished>, Option<Work>, Option<WorkerJoin>) {
     let (tx, rx) = crate::inbox::channel();
     let worker_session = session.lightweight_solve_session();
     let (opened, revision) = (session.opened(), session.revision());
-    let work = start(
+    let (work, join) = start(
         format!("fieldcraft {command}"),
         Box::new(move || {
             let mut s = worker_session;
@@ -786,7 +808,7 @@ fn spawn_solve(session: &Session, command: &'static str, params: Value, progress
             let _ = tx.send(r);
         }),
     );
-    (rx, work)
+    (rx, work, join)
 }
 
 impl ModelApp {
@@ -858,6 +880,11 @@ impl ModelApp {
             Poll::Ready(Some(path)) => {
                 // A control command, drop, new/open, save elsewhere or completed background job
                 // may have changed what this choice was for while the native chooser was open.
+                #[cfg(not(target_arch = "wasm32"))]
+                if matches!(pending.action, PickerAction::Warp3dBin) {
+                    self.picked_file(pending.action, path);
+                    return false;
+                }
                 if self.loading.is_some()
                     || pending.document != self.session.opened()
                     || pending.revision != (self.revision, self.session.revision(), self.session.path.clone())
@@ -932,6 +959,11 @@ impl ModelApp {
                 }
                 false
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            PickerAction::Warp3dBin => {
+                self.set_warp3d_bin(Some(path));
+                false
+            }
         }
     }
 
@@ -976,7 +1008,7 @@ impl ModelApp {
         // with the same work caps and file access, as the engine keeps them when a command
         // replaces the session, and the window's count of camera requests.
         let progress = Progress::new();
-        let (rx, pending) = if SOLVE_BACKGROUND.contains(&command) {
+        let (rx, pending, join) = if SOLVE_BACKGROUND.contains(&command) {
             spawn_solve(&self.session, command, params.clone(), progress.clone())
         } else {
             let base = if command == "deck.read" {
@@ -988,6 +1020,8 @@ impl ModelApp {
             };
             spawn(base, command, params.clone(), progress.clone(), self.bodies.0.clone())
         };
+        #[cfg(target_arch = "wasm32")]
+        let _ = join;
         self.set_status(format!("{title}…"), false);
         let started = web_time::Instant::now();
         self.loading = Some(Loading {
@@ -1004,6 +1038,8 @@ impl ModelApp {
             progress,
             started,
             waiters: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            join,
         });
         true
     }
@@ -1255,11 +1291,24 @@ impl ModelApp {
             }
             let line = if l.title == "Solving" { "Solve cancelled".to_string() } else { format!("{} cancelled", l.title) };
             self.set_status(line, false);
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(join) = l.join {
+                self.cancelled_joins.push(join);
+            }
         }
+    }
+
+    /// Cancel any active background job and drain tracked worker thread handles without blocking.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn cancel_loading_for_exit(&mut self) -> Vec<std::thread::JoinHandle<()>> {
+        self.cancel_loading();
+        std::mem::take(&mut self.cancelled_joins)
     }
 
     /// Take in a finished background job (called every frame); `true` while one is running.
     pub fn poll_loading(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.cancelled_joins.retain(|h| !h.is_finished());
         let Some(l) = &mut self.loading else { return false };
         if l.pending.is_some() && !l.shown {
             return true;
@@ -1273,6 +1322,12 @@ impl ModelApp {
             Err(TryRecvError::Disconnected) => None,
         };
         let Some(l) = self.loading.take() else { return false };
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut l = l;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(join) = l.join.take().filter(|h| !h.is_finished()) {
+            self.cancelled_joins.push(join);
+        }
         let reply = match &outcome {
             Some(Ok((v, _))) => json!({"ok": true, "result": v}),
             Some(Err(e)) => json!({"ok": false, "error": e.message}),
@@ -1362,9 +1417,11 @@ impl ModelApp {
         // Its commands come from where the window's do now (the job may have started from the
         // command search or the control channel).
         session.origin = self.session.origin;
+        session.warp3d_bin = self.session.warp3d_bin.clone();
         let old = std::mem::replace(&mut self.session, session);
         off_thread("fieldcraft drop".into(), move || drop(old));
         self.model_changed();
+        self.active_crack_front = None;
         self.prebuilt = Some(*o.prebuilt);
         if let Some(p) = &o.recent {
             self.recent.add(p);
@@ -1985,10 +2042,10 @@ pub fn file_menu(app: &mut ModelApp, ui: &mut egui::Ui) {
         }
     }
     if crate::frame::menu_row(ui, "deck.write.warp3d", "WARP3D Deck…", None, true)
-        .backing_on_hover_text("Write a WARP3D input file (.inp); use the deck.write command form to include crack_front options")
+        .backing_on_hover_text("Open the WARP3D export form (.inp) with pre-flight notes, Browse…, and crack_front options")
         .clicked()
     {
-        act = Some(Box::new(|app| app.write_deck("warp3d")));
+        act = Some(Box::new(|app| app.open_form("deck.write", json!({"format": "warp3d"}))));
     }
     crate::frame::menu_separator(ui);
     if crate::frame::menu_row(ui, "file.recover", "Recover…", None, true)
@@ -3692,5 +3749,219 @@ elements
         };
         let app = ModelApp::new(Session::default()).with_services(services);
         assert!(!app.has_path_picker());
+    }
+
+    #[test]
+    fn prefs_warp3d_bin_deserializes_legacy_and_omits_when_none() {
+        let legacy: Prefs = serde_json::from_str("{}").expect("legacy prefs.json without warp3d_bin loads");
+        assert_eq!(legacy.warp3d_bin, None);
+        let serialized_none = serde_json::to_string(&legacy).unwrap();
+        assert!(!serialized_none.contains("warp3d_bin"), "{serialized_none}");
+
+        let with_bin = Prefs { warp3d_bin: Some("/opt/warp3d/bin/warp3d".into()), ..Prefs::default() };
+        let round: Prefs = serde_json::from_slice(&serde_json::to_vec(&with_bin).unwrap()).unwrap();
+        assert_eq!(round.warp3d_bin.as_deref(), Some("/opt/warp3d/bin/warp3d"));
+    }
+
+    #[test]
+    fn warp3d_bin_picker_completes_across_concurrent_load_or_model_edit() {
+        let mut app = ModelApp::new(Session::default());
+        let chooser = deferred(&mut app);
+        app.pick_file(FilePicker::Open { filters: Vec::new() }, PickerAction::Warp3dBin);
+        // Simulate a concurrent model revision bump while the native Settings chooser is open.
+        app.run("mesh.node.add", json!({"label": 1, "xyz": [0, 0, 0]})).unwrap();
+        let chosen = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        *chooser.answer.borrow_mut() = Some(Some(chosen.clone()));
+        assert!(!app.poll_picker());
+        assert_eq!(app.prefs().warp3d_bin.as_deref(), Some(chosen.as_str()));
+        assert_eq!(app.session.warp3d_bin.as_deref(), Some(Path::new(&chosen)));
+        assert_eq!(app.warp3d_status().source, fieldcraft_engine::Warp3dBinarySource::PrefsOverride);
+        assert!(app.warp3d_status().valid);
+    }
+
+    #[test]
+    fn take_opened_preserves_warp3d_bin_and_clears_active_crack_front() {
+        let mut app = ModelApp::new(Session::default());
+        let custom = PathBuf::from("/opt/custom/warp3d");
+        app.session.warp3d_bin = Some(custom.clone());
+        app.active_crack_front = Some(crate::CachedCrackFront {
+            set: "cf".into(),
+            normal: None,
+            symmetric: None,
+            rings: Some(4),
+            interaction_integral: None,
+            function_type: "pointwise".into(),
+        });
+
+        let next = Box::new(Session::default());
+        let prebuilt = Box::new(Prebuilt::of(&next, &None));
+        app.take_opened(Opened {
+            command: "file.open",
+            params: json!({}),
+            session: next,
+            prebuilt,
+            reply: json!({}),
+            done: "Opened".into(),
+            recent: None,
+            form: None,
+        });
+        assert_eq!(app.session.warp3d_bin.as_ref(), Some(&custom));
+        assert!(app.active_crack_front.is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cancel_loading_for_exit_retains_cancelled_and_active_handles() {
+        let mut app = ModelApp::new(Session::default());
+        let (tx, rx) = crate::inbox::channel();
+        let p = Progress::new();
+        let p1 = p.clone();
+        let h1 = std::thread::spawn(move || {
+            while !p1.is_cancelled() {
+                std::thread::yield_now();
+            }
+            drop(tx);
+        });
+        app.loading = Some(Loading {
+            title: "Job 1".into(),
+            done: "Done".into(),
+            recent: None,
+            form: None,
+            params: json!({}),
+            pending_set_created: false,
+            rx,
+            pending: None,
+            shown: true,
+            command: "solve.static",
+            progress: p,
+            started: web_time::Instant::now(),
+            waiters: Vec::new(),
+            join: Some(h1),
+        });
+        app.cancel_loading();
+        assert_eq!(app.cancelled_joins.len(), 1);
+
+        let (tx2, rx2) = crate::inbox::channel();
+        let p2 = Progress::new();
+        let p2_w = p2.clone();
+        let h2 = std::thread::spawn(move || {
+            while !p2_w.is_cancelled() {
+                std::thread::yield_now();
+            }
+            drop(tx2);
+        });
+        app.loading = Some(Loading {
+            title: "Job 2".into(),
+            done: "Done".into(),
+            recent: None,
+            form: None,
+            params: json!({}),
+            pending_set_created: false,
+            rx: rx2,
+            pending: None,
+            shown: true,
+            command: "solve.nonlinear",
+            progress: p2,
+            started: web_time::Instant::now(),
+            waiters: Vec::new(),
+            join: Some(h2),
+        });
+        let handles = app.cancel_loading_for_exit();
+        assert_eq!(handles.len(), 2);
+        assert!(app.cancelled_joins.is_empty());
+        assert!(app.loading.is_none());
+    }
+
+    #[test]
+    fn poll_loading_solved_step_updates_active_crack_front() {
+        let mut app = ModelApp::new(Session::default());
+        app.run("file.sample", json!({"name": "cantilever"})).unwrap();
+        app.run("model.set.create", json!({"name": "cf", "nodes": [1]})).unwrap();
+
+        let mut worker = app.session.lightweight_solve_session();
+        #[allow(clippy::disallowed_methods, reason = "test fixture producing a real StepResult")]
+        worker.execute("solve.static", &json!({"step": "Load"})).unwrap();
+        let (result, _) = worker.take_solved_step("Load").unwrap();
+
+        let (tx, rx) = crate::inbox::channel();
+        let _ = tx.send(Ok((
+            json!({"backend": "warp3d", "step": "Load"}),
+            Product::SolvedStep { result, fracture: None, opened: app.session.opened(), revision: app.session.revision() },
+        )));
+        app.loading = Some(Loading {
+            title: "Solving".into(),
+            done: "Solved".into(),
+            recent: None,
+            form: None,
+            params: json!({"backend": "warp3d", "step": "Load", "crack_front": {"set": "cf", "rings": 6, "function_type": "front_average"}}),
+            pending_set_created: false,
+            rx,
+            pending: None,
+            shown: true,
+            command: "solve.static",
+            progress: Progress::new(),
+            started: web_time::Instant::now(),
+            waiters: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            join: None,
+        });
+        app.poll_loading();
+        let cf = app.active_crack_front.as_ref().expect("async WARP3D solve caches active_crack_front");
+        assert_eq!(cf.set, "cf");
+        assert_eq!(cf.rings, Some(6));
+        assert_eq!(cf.function_type, "front_average");
+    }
+
+    #[test]
+    fn file_menu_warp3d_deck_unconditionally_opens_prefilled_form() {
+        let mut app = ModelApp::new(Session::default());
+        app.run("mesh.node.add", json!({"label": 1, "xyz": [0, 0, 0]})).unwrap();
+        app.run("model.set.create", json!({"name": "front", "nodes": [1]})).unwrap();
+        app.services.pick_save = Some(Box::new(|_, _| Some("/tmp/should_not_bypass.inp".into())));
+        app.active_crack_front = Some(crate::CachedCrackFront {
+            set: "front".into(),
+            normal: None,
+            symmetric: Some(true),
+            rings: Some(5),
+            interaction_integral: None,
+            function_type: "pointwise".into(),
+        });
+
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 700.0))), ..Default::default() },
+            |ui| file_menu(&mut app, ui),
+        );
+        out.textures_delta.clear();
+        let pos = {
+            fn find(s: &egui::Shape) -> Option<egui::Pos2> {
+                match s {
+                    egui::Shape::Text(t) if t.galley.text() == "WARP3D Deck…" => Some(t.pos + t.galley.size() * 0.5),
+                    egui::Shape::Vec(v) => v.iter().find_map(find),
+                    _ => None,
+                }
+            }
+            out.shapes.iter().find_map(|cs| find(&cs.shape)).expect("WARP3D Deck… menu entry")
+        };
+        let mut click = ctx.run_ui(
+            egui::RawInput {
+                time: Some(1.0),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 700.0))),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+                ],
+                ..Default::default()
+            },
+            |ui| file_menu(&mut app, ui),
+        );
+        click.textures_delta.clear();
+        let d = app.dialog.as_ref().expect("WARP3D Deck… menu item opens deck.write form");
+        assert_eq!(d.command, "deck.write");
+        let parsed: Value = serde_json::from_str(&d.text).unwrap();
+        assert_eq!(parsed["format"], "warp3d");
+        assert_eq!(parsed["crack_front"]["set"], "front");
+        assert_eq!(parsed["crack_front"]["rings"], 5);
     }
 }

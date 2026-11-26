@@ -397,6 +397,68 @@ type RelaxPreview = (Option<(u64, String)>, Option<Arc<fieldcraft_engine::cmd::R
 /// The open Solve Fluid form's memory estimate in a line and why the run would be refused (or
 /// why there is no estimate), by model revision and form text.
 type FluidNote = (Option<(u64, String)>, Option<(String, Option<String>)>);
+/// Cached in-session WARP3D crack-front settings (not written to `.fieldcraft` or `prefs.json`).
+#[derive(Clone, Debug, PartialEq)]
+struct CachedCrackFront {
+    set: String,
+    normal: Option<[f64; 3]>,
+    symmetric: Option<bool>,
+    rings: Option<usize>,
+    interaction_integral: Option<bool>,
+    function_type: String,
+}
+
+impl CachedCrackFront {
+    fn from_json(v: &Value) -> Option<Self> {
+        let obj = v.as_object()?;
+        let set = obj.get("set").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?.to_string();
+        let normal = match obj.get("normal") {
+            Some(Value::Array(arr)) if arr.len() == 3 => {
+                let x = arr.first().and_then(Value::as_f64).filter(|n| n.is_finite())?;
+                let y = arr.get(1).and_then(Value::as_f64).filter(|n| n.is_finite())?;
+                let z = arr.get(2).and_then(Value::as_f64).filter(|n| n.is_finite())?;
+                Some([x, y, z])
+            }
+            _ => None,
+        };
+        let symmetric = obj.get("symmetric").and_then(Value::as_bool);
+        let rings = obj.get("rings").and_then(Value::as_u64).and_then(|r| usize::try_from(r).ok()).filter(|r| (1..=20).contains(r));
+        let interaction_integral = obj.get("interaction_integral").and_then(Value::as_bool);
+        let function_type = match obj.get("function_type").and_then(Value::as_str) {
+            Some("front_average") => "front_average".to_string(),
+            _ => "pointwise".to_string(),
+        };
+        Some(Self { set, normal, symmetric, rings, interaction_integral, function_type })
+    }
+
+    fn to_json(&self) -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("set".into(), json!(self.set));
+        if let Some(n) = self.normal {
+            obj.insert("normal".into(), json!(n));
+        }
+        if let Some(sym) = self.symmetric {
+            obj.insert("symmetric".into(), json!(sym));
+        }
+        if let Some(r) = self.rings {
+            obj.insert("rings".into(), json!(r));
+        }
+        if let Some(ii) = self.interaction_integral {
+            obj.insert("interaction_integral".into(), json!(ii));
+        }
+        obj.insert("function_type".into(), json!(self.function_type));
+        Value::Object(obj)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Warp3dNoteKey {
+    command: &'static str,
+    payload: String,
+}
+
+/// Cached `$O(1)` WARP3D form note keyed strictly by `(model_revision, Warp3dNoteKey)` so path edits hit cache.
+type Warp3dNote = (Option<(u64, Warp3dNoteKey)>, Option<(String, Option<String>)>);
 
 /// A screenshot asked for over the control channel.
 struct Shot {
@@ -421,6 +483,15 @@ pub struct ModelApp {
     merge_preview: std::cell::RefCell<MergePreview>,
     relax_preview: std::cell::RefCell<RelaxPreview>,
     fluid_note: std::cell::RefCell<FluidNote>,
+    /// Cached WARP3D form definition check note, keyed by `(revision, Warp3dNoteKey)`.
+    warp3d_note: std::cell::RefCell<Warp3dNote>,
+    /// Cached desktop WARP3D executable resolution status (refreshed at startup, Settings open, or override update).
+    warp3d_status: fieldcraft_engine::Warp3dBinaryStatus,
+    /// Last valid WARP3D `crack_front` setup for this session only (cleared on document switch).
+    active_crack_front: Option<CachedCrackFront>,
+    /// Worker thread handles retained after user cancellation so exit cleanup waits boundedly.
+    #[cfg(not(target_arch = "wasm32"))]
+    cancelled_joins: Vec<std::thread::JoinHandle<()>>,
     /// The open Move Nodes form's move, worked out for the view ([`node_move`]).
     node_move: std::cell::RefCell<node_move::Cache>,
     /// The Move Nodes drag in progress.
@@ -600,6 +671,7 @@ impl ModelApp {
     pub fn new(mut session: Session) -> ModelApp {
         // The window's own model: its commands count as clicks unless said otherwise.
         session.origin.get_or_insert(fieldcraft_engine::usage::Origin::Ui);
+        let warp3d_status = fieldcraft_engine::warp3d_binary_status(&session);
         ModelApp {
             session,
             ui: UiState::default(),
@@ -610,6 +682,11 @@ impl ModelApp {
             merge_preview: Default::default(),
             relax_preview: Default::default(),
             fluid_note: Default::default(),
+            warp3d_note: Default::default(),
+            warp3d_status,
+            active_crack_front: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            cancelled_joins: Vec::new(),
             node_move: Default::default(),
             node_drag: None,
             forms_opened: 0,
@@ -704,6 +781,8 @@ impl ModelApp {
         self.recent = files::Recent::load(services.recent_path.clone());
         self.prefs = files::Prefs::load(services.prefs.as_ref());
         self.session.default_units = self.prefs.units.clone();
+        self.session.warp3d_bin = self.prefs.warp3d_bin.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(std::path::PathBuf::from);
+        self.refresh_warp3d_status();
         self.ui.nav_preset = self.prefs.nav_preset.clone();
         self.ui.reverse_zoom = self.prefs.reverse_zoom;
         self.ui.browser_width = self.prefs.browser_width;
@@ -714,6 +793,25 @@ impl ModelApp {
         self.ui.history_dock = self.prefs.history_dock;
         self.services = services;
         self
+    }
+
+    /// Cached resolution status for the desktop `warp3d` executable.
+    pub fn warp3d_status(&self) -> &fieldcraft_engine::Warp3dBinaryStatus {
+        &self.warp3d_status
+    }
+
+    /// Re-evaluate the cached `warp3d` binary status on startup, Settings open, or override change.
+    pub fn refresh_warp3d_status(&mut self) {
+        self.warp3d_status = fieldcraft_engine::warp3d_binary_status(&self.session);
+    }
+
+    /// Persist a custom desktop `warp3d` executable override (or clear it to auto-detect) and update session host state.
+    pub fn set_warp3d_bin(&mut self, bin: Option<String>) {
+        let cleaned = bin.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        self.prefs.warp3d_bin = cleaned.clone();
+        self.prefs.save(self.services.prefs.as_ref());
+        self.session.warp3d_bin = cleaned.map(std::path::PathBuf::from);
+        self.refresh_warp3d_status();
     }
 
     /// Draw the viewport on the GPU (eframe's wgpu render state, with the app's depth buffer
@@ -816,6 +914,7 @@ impl ModelApp {
     }
 
     pub(crate) fn apply_command_reply(&mut self, id: &str, label: &str, params: &Value, v: &Value, changed: bool, display: bool) {
+        self.sync_warp3d_crack_front(id, params, v);
         if v.is_null() || (changed && id != "deck.read") || display {
             self.set_status(reply::done(id, label, params, v), false);
             return;
@@ -970,6 +1069,19 @@ impl ModelApp {
                     && obj.get("name").and_then(Value::as_str).is_none_or(str::is_empty)
                 {
                     obj.insert("name".into(), json!(name));
+                }
+                if !obj.get("crack_front").is_some_and(|v| !v.is_null())
+                    && let Some(cf) = self.valid_crack_front_json()
+                {
+                    let should_prefill = match spec.id {
+                        "warp3d.check" => true,
+                        "deck.write" => obj.get("format").and_then(Value::as_str) == Some("warp3d"),
+                        "solve.static" | "solve.nonlinear" => fieldcraft_engine::effective_structural_backend(&Value::Object(obj.clone())),
+                        _ => false,
+                    };
+                    if should_prefill {
+                        obj.insert("crack_front".into(), cf);
+                    }
                 }
             }
             self.forms_opened = self.forms_opened.wrapping_add(1);
@@ -1483,6 +1595,80 @@ impl ModelApp {
             *cache = (Some((self.revision, d.text.clone())), Some(note));
         }
         cache.1.clone()
+    }
+
+    /// Return the in-session `crack_front` parameters if valid against current model sets.
+    pub(crate) fn valid_crack_front_json(&self) -> Option<Value> {
+        let cf = self.active_crack_front.as_ref()?;
+        self.session.model.set(&cf.set).is_some().then(|| cf.to_json())
+    }
+
+    fn sync_warp3d_crack_front(&mut self, id: &str, params: &Value, v: &Value) {
+        if id == "model.rename"
+            && v["kind"].as_str() == Some("set")
+            && let (Some(from), Some(to), Some(cf)) = (v["from"].as_str(), v["name"].as_str(), &mut self.active_crack_front)
+            && cf.set == from
+        {
+            cf.set = to.to_string();
+            return;
+        }
+        let is_export_or_solve = match id {
+            "deck.write" => params.get("format").and_then(Value::as_str) == Some("warp3d"),
+            "solve.static" | "solve.nonlinear" => {
+                v.get("backend").and_then(Value::as_str) == Some("warp3d") || fieldcraft_engine::effective_structural_backend(params)
+            }
+            "warp3d.check" => {
+                if let Some(raw) = params.get("crack_front").filter(|val| !val.is_null())
+                    && let Some(cf) = CachedCrackFront::from_json(raw)
+                    && self.session.model.set(&cf.set).is_some()
+                {
+                    self.active_crack_front = Some(cf);
+                }
+                return;
+            }
+            _ => return,
+        };
+        if is_export_or_solve {
+            self.active_crack_front = params
+                .get("crack_front")
+                .filter(|val| !val.is_null())
+                .and_then(CachedCrackFront::from_json)
+                .filter(|cf| self.session.model.set(&cf.set).is_some());
+        }
+    }
+
+    /// Constant-time ($O(1)$) pre-flight preview note for active WARP3D forms, cached on
+    /// `(revision, format/backend/step/steps/crack_front)` so typing into file path fields hits cache.
+    pub fn warp3d_note(&self) -> Option<(String, Option<String>)> {
+        let d = self.dialog.as_ref()?;
+        if !matches!(d.command, "deck.write" | "solve.static" | "solve.nonlinear") {
+            return None;
+        }
+        let params: Value = serde_json::from_str(&d.text).ok()?;
+        let is_warp3d = match d.command {
+            "deck.write" => params.get("format").and_then(Value::as_str) == Some("warp3d"),
+            "solve.static" | "solve.nonlinear" => fieldcraft_engine::effective_structural_backend(&params),
+            _ => false,
+        };
+        if !is_warp3d {
+            return None;
+        }
+        let payload =
+            json!([params.get("format"), params.get("backend"), params.get("step"), params.get("steps"), params.get("crack_front"),]).to_string();
+        let key = Warp3dNoteKey { command: d.command, payload };
+        let mut cache = self.warp3d_note.borrow_mut();
+        if cache.0.as_ref().is_none_or(|(rev, prev)| *rev != self.revision || prev != &key) {
+            let note = fieldcraft_engine::warp3d_quick_note(&self.session, d.command, &params).map(|n| (n.summary, n.problem));
+            *cache = (Some((self.revision, key)), note);
+        }
+        cache.1.clone()
+    }
+
+    /// Open `model.step.create` prefilled with all WARP3D-supported structural BCs and loads
+    /// present in the model (leaving `procedure` unselected for engineer choice).
+    pub(crate) fn open_warp3d_create_step(&mut self) {
+        let (bcs, loads) = warp3d_step_prefill_entities(&self.session.model);
+        self.open_form("model.step.create", json!({"boundary_conditions": bcs, "loads": loads}));
     }
 
     /// The open Relax Nodes form's preview in a line: nodes moved and the region's quality.
@@ -2845,6 +3031,32 @@ fn probe_rows(reply: &Value, plot: Option<&results::Plot>, units: &DisplaySystem
 pub(crate) fn gpu_turn() -> std::sync::MutexGuard<'static, ()> {
     static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Collect WARP3D-supported structural boundary condition and load names in deterministic order for step prefill.
+pub(crate) fn warp3d_step_prefill_entities(model: &fieldcraft_model::Model) -> (Vec<String>, Vec<String>) {
+    let bcs = model
+        .boundary_conditions()
+        .iter()
+        .filter(|(_, bc)| !bc.is_thermal() && matches!(bc.target(), fieldcraft_model::Target::Set(_)))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let loads = model
+        .loads()
+        .iter()
+        .filter(|(_, load)| {
+            matches!(
+                load,
+                fieldcraft_model::Load::Force { target: fieldcraft_model::Target::Set(_), .. }
+                    | fieldcraft_model::Load::Traction { .. }
+                    | fieldcraft_model::Load::Pressure { .. }
+                    | fieldcraft_model::Load::BodyForce { .. }
+                    | fieldcraft_model::Load::Gravity { .. }
+            )
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    (bcs, loads)
 }
 
 #[cfg(test)]
@@ -4482,5 +4694,115 @@ mod tests {
         let mut empty = ModelApp::new(Session::default());
         empty.cam.target = Vec3::new(1.0, 2.0, 3.0);
         assert_eq!(empty.drawn_centre(), Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn crack_front_in_session_prefill_rename_clear_and_validation() {
+        let mut app = ModelApp::new(Session::default());
+        app.run("mesh.node.add", json!({"label": 1, "xyz": [0, 0, 0]})).unwrap();
+        app.run("model.set.create", json!({"name": "cf_old", "nodes": [1]})).unwrap();
+
+        // Nonexistent set in warp3d.check stays uncached.
+        let report = app.run("warp3d.check", json!({"crack_front": {"set": "no_such_set"}})).unwrap();
+        assert_eq!(report["ready"], false);
+        assert!(app.active_crack_front.is_none());
+
+        // Valid set caches in session, survives rename past early-return branch, and clears on crack-free export.
+        app.run("warp3d.check", json!({"crack_front": {"set": "cf_old", "rings": 6, "symmetric": true}})).unwrap();
+        assert_eq!(app.active_crack_front.as_ref().map(|c| c.set.as_str()), Some("cf_old"));
+
+        app.run("model.rename", json!({"kind": "set", "from": "cf_old", "to": "cf_new"})).unwrap();
+        assert_eq!(app.active_crack_front.as_ref().map(|c| c.set.as_str()), Some("cf_new"));
+
+        // Prefill gated strictly on WARP3D forms/backends; never prefill crack_face or non-WARP3D.
+        app.open_form("warp3d.check", json!({}));
+        let check_params: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();
+        assert_eq!(check_params["crack_front"]["set"], "cf_new");
+        assert!(check_params.get("crack_face").is_none_or(Value::is_null));
+
+        app.open_form("deck.write", json!({"format": "warp3d"}));
+        let dw_warp: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();
+        assert_eq!(dw_warp["crack_front"]["set"], "cf_new");
+
+        app.open_form("deck.write", json!({"format": "abaqus"}));
+        let dw_abq: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();
+        assert!(dw_abq.get("crack_front").is_none_or(Value::is_null));
+
+        app.open_form("solve.static", json!({"backend": "native"}));
+        let ss_nat: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();
+        assert!(ss_nat.get("crack_front").is_none_or(Value::is_null));
+
+        app.open_form("solve.static", json!({"backend": "warp3d"}));
+        let ss_warp: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();
+        assert_eq!(ss_warp["crack_front"]["set"], "cf_new");
+
+        // Switching to a new document clears active_crack_front via frame_new_document().
+        app.run("file.new", json!({})).unwrap();
+        app.model_changed();
+        assert!(app.active_crack_front.is_none());
+    }
+
+    #[test]
+    fn warp3d_note_hits_cache_on_path_edits_and_open_warp3d_create_step_filters_entities() {
+        let mut s = Session::default();
+        s.model.set_node(1, [0.0, 0.0, 0.0]).unwrap();
+        s.model.add_set("s1", fieldcraft_model::Set { nodes: vec![1], ..Default::default() }).unwrap();
+        s.model
+            .add_boundary_condition("fix", fieldcraft_model::BoundaryCondition::Fixed { target: fieldcraft_model::Target::Set("s1".into()) })
+            .unwrap();
+        s.model
+            .add_boundary_condition(
+                "temp_bc",
+                fieldcraft_model::BoundaryCondition::Temperature { target: fieldcraft_model::Target::Set("s1".into()), value: 100.0 },
+            )
+            .unwrap();
+        s.model
+            .add_load(
+                "force",
+                fieldcraft_model::Load::Force {
+                    target: fieldcraft_model::Target::Set("s1".into()),
+                    vector: [1.0, 0.0, 0.0],
+                    distribution: Default::default(),
+                },
+            )
+            .unwrap();
+        s.model.add_load("grav", fieldcraft_model::Load::Gravity { acceleration: [0.0, 0.0, -9.81], set: None }).unwrap();
+        s.model
+            .add_load(
+                "moment",
+                fieldcraft_model::Load::Moment {
+                    target: fieldcraft_model::Target::Set("s1".into()),
+                    vector: [0.0, 0.0, 1.0],
+                    distribution: Default::default(),
+                },
+            )
+            .unwrap();
+        s.model.add_load("flux", fieldcraft_model::Load::SurfaceFlux { set: "s1".into(), flux: 10.0 }).unwrap();
+        s.model.add_reference_point("rp", fieldcraft_model::ReferencePoint { xyz: [0.0; 3], label: 2 }).unwrap();
+        s.model
+            .add_load(
+                "rp_force",
+                fieldcraft_model::Load::Force {
+                    target: fieldcraft_model::Target::ReferencePoint("rp".into()),
+                    vector: [1.0, 0.0, 0.0],
+                    distribution: Default::default(),
+                },
+            )
+            .unwrap();
+
+        let mut app = ModelApp::new(s);
+        app.open_form("solve.static", json!({"backend": "warp3d", "deck_path": "/tmp/a.inp"}));
+        assert!(app.warp3d_note().is_some());
+        *app.warp3d_note.borrow_mut().1.as_mut().unwrap() = ("CACHE_HIT_SENTINEL".into(), None);
+        app.dialog.as_mut().unwrap().text = json!({"backend": "warp3d", "deck_path": "/tmp/typed_more.inp", "threads": 4}).to_string();
+        assert_eq!(app.warp3d_note().unwrap().0, "CACHE_HIT_SENTINEL", "path/threads edits must reuse cached O(1) note");
+
+        app.open_warp3d_create_step();
+        let d = app.dialog.as_ref().unwrap();
+        assert_eq!(d.command, "model.step.create");
+        let parsed: Value = serde_json::from_str(&d.text).unwrap();
+        assert_eq!(parsed["boundary_conditions"], json!(["fix"]));
+        assert_eq!(parsed["loads"], json!(["force", "grav"]));
+        assert_eq!(parsed["procedure"], json!({"type": "static"}));
     }
 }

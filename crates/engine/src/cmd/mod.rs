@@ -32,6 +32,7 @@ pub use nodes::merge_preview as node_merge_preview;
 pub use plan::untagged_faces;
 pub use relax::{Preview as RelaxPreview, preview as relax_preview, sphere as relax_sphere};
 pub use solve::{FluidEstimate, fluid_estimate};
+pub use warp3d::{effective_structural_backend, warp3d_binary_status, warp3d_check_preview, warp3d_quick_note};
 mod fluid_measure;
 mod library;
 mod mirror;
@@ -59,6 +60,7 @@ pub mod update;
 pub(crate) mod view;
 pub(crate) mod views;
 mod virtual_faces;
+mod warp3d;
 pub mod xy;
 
 use crate::schema::ProblemKind;
@@ -230,6 +232,7 @@ pub static ALL: &[CommandSpec] = &[
     deck::READ,
     openfoam::WRITE,
     openfoam::read::READ,
+    warp3d::CHECK,
     solve::RUN,
     solve::STATIC,
     solve::NONLINEAR,

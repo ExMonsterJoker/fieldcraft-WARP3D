@@ -44,6 +44,11 @@ impl ModelApp {
             merge_preview,
             relax_preview,
             fluid_note,
+            warp3d_note: _,
+            warp3d_status: _,
+            active_crack_front,
+            #[cfg(not(target_arch = "wasm32"))]
+                cancelled_joins: _,
             node_move,
             node_drag,
             // Numbers every form opening: never reused.
@@ -146,6 +151,7 @@ impl ModelApp {
         *merge_preview = Default::default();
         *relax_preview = Default::default();
         *fluid_note = Default::default();
+        *active_crack_front = None;
         *node_move = Default::default();
         *node_drag = None;
         viewport.document_replaced();
@@ -161,7 +167,10 @@ impl ModelApp {
         *refused = None;
         // A question about the old document (its unsaved changes, what a deletion or a remesh
         // of its items would do, a design over its model) has nothing left to answer for.
-        if matches!(prompt, Some(Prompt::Unsaved(_) | Prompt::ReplaceMesh(_) | Prompt::Delete(_) | Prompt::Design(_))) {
+        if matches!(
+            prompt,
+            Some(Prompt::Unsaved(_) | Prompt::UnpersistedFracture(_) | Prompt::ReplaceMesh(_) | Prompt::Delete(_) | Prompt::Design(_))
+        ) {
             *prompt = None;
             *held = None;
         }

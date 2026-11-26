@@ -292,6 +292,10 @@ fn read(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 pub(super) fn parse_crack_front(p: &Value) -> Result<Option<fieldcraft_warp3d::CrackFrontSpec>> {
+    parse_crack_front_with(p, false)
+}
+
+pub(super) fn parse_crack_front_with(p: &Value, allow_empty_set: bool) -> Result<Option<fieldcraft_warp3d::CrackFrontSpec>> {
     let Some(raw) = p.get("crack_front") else {
         return Ok(None);
     };
@@ -301,13 +305,22 @@ pub(super) fn parse_crack_front(p: &Value) -> Result<Option<fieldcraft_warp3d::C
     let Some(obj) = raw.as_object() else {
         return Err(EngineError::invalid("crack_front", "must be a JSON object"));
     };
-    let set = obj
-        .get("set")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| EngineError::invalid("crack_front/set", "must name an existing crack-front set"))?
-        .to_string();
+    let set = match obj.get("set") {
+        None | Some(Value::Null) if allow_empty_set => String::new(),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                if allow_empty_set {
+                    String::new()
+                } else {
+                    return Err(EngineError::invalid("crack_front/set", "must name an existing crack-front set"));
+                }
+            } else {
+                trimmed.to_string()
+            }
+        }
+        _ => return Err(EngineError::invalid("crack_front/set", "must name an existing crack-front set")),
+    };
 
     let normal = match obj.get("normal") {
         None | Some(Value::Null) => None,

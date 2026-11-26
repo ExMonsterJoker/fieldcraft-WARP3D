@@ -63,6 +63,8 @@ pub const PAGES: &[Page<ModelApp>] = &[
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Snapshot {
     units: DisplaySystem,
+    #[serde(skip_serializing)]
+    warp3d_bin: Option<String>,
     language: String,
     history_dock: HistoryDock,
     browser_float: bool,
@@ -79,6 +81,7 @@ impl Snapshot {
     fn of(app: &ModelApp) -> Snapshot {
         Snapshot {
             units: app.prefs.units.clone(),
+            warp3d_bin: app.prefs.warp3d_bin.clone(),
             language: app.prefs.language.clone(),
             history_dock: app.ui.history_dock,
             browser_float: app.ui.browser_float,
@@ -95,6 +98,9 @@ impl Snapshot {
     fn put_back(&self, app: &mut ModelApp) {
         if app.prefs.units != self.units {
             app.set_default_units(self.units.clone());
+        }
+        if app.prefs.warp3d_bin != self.warp3d_bin {
+            app.set_warp3d_bin(self.warp3d_bin.clone());
         }
         if app.prefs.language != self.language {
             app.set_language(self.language.clone());
@@ -147,6 +153,7 @@ impl Host for ModelApp {
 impl ModelApp {
     /// Open Settings at the page it last showed (the app bar's gear, Help › Settings…).
     pub fn open_settings(&mut self) {
+        self.refresh_warp3d_status();
         let page = self.settings.section;
         self.settings.open_at(page, PAGES.len());
         self.ui.menu = None;
@@ -237,7 +244,12 @@ pub fn from_control(app: &mut ModelApp, p: &Value) -> Result<Value, String> {
     };
     let change = match p.get("set") {
         None => None,
-        Some(set) => Some(serde_json::from_value::<Change>(set.clone()).map_err(|e| format!("`set`: {e}"))?),
+        Some(set) => {
+            if set.as_object().is_some_and(|o| o.contains_key("warp3d_bin")) {
+                return Err("`warp3d_bin` cannot be read or modified over the control channel; configure it interactively in Settings".into());
+            }
+            Some(serde_json::from_value::<Change>(set.clone()).map_err(|e| format!("`set`: {e}"))?)
+        }
     };
     let press = match p.get("press").map(|b| b.as_str()) {
         None => None,
@@ -370,6 +382,66 @@ fn general(ui: &mut egui::Ui, app: &mut ModelApp) {
             check(ui, "settings.browser_eye_left", "settings.browser_eye_left_hint", &mut app.ui.browser_eye_left);
             check(ui, "settings.status_bar", "settings.status_bar_hint", &mut app.ui.status_bar);
         });
+        kit::settings_section(ui, "warp3d", tr("settings.warp3d"), |ui| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let status = app.warp3d_status().clone();
+                let source_label = match status.source {
+                    fieldcraft_engine::Warp3dBinarySource::PrefsOverride => tr("settings.warp3d_source_override"),
+                    fieldcraft_engine::Warp3dBinarySource::EnvFieldcraftBin => "FIELDCRAFT_WARP3D_BIN",
+                    fieldcraft_engine::Warp3dBinarySource::EnvWarp3dHome => "WARP3D_HOME",
+                    fieldcraft_engine::Warp3dBinarySource::Path => "PATH",
+                    fieldcraft_engine::Warp3dBinarySource::NotFound => tr("settings.warp3d_source_not_found"),
+                };
+                let (badge, check_status) = if status.valid {
+                    (tr("settings.warp3d_valid"), kit::CheckStatus::Ok)
+                } else {
+                    (tr("settings.warp3d_missing"), kit::CheckStatus::Error)
+                };
+                kit::check_status_line(ui, "fc_settings_warp3d:status", &format!("{badge} · {source_label}"), check_status);
+                if let Some(path) = &status.path {
+                    let full = path.display().to_string();
+                    let font = egui::TextStyle::Small.resolve(ui.style());
+                    let shown = crate::elide::middle_in(ui, &full, &font, ui.available_width());
+                    kit::text(ui, &shown, kit::Text::Inline).backing_on_hover_text(full);
+                }
+                if let Some(err) = &status.error {
+                    kit::status_line(ui, err, kit::StatusTone::Error);
+                }
+                let can_browse = app.has_path_picker() && app.busy().is_none();
+                let browse_tip = if !app.has_path_picker() {
+                    tr("settings.warp3d_browse_no_picker")
+                } else if app.busy().is_some() {
+                    tr("settings.warp3d_browse_busy")
+                } else {
+                    tr("settings.warp3d_browse_hint")
+                };
+                let has_override = app.prefs.warp3d_bin.is_some();
+                let (mut pick_warp3d, mut reset_warp3d) = (false, false);
+                ui.horizontal(|ui| {
+                    pick_warp3d =
+                        kit::button(ui, tr("settings.warp3d_browse"), kit::Button::Enabled(can_browse)).backing_on_hover_text(browse_tip).clicked();
+                    reset_warp3d = kit::button(ui, tr("settings.warp3d_reset"), kit::Button::Enabled(has_override))
+                        .backing_on_hover_text(tr("settings.warp3d_reset_hint"))
+                        .clicked();
+                });
+                if pick_warp3d {
+                    #[cfg(target_os = "windows")]
+                    let filters =
+                        vec![crate::files::Filter::new("Executables", &["exe", "cmd", "bat"]), crate::files::Filter::new("All files", &["*"])];
+                    #[cfg(not(target_os = "windows"))]
+                    let filters = Vec::new();
+                    app.pick_file(crate::files::FilePicker::Open { filters }, crate::files::PickerAction::Warp3dBin);
+                }
+                if reset_warp3d {
+                    app.set_warp3d_bin(None);
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                note(ui, "settings.warp3d_wasm_note");
+            }
+        });
     });
 }
 
@@ -377,6 +449,9 @@ fn general_defaults(app: &mut ModelApp) {
     let d = Prefs::default();
     if app.prefs.units != d.units {
         app.set_default_units(d.units);
+    }
+    if app.prefs.warp3d_bin != d.warp3d_bin {
+        app.set_warp3d_bin(d.warp3d_bin);
     }
     if app.prefs.language != d.language {
         app.set_language(d.language);

@@ -714,7 +714,7 @@ pub static CATALOGUE: &[Capability] = &[
     soon("interaction.fsi", "FSI Interface", Interactions, "Coupled", "M13", "The fluid–structure interface"),
     // ---- Solve ----
     ready("solve.run", "Solve", Solve, "Run", "Solve every step in order and show the results"),
-    ready("model.check", "Check Model", Solve, "Check", "Name every missing or bad definition before writing or solving"),
+    ready_more("model.check", "Check Model", Solve, "Check", "Name every missing or bad definition before writing or solving", &["warp3d.check"]),
     deck("deck.write.abaqus", "Abaqus Input", "abaqus", "Write an Abaqus input file (.inp)"),
     deck("deck.write.nastran", "Nastran Deck", "nastran", "Write Nastran bulk data (SOL 101, 103)"),
     deck("deck.write.lsdyna", "LS-DYNA Deck", "lsdyna", "Write an LS-DYNA keyword file"),
@@ -1032,7 +1032,11 @@ mod tests {
     fn entries_are_well_formed() {
         let mut ids: Vec<&str> = CATALOGUE.iter().map(|c| c.id).collect();
         for c in CATALOGUE {
-            assert!(c.id.split('.').count() >= 2 && c.id.chars().all(|ch| ch.is_ascii_lowercase() || ch == '.' || ch == '_'), "{}", c.id);
+            assert!(
+                c.id.split('.').count() >= 2 && c.id.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '.' || ch == '_'),
+                "{}",
+                c.id
+            );
             assert!(!c.label.is_empty() && !c.panel.is_empty() && !c.tip.is_empty(), "{}", c.id);
             if let Some(m) = c.milestone() {
                 assert!(m.strip_prefix('M').is_some_and(|n| n.parse::<u32>().is_ok_and(|n| (1..=14).contains(&n))), "{}: {m}", c.id);

@@ -320,6 +320,8 @@ fn form(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens, bounds: Rect, anchor:
     let running = app.busy().map(str::to_string);
     let relax_note = app.relax_note().or_else(|| app.node_move_note());
     let fluid_note = app.fluid_note();
+    let warp3d_note = app.warp3d_note();
+    let cached_crack_front = app.valid_crack_front_json();
     let units = app.session.units().clone();
     let can_browse = app.has_path_picker();
     // Escape closes an open menu, command search, or native file chooser, not the form under it.
@@ -425,12 +427,33 @@ fn form(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens, bounds: Rect, anchor:
                     selection: Some(selection),
                     can_browse,
                 };
+                let is_warp3d_obj = |cmd: &str, map: &serde_json::Map<String, Value>| -> bool {
+                    match cmd {
+                        "deck.write" => map.get("format").and_then(Value::as_str) == Some("warp3d"),
+                        "solve.static" | "solve.nonlinear" => fieldcraft_engine::effective_structural_backend(&Value::Object(map.clone())),
+                        _ => false,
+                    }
+                };
+                let was_warp3d = is_warp3d_obj(spec.id, &obj);
                 let out = crate::form::show(ui, t, &cx, fields, &mut obj);
                 invalid = out.invalid;
                 create = out.create;
                 browse = out.browse;
                 hover_body = out.hover_body;
                 if out.changed {
+                    let is_warp3d = is_warp3d_obj(spec.id, &obj);
+                    if !was_warp3d && is_warp3d {
+                        let switched_target = (spec.id == "deck.write" && out.touched.iter().any(|k| k == "format"))
+                            || (matches!(spec.id, "solve.static" | "solve.nonlinear") && out.touched.iter().any(|k| k == "backend"));
+                        if switched_target
+                            && !obj.get("crack_front").is_some_and(|v| !v.is_null())
+                            && let Some(cf) = &cached_crack_front
+                        {
+                            obj.insert("crack_front".into(), cf.clone());
+                        }
+                    } else if was_warp3d && !is_warp3d {
+                        obj.remove("crack_front");
+                    }
                     d.text = Value::Object(obj).to_string();
                     d.error = None;
                     d.refused = None;
@@ -454,6 +477,24 @@ fn form(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens, bounds: Rect, anchor:
             if let Some(problem) = problem {
                 kit::status_line(ui, problem, kit::StatusTone::Error);
             }
+        }
+        if let Some((note, problem)) = &warp3d_note {
+            kit::status_line(ui, note, kit::StatusTone::Dim);
+            if let Some(problem) = problem {
+                kit::status_line(ui, problem, kit::StatusTone::Error);
+            }
+        }
+        let crack_front_notice = serde_json::from_str::<Value>(&d.text).ok().is_some_and(|cur| {
+            let active_form = match spec.id {
+                "warp3d.check" => true,
+                "deck.write" => cur.get("format").and_then(Value::as_str) == Some("warp3d"),
+                "solve.static" | "solve.nonlinear" => fieldcraft_engine::effective_structural_backend(&cur),
+                _ => false,
+            };
+            active_form && cur.get("crack_front").and_then(Value::as_object).is_some_and(|o| !o.is_empty())
+        });
+        if crack_front_notice {
+            kit::status_line(ui, "Crack front settings are kept for this session only; not saved in .fieldcraft", kit::StatusTone::Dim);
         }
         // Read after the fields are drawn: a field holding something that is not a value, or
         // a running job, keeps OK greyed (the kit's `applying`).
@@ -1230,5 +1271,32 @@ mod tests {
         let mut out2 = ctx.run_ui(esc(), |ui| panel(&mut app, ui));
         out2.textures_delta.clear();
         assert!(app.dialog.is_none(), "Escape closes form once native chooser finishes");
+    }
+
+    #[test]
+    fn context_panel_renders_warp3d_note_and_session_only_crack_front_notice() {
+        let mut app = ModelApp::new(fieldcraft_engine::Session::default());
+        app.run("mesh.node.add", json!({"label": 1, "xyz": [0, 0, 0]})).unwrap();
+        app.run("model.set.create", json!({"name": "cf", "nodes": [1]})).unwrap();
+        app.open_form("deck.write", json!({"format": "warp3d", "crack_front": {"set": "cf"}}));
+
+        let ctx = egui::Context::default();
+        let raw =
+            || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 1400.0))), ..Default::default() };
+        let mut warm = ctx.run_ui(raw(), |ui| app.ui(ui));
+        warm.textures_delta.clear();
+        let mut out = ctx.run_ui(raw(), |ui| app.ui(ui));
+        out.textures_delta.clear();
+        fn collect(s: &egui::Shape, acc: &mut Vec<String>) {
+            match s {
+                egui::Shape::Text(t) => acc.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|x| collect(x, acc)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        out.shapes.iter().for_each(|cs| collect(&cs.shape, &mut texts));
+        assert!(texts.iter().any(|s| s.contains("kept for this session only")), "{texts:?}");
+        assert!(texts.iter().any(|s| s.contains("Check WARP3D Model")), "{texts:?}");
     }
 }

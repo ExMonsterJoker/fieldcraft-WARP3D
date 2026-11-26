@@ -2884,6 +2884,13 @@ const DECK_PATH: Field =
 const CRACK_FRONT_FIELD: Field = group("crack_front", "Crack front (WARP3D)", CRACK_FRONT)
     .help("Optional 3D fracture mechanics domain integral specification (WARP3D backend only).");
 
+pub const WARP3D_CHECK: &[Field] = &[
+    reference("step", "Step", C::Step).help("The step to check; the only one when empty.").hint("the only one"),
+    group("crack_front", "Crack front (WARP3D)", CRACK_FRONT).help("Optional 3D fracture mechanics domain integral set and parameters to validate."),
+    reference("crack_face", "Crack face set", C::Set)
+        .help("Optional crack-face node or face set checked against active constraints outside the crack front."),
+];
+
 pub const SOLVE_HEAT: &[Field] = &[STEP, MAX_DOFS, MAX_FACTOR, THREADS];
 pub const SOLVE_STATIC: &[Field] = &[STEP, MAX_DOFS, MAX_FACTOR, THREADS, SOLVER_BACKEND, DECK_PATH, CRACK_FRONT_FIELD];
 pub const SOLVE_NONLINEAR: &[Field] = &[

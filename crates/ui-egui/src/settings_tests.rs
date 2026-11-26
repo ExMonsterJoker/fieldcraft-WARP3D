@@ -412,3 +412,16 @@ fn language_preference_switches_to_hebrew_and_restores_on_cancel() {
     assert_eq!(app.prefs.language, "en");
     assert_eq!(prefs.saved().language, "en");
 }
+
+#[test]
+fn warp3d_bin_is_refused_over_control_and_excluded_from_describe() {
+    let prefs = Temp::new("warp3d-bin");
+    let mut app = app(&prefs);
+    app.set_warp3d_bin(Some("/tmp/custom-warp3d".into()));
+    let shown = describe(&app);
+    assert!(shown["values"].get("warp3d_bin").is_none(), "describe must never expose warp3d_bin: {shown}");
+
+    let err = from_control(&mut app, &json!({"page": "general", "set": {"warp3d_bin": "/tmp/evil"}})).unwrap_err();
+    assert!(err.contains("warp3d_bin") && err.contains("control channel"), "{err}");
+    assert_eq!(app.prefs.warp3d_bin.as_deref(), Some("/tmp/custom-warp3d"));
+}
