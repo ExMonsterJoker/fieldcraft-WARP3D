@@ -94,6 +94,16 @@ pub fn summary_in(command: &str, v: &Value, units: Option<&DisplaySystem>) -> St
                 v["display_units"].as_str().unwrap_or("—")
             )
         }
+        "deck.read" => {
+            let elements: u64 = v["elements"].as_object().into_iter().flatten().filter_map(|(_, n)| n.as_u64()).sum();
+            format!(
+                "{}, {}, units {}, {}",
+                plural(v["nodes"].as_u64().unwrap_or(0), "node"),
+                plural(elements, "element"),
+                v["units"].as_str().unwrap_or("—"),
+                plural(v["unknown_count"].as_u64().unwrap_or(0), "unread keyword")
+            )
+        }
         "interaction.contact.find" => {
             format!("{} among {}", plural(count("touching") as u64, "touching pair"), plural(v["parts"].as_u64().unwrap_or(0), "part"))
         }
@@ -313,7 +323,45 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens) {
         match reply.command.as_str() {
             "deck.read" => {
                 kit::status_line(ui, &deck_read_notice(&reply.value), kit::StatusTone::Dim);
-                value(ui, t, egui::Id::unique("fc_deck_read"), &reply.value, 0);
+                if let Some(w) = reply.value.get("warnings").and_then(Value::as_array) {
+                    for x in w {
+                        ui.add(
+                            egui::Label::new(RichText::new(format!("⚠ {}", inline(x).unwrap_or_else(|| crate::context::value_text(x)))).color(t.warm))
+                                .wrap(),
+                        );
+                    }
+                }
+                if reply.value.get("format").and_then(Value::as_str) == Some("warp3d")
+                    && reply.value.get("loads").and_then(Value::as_u64).unwrap_or(0) > 0
+                {
+                    ui.add_space(4.0);
+                    egui::Frame::NONE
+                        .fill(t.subheading_bg)
+                        .stroke(egui::Stroke::new(1.0, t.warm))
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .corner_radius(4.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        "⚠ Imported WARP3D loads are unscaled patterns; create a step and activate the loads to apply before solving.",
+                                    )
+                                    .color(t.warm),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(4.0);
+                            if kit::button(ui, "Create Step…", kit::Button::Normal).clicked() {
+                                acts.push(Act::Start("model.step.create"));
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
+                let filtered = match reply.value.as_object() {
+                    Some(m) => Value::Object(m.iter().filter(|(k, _)| k.as_str() != "warnings").map(|(k, v)| (k.clone(), v.clone())).collect()),
+                    None => reply.value.clone(),
+                };
+                value(ui, t, egui::Id::unique("fc_deck_read"), &filtered, 0);
             }
             "model.check" => diagnostics(app, ui, &reply.value, &mut acts),
             c if SOLVES.contains(&c) => solve_summary(ui, t, &reply.value, units),
@@ -1749,5 +1797,137 @@ mod tests {
         assert!(no_k_texts.iter().any(|s| s == "J [N/mm]") && !no_k_texts.iter().any(|s| s.contains("K_")), "{no_k_texts:?}");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deck_read_summary_and_warnings_render_above_table() {
+        let deck_val = json!({
+            "format": "warp3d",
+            "path": "bracket.inp",
+            "units": "in-lbf-s-psi",
+            "units_source": "session",
+            "nodes": 12,
+            "elements": {"hex8": 2},
+            "sets": 1,
+            "materials": 1,
+            "sections": 1,
+            "unknown": [],
+            "unknown_count": 3,
+            "warnings": ["no `! fieldcraft-units:` header found; assuming session display preset `in-lbf-s-psi`"],
+            "stopped_at": null,
+            "history_imported": false
+        });
+        assert_eq!(summary("deck.read", &deck_val), "12 nodes, 2 elements, units in-lbf-s-psi, 3 unread keywords");
+        let single = json!({"nodes": 1, "elements": {"tet4": 1}, "units": "m-kg-s-N-Pa", "unknown_count": 1});
+        assert_eq!(summary("deck.read", &single), "1 node, 1 element, units m-kg-s-N-Pa, 1 unread keyword");
+
+        let mut app = ModelApp::new(fieldcraft_engine::Session::default());
+        app.reply = Some(Reply {
+            command: "deck.read".into(),
+            label: "Read Solver Deck".into(),
+            params: json!({"format": "warp3d", "path": "bracket.inp"}),
+            value: deck_val,
+        });
+        let ctx = egui::Context::default();
+        let t = Tokens::get(false);
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 900.0)));
+        let mut out = ctx.run_ui(egui::RawInput { screen_rect: screen, ..Default::default() }, |ui| {
+            show(&mut app, ui, &t);
+        });
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        collect_texts(&out.shapes, &mut texts);
+        assert!(texts.iter().any(|s| s.contains("⚠") && s.contains("in-lbf-s-psi")), "expected amber warning row in {texts:?}");
+        assert!(!texts.iter().any(|s| s == "warnings"), "warnings should not duplicate in table: {texts:?}");
+        assert!(texts.iter().any(|s| s == "units source"), "{texts:?}");
+        assert!(!texts.iter().any(|s| s.contains("Create Step")), "loadless WARP3D deck must not add Create Step banner: {texts:?}");
+
+        // Explicit loads == 0 must also stay banner-free, and Abaqus decks with loads must stay unchanged.
+        for (format, loads) in [("warp3d", 0_u64), ("abaqus", 2_u64)] {
+            app.reply = Some(Reply {
+                command: "deck.read".into(),
+                label: "Read Solver Deck".into(),
+                params: json!({"format": format, "path": "bracket.inp"}),
+                value: json!({
+                    "format": format,
+                    "path": "bracket.inp",
+                    "units": "in-lbf-s-psi",
+                    "nodes": 12,
+                    "elements": {"hex8": 2},
+                    "loads": loads,
+                    "unknown": [],
+                    "unknown_count": 0
+                }),
+            });
+            let mut other_out = ctx.run_ui(egui::RawInput { screen_rect: screen, ..Default::default() }, |ui| {
+                show(&mut app, ui, &t);
+            });
+            other_out.textures_delta.clear();
+            let mut other_texts = Vec::new();
+            collect_texts(&other_out.shapes, &mut other_texts);
+            assert!(
+                !other_texts.iter().any(|s| s.contains("Create Step") || s.contains("unscaled")),
+                "{format} with loads={loads} must not render WARP3D unscaled-load banner: {other_texts:?}"
+            );
+        }
+
+        // WARP3D with loads > 0 renders the amber unscaled-load callout and `"Create Step…"` button.
+        app.reply = Some(Reply {
+            command: "deck.read".into(),
+            label: "Read Solver Deck".into(),
+            params: json!({"format": "warp3d", "path": "bracket.inp"}),
+            value: json!({
+                "format": "warp3d",
+                "path": "bracket.inp",
+                "units": "in-lbf-s-psi",
+                "units_source": "session",
+                "nodes": 12,
+                "elements": {"hex8": 2},
+                "boundary_conditions": 1,
+                "loads": 2,
+                "includes_read": [],
+                "unknown": [],
+                "unknown_count": 0,
+                "warnings": [],
+                "stopped_at": null,
+                "history_imported": false
+            }),
+        });
+        let mut loaded_out = ctx.run_ui(egui::RawInput { time: Some(1.0), screen_rect: screen, ..Default::default() }, |ui| {
+            show(&mut app, ui, &t);
+        });
+        loaded_out.textures_delta.clear();
+        let mut loaded_texts = Vec::new();
+        collect_texts(&loaded_out.shapes, &mut loaded_texts);
+        assert!(
+            loaded_texts.iter().any(|s| s.contains("unscaled") && s.contains("step")),
+            "expected unscaled-load callout banner in {loaded_texts:?}"
+        );
+        let btn_pos = {
+            fn find(shape: &egui::Shape) -> Option<egui::Pos2> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == "Create Step…" => Some(t.pos + t.galley.size() * 0.5),
+                    egui::Shape::Vec(v) => v.iter().find_map(find),
+                    _ => None,
+                }
+            }
+            loaded_out.shapes.iter().find_map(|cs| find(&cs.shape)).expect("Create Step… button")
+        };
+        assert!(app.dialog.is_none());
+        let mut click_out = ctx.run_ui(
+            egui::RawInput {
+                time: Some(2.0),
+                screen_rect: screen,
+                events: vec![
+                    egui::Event::PointerMoved(btn_pos),
+                    egui::Event::PointerButton { pos: btn_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                    egui::Event::PointerButton { pos: btn_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+                ],
+                ..Default::default()
+            },
+            |ui| show(&mut app, ui, &t),
+        );
+        click_out.textures_delta.clear();
+        assert_eq!(app.dialog.as_ref().map(|d| d.command), Some("model.step.create"));
     }
 }

@@ -2782,12 +2782,12 @@ pub const DECK: &[Field] = &[
 ];
 
 pub const DECK_READ: &[Field] = &[
-    choice("format", "Format", &[("abaqus", "Abaqus input (.inp)")])
-        .help("The Abaqus model-data and writer-linear-history input format to read.")
+    choice("format", "Format", &[("abaqus", "Abaqus input (.inp)"), ("warp3d", "WARP3D input (.inp, extensionless)")])
+        .help("The input deck format to read (Abaqus model data + writer linear history, or WARP3D model data).")
         .req()
         .def("\"abaqus\""),
     path("path", "Input deck", false)
-        .help("Abaqus model data plus writer linear history; replaces the current model only after a successful read.")
+        .help("Abaqus model data plus writer linear history, or WARP3D model data; replaces the current model only after a successful read.")
         .req(),
     choice(
         "units",
@@ -2800,7 +2800,7 @@ pub const DECK_READ: &[Field] = &[
             ("in-lbf-s-psi", "in, lbf·s²/in, s, lbf, psi"),
         ],
     )
-    .help("A deck has no intrinsic units. Choose its consistent preset; default is the current display preset, ignoring overrides.")
+    .help("Consistent unit preset for deck numbers. WARP3D auto-detects `! fieldcraft-units:` headers when blank; otherwise defaults to the current display preset, ignoring overrides.")
     .hint("current display preset"),
 ];
 

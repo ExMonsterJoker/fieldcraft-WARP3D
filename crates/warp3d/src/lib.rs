@@ -10,11 +10,13 @@
 //!   optional crack-front `domain` J/interaction-integral definitions.
 //! - Native subprocess execution (`runner`) with streaming drain, cancellation, timeout,
 //!   and flat-file / domain-integral result parsing (`results`), plus wasm-safe stubs.
+//! - Imports flat WARP3D 18.5.0 ASCII `.inp` model-data decks (`reader`) into SI `Model`s.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod deck;
 pub mod fracture;
+pub mod reader;
 pub mod results;
 pub mod runner;
 

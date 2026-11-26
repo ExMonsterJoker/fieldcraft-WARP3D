@@ -244,3 +244,305 @@ fn the_session_import_caps_bound_the_read() {
     assert!(s.execute("deck.read", &json!({"format":"abaqus","path":path,"units":"mm-t-s-N-MPa"})).is_ok());
     assert_eq!(s.limits.max_import_nodes, 12, "the new document keeps the session's caps");
 }
+
+fn bar_full_hex8() -> Session {
+    let mut s = Session::default();
+    super::super::define::tests::tagged_bar(&mut s);
+    s.run_script(&json!([
+        {"command":"model.units","params":{"system":"mm-t-s-N-MPa"}},
+        {"command":"model.set.create","params":{"name":"all","geometry":[{"body":"Bar"}]}},
+        {"command":"model.set.create","params":{"name":"root","geometry":[{"body":"Bar","face":"left"}]}},
+        {"command":"model.set.create","params":{"name":"end","geometry":[{"body":"Bar","face":"right"}]}},
+        {"command":"model.material.create","params":{"name":"Steel","elastic":{"type":"isotropic","young":"210 GPa","poisson":0.3},"density":"7850 kg/m^3"}},
+        {"command":"model.section.create","params":{"name":"BarSection","set":"all","material":"Steel","kind":{"type":"solid"}}}
+    ])).unwrap();
+    constrain(&mut s);
+    s
+}
+
+#[test]
+fn warp3d_write_then_read_round_trips_and_solves_identically_after_reconstraining() {
+    let dir = folder();
+    let path = dir.join("bar_warp3d.inp");
+    let mut s = bar_full_hex8();
+    let original = s.execute("solve.static", &json!({"step":"Bend"})).unwrap();
+    s.execute("deck.write", &json!({"format":"warp3d","path":path})).unwrap();
+    s.path = Some(dir.join("previous.fieldcraft").to_string_lossy().into_owned());
+
+    let result = s.execute("deck.read", &json!({"format":"warp3d","path":path,"units":null})).unwrap();
+    assert_eq!(result["format"], "warp3d");
+    assert_eq!(result["units"], "mm-t-s-N-MPa");
+    assert_eq!(result["units_source"], "header");
+    assert_eq!(result["nodes"], 12);
+    assert_eq!(result["elements"]["hex8"], 2);
+    assert_eq!(result["boundary_conditions"], 1);
+    assert_eq!(result["loads"], 1);
+    assert_eq!(result["includes_read"], json!([]));
+    assert_eq!(result["history_imported"], false);
+    assert_eq!(result["stopped_at"]["reason"], "compute");
+    assert_eq!(result["stopped_at"]["file"], "bar_warp3d.inp");
+    assert!(result["stopped_at"]["line"].as_u64().unwrap() > 0);
+    assert!(result["unknown"].as_array().unwrap().iter().any(|u| u["keyword"] == "compute" && u.get("file").is_none()));
+    assert!(s.model.steps().is_empty());
+    assert_eq!(s.model.boundary_conditions().len(), 1);
+    assert_eq!(s.model.loads().len(), 1);
+    assert_eq!(s.undo_depth(), (0, 0));
+    assert!(s.journal.is_empty() && s.path.is_none() && s.result("Bend").is_none() && s.is_dirty());
+
+    let bcs: Vec<String> = s.model.boundary_conditions().keys().cloned().collect();
+    let lds: Vec<String> = s.model.loads().keys().cloned().collect();
+    s.execute("model.step.create", &json!({"name":"Bend","procedure":{"type":"static"},"boundary_conditions":bcs,"loads":lds})).unwrap();
+    let resumed = s.execute("solve.static", &json!({"step":"Bend"})).unwrap();
+    let before = original["max_displacement"]["value"].as_f64().unwrap();
+    let after = resumed["max_displacement"]["value"].as_f64().unwrap();
+    assert!((before - after).abs() <= before.abs() * 1e-7, "{before} vs {after}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn warp3d_units_precedence_null_empty_refusal_and_header_validation() {
+    let dir = folder();
+    let mut s = bar_full_hex8();
+    s.execute("model.units", &json!({"system":"in-lbf-s-psi","overrides":{"length":"mm"}})).unwrap();
+    let before = s.clone();
+
+    // 1. Explicit units > Header > Session, and `"units": null` acts as omitted for both formats.
+    let header_path = dir.join("with_header.inp");
+    std::fs::write(
+        &header_path,
+        "! fieldcraft-units: m-kg-s-N-Pa\nmaterial S\n  properties linear e 2e11 nu 0.3\ncoordinates\n  1 2.0 0.0 0.0\n  2 3.0 0.0 0.0\n  3 2.0 1.0 0.0\n  4 2.0 0.0 1.0\nincidences\n  1 1 2 3 4\nelements\n  1 type tet4 linear material S\n",
+    )
+    .unwrap();
+    let abaqus_null_path = dir.join("abaqus_null.inp");
+    std::fs::write(&abaqus_null_path, "*NODE\n1,1,0,0\n").unwrap();
+
+    // Explicit overrides header.
+    let mut s_exp = bar_full_hex8();
+    let r_exp = s_exp.execute("deck.read", &json!({"format":"warp3d","path":header_path,"units":"mm-t-s-N-MPa"})).unwrap();
+    assert_eq!(r_exp["units"], "mm-t-s-N-MPa");
+    assert_eq!(r_exp["units_source"], "explicit");
+    assert!((s_exp.model.node(1).unwrap().xyz[0] - 0.002).abs() < 1e-12);
+
+    // `units: null` auto-detects header.
+    let mut s_hdr = bar_full_hex8();
+    let r_hdr = s_hdr.execute("deck.read", &json!({"format":"warp3d","path":header_path,"units":null})).unwrap();
+    assert_eq!(r_hdr["units"], "m-kg-s-N-Pa");
+    assert_eq!(r_hdr["units_source"], "header");
+    assert!((s_hdr.model.node(1).unwrap().xyz[0] - 2.0).abs() < 1e-12);
+    assert!(r_hdr.get("unknown").is_some());
+
+    // `units: null` on Abaqus falls back to session preset without leaking WARP3D-only fields.
+    let mut s_abq = bar_full_hex8();
+    s_abq.execute("model.units", &json!({"system":"in-lbf-s-psi"})).unwrap();
+    let r_abq = s_abq.execute("deck.read", &json!({"format":"abaqus","path":abaqus_null_path,"units":null})).unwrap();
+    assert_eq!(r_abq["units"], "in-lbf-s-psi");
+    assert!(r_abq.get("units_source").is_none());
+    assert!(r_abq.get("stopped_at").is_none());
+    assert!(r_abq.get("includes_read").is_none());
+
+    // 2. Headerless WARP3D falls back to session display preset (ignoring overrides) and warns.
+    let headerless = dir.join("headerless.inp");
+    std::fs::write(&headerless, "coordinates\n  1 1.0 0.0 0.0\n").unwrap();
+    let r_sess = s.execute("deck.read", &json!({"format":"warp3d","path":headerless})).unwrap();
+    assert_eq!(r_sess["units"], "in-lbf-s-psi");
+    assert_eq!(r_sess["units_source"], "session");
+    assert!(r_sess["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap_or("").contains("in-lbf-s-psi")));
+    let inch = fieldcraft_model::units::Quantity::Length.parse("1 in", crate::units::si()).unwrap();
+    assert_eq!(s.model.node(1).unwrap().xyz, [inch, 0.0, 0.0]);
+
+    // 3. Malformed header & empty-model deck leave prior session untouched.
+    let mut s_guard = before.clone();
+    let bad_hdr = dir.join("bad_hdr.inp");
+    std::fs::write(&bad_hdr, "! fieldcraft-units: nope\ncoordinates\n  1 0 0 0\n").unwrap();
+    let err = s_guard.execute("deck.read", &json!({"format":"warp3d","path":bad_hdr})).unwrap_err();
+    assert!(matches!(err, EngineError::Params(_)), "{err:?}");
+    assert_unchanged(&s_guard, &before);
+
+    let empty_deck = dir.join("empty.inp");
+    std::fs::write(&empty_deck, "structure empty\nblocking automatic\ncompute displacements\n").unwrap();
+    let err = s_guard.execute("deck.read", &json!({"format":"warp3d","path":empty_deck})).unwrap_err();
+    assert!(matches!(&err, EngineError::Param(p) if p.path == "path"), "{err:?}");
+    assert_unchanged(&s_guard, &before);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn warp3d_comments_encoding_errors_and_cancellation() {
+    let dir = folder();
+    let mut s = bar_full_hex8();
+    s.execute("solve.static", &json!({"step":"Bend"})).unwrap();
+    let before = s.clone();
+
+    // Latin-1 inside col-1 & `$` comments succeeds; active Latin-1 fails with Params (not Param).
+    let latin1_ok = dir.join("latin1_ok.inp");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"! Latin-1 comment \xff\xfe\n");
+    bytes.extend_from_slice(b"! fieldcraft-units: m-kg-s-N-Pa\n");
+    bytes.extend_from_slice(b"coordinates $ post-dollar \xff\n  1 1.0 2.0 3.0\n");
+    std::fs::write(&latin1_ok, &bytes).unwrap();
+    assert!(s.execute("deck.read", &json!({"format":"warp3d","path":latin1_ok})).is_ok());
+
+    let mut s = before.clone();
+    let latin1_bad = dir.join("latin1_bad.inp");
+    std::fs::write(&latin1_bad, b"coordinates\n  1 0.0 0.0 \xff\n").unwrap();
+    let err = s.execute("deck.read", &json!({"format":"warp3d","path":latin1_bad})).unwrap_err();
+    assert!(matches!(err, EngineError::Params(_)), "{err:?}");
+    assert_unchanged(&s, &before);
+
+    // Unsupported feature maps to EngineError::Deck(Unsupported { format: "warp3d", .. }), not Param.
+    let unsup = dir.join("unsup.inp");
+    std::fs::write(&unsup, "restart\n").unwrap();
+    let err = s.execute("deck.read", &json!({"format":"warp3d","path":unsup})).unwrap_err();
+    assert!(matches!(err, EngineError::Deck(fieldcraft_decks::Error::Unsupported { format: "warp3d", .. })), "{err:?}");
+    assert_unchanged(&s, &before);
+
+    // Limit maps to EngineError::Deck(Limit(_)).
+    s.limits.max_import_members = 2;
+    let bomb = dir.join("bomb.inp");
+    std::fs::write(&bomb, "list n 1-100\n").unwrap();
+    let err = s.execute("deck.read", &json!({"format":"warp3d","path":bomb})).unwrap_err();
+    assert!(matches!(err, EngineError::Deck(fieldcraft_decks::Error::Limit(_))), "{err:?}");
+    s.limits = before.limits;
+    assert_unchanged(&s, &before);
+
+    // `EngineError::Param` only for `format`, `path`, `units`.
+    for (expected_key, bad_params) in [
+        ("format", json!({"format":"nope","path":latin1_ok})),
+        ("path", json!({"format":"warp3d","path":""})),
+        ("units", json!({"format":"warp3d","path":latin1_ok,"units":"bad"})),
+        ("units", json!({"format":"warp3d","path":latin1_ok,"units":42})),
+    ] {
+        let err = s.execute("deck.read", &bad_params).unwrap_err();
+        assert!(matches!(&err, EngineError::Param(p) if p.path == expected_key), "{expected_key}: {err:?}");
+        assert_unchanged(&s, &before);
+    }
+
+    // Cooperative cancellation preserves prior session.
+    let mut big = String::from("! fieldcraft-units: m-kg-s-N-Pa\ncoordinates\n");
+    for i in 1..=600 {
+        big.push_str(&format!("  {i} 0.0 0.0 0.0\n"));
+    }
+    let cancel_path = dir.join("cancel.inp");
+    std::fs::write(&cancel_path, &big).unwrap();
+    let progress = fieldcraft_model::progress::Progress::new();
+    progress.cancel();
+    let err =
+        fieldcraft_model::progress::scoped(Some(progress), || s.execute("deck.read", &json!({"format":"warp3d","path":cancel_path}))).unwrap_err();
+    assert!(err.is_cancelled(), "{err}");
+    assert_unchanged(&s, &before);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn warp3d_includes_macros_bcs_loads_and_resolve() {
+    let dir = folder();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("params.inp"), "*parameter E0 = '2.0e11' Y0 = '2.0e8' NEXP = '5'\n").unwrap();
+    std::fs::write(
+        dir.join("sub/mesh.inp"),
+        "coordinates\n  1 0 0 0\n  2 1 0 0\n  3 1 1 0\n  4 0 1 0\n  5 0 0 1\n  6 1 0 1\n  7 1 1 1\n  8 0 1 1\nincidences\n  1 1 2 3 4 5 6 7 8\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("bcs_loads.inp"), "constraints\n  plane x=0 fixed\nloading p\n  element loads\n    1 face 4 pressure 100.0\n").unwrap();
+
+    let root = dir.join("root");
+    std::fs::write(
+        &root,
+        "! fieldcraft-units: m-kg-s-N-Pa\n*input from 'params.inp'\nmaterial M\n  properties mises e @E0 nu 0.3 yld_pt @Y0 n_power @NEXP\nelements\n  1 type l3disop linear material M\n*input from 'sub/mesh.inp'\n*input 'bcs_loads.inp\ncompute displacements\n*input 'post_compute_missing.inp'\n",
+    )
+    .unwrap();
+
+    let mut s = Session::default();
+    let reply = s.execute("deck.read", &json!({"format":"warp3d","path":root})).unwrap();
+    assert_eq!(reply["boundary_conditions"], 1);
+    assert_eq!(reply["loads"], 1);
+    assert_eq!(reply["includes_read"], json!(["params.inp", "sub/mesh.inp", "bcs_loads.inp"]));
+
+    let bcs: Vec<String> = s.model.boundary_conditions().keys().cloned().collect();
+    let lds: Vec<String> = s.model.loads().keys().cloned().collect();
+    s.execute("model.step.create", &json!({"name":"S1","procedure":{"type":"static"},"boundary_conditions":bcs,"loads":lds})).unwrap();
+    assert!(s.model.resolve().is_ok(), "{:?}", s.model.check());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn warp3d_include_confinement_redacts_host_paths_and_keeps_session() {
+    let dir = folder();
+    let deck_dir = dir.join("deck");
+    let outside_dir = dir.join("outside");
+    std::fs::create_dir_all(&deck_dir).unwrap();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("secret.inp"), "coordinates\n  1 0 0 0\n").unwrap();
+
+    let mut s = bar_full_hex8();
+    s.execute("solve.static", &json!({"step":"Bend"})).unwrap();
+    let before = s.clone();
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    // Unsafe lexical targets, Windows device names, ADS, and `~/`
+    for bad_inc in ["../outside/secret.inp", "~/secret.inp", "/etc/passwd", "CON", "NUL.inp", "sub.inp:stream"] {
+        let root = deck_dir.join("root.inp");
+        std::fs::write(&root, format!("*input '{bad_inc}'\n")).unwrap();
+        let err = s.execute("deck.read", &json!({"format":"warp3d","path":root})).unwrap_err();
+        assert!(matches!(err, EngineError::File(fieldcraft_io::Error::Refused(_))), "{bad_inc}: {err:?}");
+        assert!(!err.to_string().contains(&dir_str), "host path leaked for `{bad_inc}`: {err}");
+        assert_unchanged(&s, &before);
+    }
+
+    // Cycle detection -> Refused
+    std::fs::write(deck_dir.join("a.inp"), "*input 'b.inp'\n").unwrap();
+    std::fs::write(deck_dir.join("b.inp"), "*input 'a.inp'\n").unwrap();
+    let cyc = deck_dir.join("cyc.inp");
+    std::fs::write(&cyc, "*input 'a.inp'\n").unwrap();
+    let err = s.execute("deck.read", &json!({"format":"warp3d","path":cyc})).unwrap_err();
+    assert!(matches!(err, EngineError::File(fieldcraft_io::Error::Refused(_))), "{err:?}");
+    assert!(!err.to_string().contains(&dir_str), "host path leaked in cycle error: {err}");
+    assert_unchanged(&s, &before);
+
+    // Symlink escape inside `deck_dir` pointing to `outside_dir/secret.inp`
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside_dir.join("secret.inp"), deck_dir.join("sym.inp")).unwrap();
+        let sym_root = deck_dir.join("sym_root.inp");
+        std::fs::write(&sym_root, "*input 'sym.inp'\n").unwrap();
+        let err = s.execute("deck.read", &json!({"format":"warp3d","path":sym_root})).unwrap_err();
+        assert!(matches!(err, EngineError::File(fieldcraft_io::Error::Refused(_))), "{err:?}");
+        assert!(!err.to_string().contains(&dir_str), "host path leaked in symlink error: {err}");
+        assert_unchanged(&s, &before);
+    }
+
+    // Confined `s.file_access = Roots::new(Some(&deck_dir), None)` allows relative include inside `deck_dir`.
+    let sub_dir = deck_dir.join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    std::fs::write(sub_dir.join("ok.inp"), "coordinates\n  1 0 0 0\n").unwrap();
+    let ok_root = deck_dir.join("ok_confined.inp");
+    std::fs::write(&ok_root, "! fieldcraft-units: m-kg-s-N-Pa\n*input 'sub/ok.inp'\n").unwrap();
+    let mut s_conf = before.clone();
+    s_conf.file_access = fieldcraft_io::roots::Roots::new(Some(&deck_dir), None).unwrap();
+    assert!(s_conf.execute("deck.read", &json!({"format":"warp3d","path":ok_root})).is_ok());
+
+    // Cumulative 64 MiB cap across root + include: 33 MiB root + 33 MiB include -> Limit without leaking host path.
+    let big_inc = deck_dir.join("big_inc.inp");
+    let big_root = deck_dir.join("big_root.inp");
+    let pad = vec![b'!'; 33 * 1024 * 1024];
+    let mut inc_bytes = pad.clone();
+    inc_bytes.extend_from_slice(b"\ncoordinates\n  1 0 0 0\n");
+    std::fs::write(&big_inc, &inc_bytes).unwrap();
+    let mut root_bytes = pad;
+    root_bytes.extend_from_slice(b"\n! fieldcraft-units: m-kg-s-N-Pa\n*input 'big_inc.inp'\n");
+    std::fs::write(&big_root, &root_bytes).unwrap();
+    let err = s.execute("deck.read", &json!({"format":"warp3d","path":big_root})).unwrap_err();
+    assert!(matches!(err, EngineError::Deck(fieldcraft_decks::Error::Limit(_))), "{err:?}");
+    assert!(!err.to_string().contains(&dir_str), "host path leaked in limit error: {err}");
+    assert_unchanged(&s, &before);
+
+    // Bare-filename `deck_dir_for` fallback to `"."` and `wasm_include_refused`:
+    assert_eq!(super::deck_dir_for(Path::new("root.inp")), Path::new("."));
+    let wasm_err = super::wasm_include_refused("sub.inp").unwrap_err();
+    assert!(matches!(wasm_err, fieldcraft_warp3d::reader::ReadError::IncludeRefused(_)), "{wasm_err:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

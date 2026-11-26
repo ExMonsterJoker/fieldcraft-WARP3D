@@ -1,4 +1,4 @@
-//! Solver decks: write model data, or read a flat Abaqus deck into a new session.
+//! Solver decks: write model data, or read a flat Abaqus or WARP3D deck into a new session.
 
 use std::path::Path;
 
@@ -48,54 +48,243 @@ pub const WRITE: CommandSpec = CommandSpec {
 
 pub const READ: CommandSpec = CommandSpec {
     id: "deck.read",
-    label: "Read Abaqus Deck",
-    params: r#"{"format":"abaqus","path":"part.inp","units"?:"mm-t-s-N-MPa|m-kg-s-N-Pa|mm-kg-ms-kN-GPa|mm-g-ms-N-MPa|in-lbf-s-psi"} — replaces the model with a flat Abaqus deck's mesh, sets, element surfaces, elastic/density materials, sections and the linear history written by the current writer (static, frequency and buckling steps, boundary conditions and concentrated loads); input numbers use this consistent preset (default: the current display preset, ignoring overrides), then store SI; the reply states counts for nodes, elements by kind, sets, materials, sections, steps, boundary conditions and loads, plus units, unread keywords with original lines (first 100 and total count), and warnings. Unsupported history remains reported and is not stored; INCLUDE/parts/assemblies and unsupported physical variants are refused. Empty supported data is refused. Success clears old results/design/path/undo and is unsaved; errors leave the whole session intact."#,
+    label: "Read Deck",
+    params: r#"{"format":"abaqus|warp3d","path":"part.inp","units"?:"mm-t-s-N-MPa|m-kg-s-N-Pa|mm-kg-ms-kN-GPa|mm-g-ms-N-MPa|in-lbf-s-psi"} — replaces the model with an Abaqus deck's mesh, sets, element surfaces, elastic/density materials, sections and linear history written by the current writer, or a WARP3D deck's mesh, sets, materials and sections (plus constraints, static load patterns, relative `*input` includes on native, `*parameter`/`@param` macros, and discretized `n_power > 1.0` hardening); WARP3D auto-detects `! fieldcraft-units:` headers when `units` is omitted or null, otherwise uses `units` or the current display preset (ignoring overrides) and stores SI; the reply states counts, units (plus `units_source`, `stopped_at`, `boundary_conditions`, `loads`, and `includes_read` for WARP3D), unread keywords with original lines (first 100 and total count), and warnings. Unsupported history remains reported and is not stored; unsafe include paths and unsupported physical variants are refused. Empty supported data is refused. Success clears old results/design/path/undo and is unsaved; errors leave the whole session intact."#,
     form: Some(super::forms::DECK_READ),
     kind: CommandKind::Session,
     requires: &[],
     run: read,
 };
 
-fn read(s: &mut Session, p: &Value) -> Result<Value> {
-    let format: &str = req(p, "format")?;
-    if format != "abaqus" {
-        return Err(EngineError::invalid("format", "only abaqus is supported by deck.read"));
-    }
-    let units = match opt::<String>(p, "units")? {
-        Some(label) => fieldcraft_model::units::Preset::from_label(&label)
-            .ok_or_else(|| EngineError::invalid("units", "choose a known consistent unit preset"))?,
-        None => s.units().preset(),
-    };
-    let path = super::file_param(s, p, "path", Access::Read)?;
-    let bytes = super::file::read_file(&path, fieldcraft_decks::abaqus::read::MAX_INPUT_BYTES as u64)?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| EngineError::invalid("path", "the input deck is not UTF-8 text"))?;
-    let limits = fieldcraft_decks::abaqus::Limits {
-        nodes: s.limits.max_import_nodes,
-        elements: s.limits.max_import_elements,
-        members: s.limits.max_import_members,
-    };
-    let imported = fieldcraft_decks::abaqus::read_analysis_limited(text, units, limits)?;
-    let model = &imported.model;
-    if model.nodes().is_empty()
+fn is_empty_imported_model(model: &fieldcraft_model::Model) -> bool {
+    model.nodes().is_empty()
         && model.elements().is_empty()
         && model.sets().values().all(fieldcraft_model::Set::is_empty)
         && model.materials().is_empty()
         && model.sections().is_empty()
-    {
+}
+
+fn element_kind_counts(model: &fieldcraft_model::Model) -> std::collections::BTreeMap<&'static str, usize> {
+    let mut kinds = std::collections::BTreeMap::<&'static str, usize>::new();
+    for element in model.elements().values() {
+        *kinds.entry(element.kind.name()).or_default() += 1;
+    }
+    kinds
+}
+
+fn warp3d_read_to_engine(err: fieldcraft_warp3d::reader::ReadError) -> EngineError {
+    use fieldcraft_warp3d::reader::ReadError;
+    match err {
+        ReadError::Model(m) => EngineError::Model(m),
+        ReadError::Parse { .. } => EngineError::Params(err.to_string()),
+        ReadError::Unsupported { file, line, feature, message } => {
+            EngineError::Deck(fieldcraft_decks::Error::Unsupported { format: "warp3d", what: format!("{file}:{line} ({feature}): {message}") })
+        }
+        ReadError::Limit(msg) => EngineError::Deck(fieldcraft_decks::Error::Limit(msg)),
+        ReadError::IncludeRefused(msg) => EngineError::File(fieldcraft_io::Error::Refused(msg)),
+    }
+}
+
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+pub(crate) fn wasm_include_refused(
+    _target: &str,
+) -> std::result::Result<fieldcraft_warp3d::reader::ResolvedInclude, fieldcraft_warp3d::reader::ReadError> {
+    Err(fieldcraft_warp3d::reader::ReadError::IncludeRefused(
+        "WARP3D *input includes are not supported in the browser build; inline the deck or use desktop/CLI".into(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn deck_dir_for(path: &Path) -> &Path {
+    path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_windows_reserved_device_name(segment: &str) -> bool {
+    const DEVICES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+        "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = segment.split('.').next().unwrap_or(segment).trim_end();
+    DEVICES.iter().any(|d| d.eq_ignore_ascii_case(stem))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_relative_include_target(target: &str) -> std::result::Result<(std::path::PathBuf, String), fieldcraft_warp3d::reader::ReadError> {
+    use fieldcraft_warp3d::reader::ReadError;
+    use std::path::{Component, PathBuf};
+
+    if target.is_empty() || target.contains('\0') {
+        return Err(ReadError::IncludeRefused("empty or NUL-containing `*input` path".into()));
+    }
+    if target.starts_with('/') || target.starts_with('\\') || target == "~" || target.starts_with("~/") || target.starts_with("~\\") {
+        return Err(ReadError::IncludeRefused(format!("include `{target}` must be a relative path inside the deck folder")));
+    }
+    if target.contains(':') {
+        return Err(ReadError::IncludeRefused(format!("include `{target}` contains disallowed `:` (drive or alternate stream)")));
+    }
+
+    let normalized = target.replace('\\', "/");
+    let mut rel = PathBuf::new();
+    let mut parts: Vec<String> = Vec::new();
+    for comp in Path::new(&normalized).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(seg) => {
+                let seg_str = seg.to_str().ok_or_else(|| ReadError::IncludeRefused("non-UTF-8 include path segment".into()))?;
+                if is_windows_reserved_device_name(seg_str) {
+                    return Err(ReadError::IncludeRefused(format!("include `{target}` names a reserved device")));
+                }
+                rel.push(seg_str);
+                parts.push(seg_str.to_string());
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ReadError::IncludeRefused(format!("include `{target}` escapes the deck folder")));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(ReadError::IncludeRefused(format!("include `{target}` resolves to an empty path")));
+    }
+    Ok((rel, parts.join("/")))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn redact_include_io_err(err: fieldcraft_io::Error, display_name: &str, remaining_bytes: usize) -> fieldcraft_warp3d::reader::ReadError {
+    use fieldcraft_warp3d::reader::ReadError;
+    match err {
+        fieldcraft_io::Error::Limit(_) => ReadError::Limit(format!("include `{display_name}` exceeds remaining {remaining_bytes} byte input cap")),
+        fieldcraft_io::Error::Refused(_) => ReadError::IncludeRefused(format!("include `{display_name}` refused")),
+        fieldcraft_io::Error::Io(_) | fieldcraft_io::Error::Invalid(_) | fieldcraft_io::Error::Version(_) => {
+            ReadError::Parse { file: display_name.to_string(), line: 0, message: format!("unable to read include `{display_name}`") }
+        }
+    }
+}
+
+fn read(s: &mut Session, p: &Value) -> Result<Value> {
+    let format: &str = req(p, "format")?;
+    if !matches!(format, "abaqus" | "warp3d") {
+        return Err(EngineError::invalid("format", "expected `abaqus` or `warp3d`"));
+    }
+    let explicit_units = match opt::<Option<String>>(p, "units")?.flatten() {
+        Some(label) => Some(
+            fieldcraft_model::units::Preset::from_label(&label)
+                .ok_or_else(|| EngineError::invalid("units", "choose a known consistent unit preset"))?,
+        ),
+        None => None,
+    };
+    let path = super::file_param(s, p, "path", Access::Read)?;
+
+    if format == "abaqus" {
+        let units = explicit_units.unwrap_or_else(|| s.units().preset());
+        let bytes = super::file::read_file(&path, fieldcraft_decks::abaqus::read::MAX_INPUT_BYTES as u64)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| EngineError::invalid("path", "the input deck is not UTF-8 text"))?;
+        let limits = fieldcraft_decks::abaqus::Limits {
+            nodes: s.limits.max_import_nodes,
+            elements: s.limits.max_import_elements,
+            members: s.limits.max_import_members,
+        };
+        let imported = fieldcraft_decks::abaqus::read_analysis_limited(text, units, limits)?;
+        let model = &imported.model;
+        if is_empty_imported_model(model) {
+            return Err(EngineError::invalid(
+                "path",
+                format!("the deck contains no supported model data ({} unread keywords); the current model is unchanged", imported.unknown_count),
+            ));
+        }
+        let kinds = element_kind_counts(model);
+        let unknown: Vec<Value> = imported.unknown.iter().map(|u| json!({"keyword":u.keyword,"line":u.line})).collect();
+        let reply = json!({"format":"abaqus","path":path,"units":units.label(),"nodes":model.nodes().len(),"elements":kinds,
+            "sets":model.sets().len(),"materials":model.materials().len(),"sections":model.sections().len(),
+            "steps":model.steps().len(),"boundary_conditions":model.boundary_conditions().len(),"loads":model.loads().len(),"unknown":unknown,
+            "unknown_count":imported.unknown_count,"warnings":imported.warnings,"history_imported":!model.steps().is_empty()});
+        // The new, unsaved document has no journal, but still needs its own dirty revision.
+        let opened = Session { model: imported.model, revision: crate::next_revision(), ..Session::default() };
+        s.replace_with(opened);
+        return Ok(reply);
+    }
+
+    let bytes = super::file::read_file(&path, fieldcraft_warp3d::reader::MAX_INPUT_BYTES as u64)?;
+    let limits = fieldcraft_warp3d::reader::ReadLimits {
+        nodes: s.limits.max_import_nodes,
+        elements: s.limits.max_import_elements,
+        members: s.limits.max_import_members,
+    };
+    let root_name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path);
+
+    #[cfg(target_arch = "wasm32")]
+    let imported = fieldcraft_warp3d::reader::read_with_includes(root_name, &bytes, explicit_units, s.units().preset(), limits, |req| {
+        wasm_include_refused(req.target)
+    })
+    .map_err(warp3d_read_to_engine)?;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let imported = {
+        let deck_dir = deck_dir_for(Path::new(&path));
+        let deck_root = fieldcraft_io::roots::Roots::new(Some(deck_dir), None)
+            .map_err(|_| EngineError::File(fieldcraft_io::Error::Refused("unable to confine WARP3D deck folder".into())))?;
+        let mut include_loader = |req: fieldcraft_warp3d::reader::IncludeRequest<'_>| -> std::result::Result<
+            fieldcraft_warp3d::reader::ResolvedInclude,
+            fieldcraft_warp3d::reader::ReadError,
+        > {
+            use fieldcraft_warp3d::reader::{ReadError, ResolvedInclude};
+            let (rel_path, display_name) = validate_relative_include_target(req.target)?;
+            let candidate = deck_dir.join(&rel_path);
+            let in_deck = deck_root.check(&candidate, Access::Read).map_err(|e| redact_include_io_err(e, &display_name, req.remaining_bytes))?;
+            let resolved =
+                s.file_access.check(&in_deck, Access::Read).map_err(|e| redact_include_io_err(e, &display_name, req.remaining_bytes))?;
+            let canonical = std::fs::canonicalize(&resolved).map_err(|e| ReadError::Parse {
+                file: display_name.clone(),
+                line: 0,
+                message: format!("cannot open include `{display_name}` ({:?})", e.kind()),
+            })?;
+            let inc_bytes = fieldcraft_io::fs::read_capped(&canonical, req.remaining_bytes as u64)
+                .map_err(|e| redact_include_io_err(e, &display_name, req.remaining_bytes))?;
+            Ok(ResolvedInclude { display_name, canonical_key: canonical.to_string_lossy().into_owned(), bytes: inc_bytes })
+        };
+        fieldcraft_warp3d::reader::read_with_includes(root_name, &bytes, explicit_units, s.units().preset(), limits, &mut include_loader)
+            .map_err(warp3d_read_to_engine)?
+    };
+
+    let model = &imported.model;
+    if is_empty_imported_model(model) {
         return Err(EngineError::invalid(
             "path",
             format!("the deck contains no supported model data ({} unread keywords); the current model is unchanged", imported.unknown_count),
         ));
     }
-    let mut kinds = std::collections::BTreeMap::<&str, usize>::new();
-    for element in model.elements().values() {
-        *kinds.entry(element.kind.name()).or_default() += 1;
-    }
-    let unknown: Vec<Value> = imported.unknown.iter().map(|u| json!({"keyword":u.keyword,"line":u.line})).collect();
-    let reply = json!({"format":"abaqus","path":path,"units":units.label(),"nodes":model.nodes().len(),"elements":kinds,
-        "sets":model.sets().len(),"materials":model.materials().len(),"sections":model.sections().len(),
-        "steps":model.steps().len(),"boundary_conditions":model.boundary_conditions().len(),"loads":model.loads().len(),"unknown":unknown,
-        "unknown_count":imported.unknown_count,"warnings":imported.warnings,"history_imported":!model.steps().is_empty()});
+    let kinds = element_kind_counts(model);
+    let unknown: Vec<Value> = imported
+        .unknown
+        .iter()
+        .map(|u| match &u.file {
+            Some(f) => json!({"keyword": u.keyword, "file": f, "line": u.line}),
+            None => json!({"keyword": u.keyword, "line": u.line}),
+        })
+        .collect();
+    let stopped_at = match &imported.stopped_at {
+        Some(st) => json!({"file": st.file, "line": st.line, "reason": st.reason}),
+        None => Value::Null,
+    };
+    let reply = json!({
+        "format": "warp3d",
+        "path": path,
+        "units": imported.units.label(),
+        "units_source": imported.units_source.as_str(),
+        "nodes": model.nodes().len(),
+        "elements": kinds,
+        "sets": model.sets().len(),
+        "materials": model.materials().len(),
+        "sections": model.sections().len(),
+        "boundary_conditions": model.boundary_conditions().len(),
+        "loads": model.loads().len(),
+        "includes_read": imported.includes_read,
+        "unknown": unknown,
+        "unknown_count": imported.unknown_count,
+        "warnings": imported.warnings,
+        "stopped_at": stopped_at,
+        "history_imported": false,
+    });
     // The new, unsaved document has no journal, but still needs its own dirty revision.
     let opened = Session { model: imported.model, revision: crate::next_revision(), ..Session::default() };
     s.replace_with(opened);

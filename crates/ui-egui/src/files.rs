@@ -565,7 +565,7 @@ pub struct Opened {
 pub enum Replace {
     /// A `.fieldcraft` file.
     File(String),
-    /// An Abaqus model-data import with its explicit input-unit choice.
+    /// A solver deck model-data import with its explicit input-unit choice.
     Deck(Value),
     /// A sample (`file.sample`).
     Sample(&'static str),
@@ -579,7 +579,7 @@ impl Replace {
     fn name(&self) -> String {
         match self {
             Replace::File(p) => file_name(p),
-            Replace::Deck(p) => p.get("path").and_then(Value::as_str).map(file_name).unwrap_or_else(|| "an Abaqus deck".into()),
+            Replace::Deck(p) => p.get("path").and_then(Value::as_str).map(file_name).unwrap_or_else(|| "a solver deck".into()),
             Replace::Sample(n) => fieldcraft_engine::sample::find(n).map_or_else(|| (*n).to_string(), |s| format!("the {} sample", s.label)),
             Replace::Update => "the update".into(),
             Replace::New => "a new model".into(),
@@ -933,7 +933,7 @@ impl ModelApp {
     fn begin_job_inner(
         &mut self,
         command: &'static str,
-        mut params: Value,
+        params: Value,
         title: String,
         done: String,
         recent: Option<String>,
@@ -945,12 +945,17 @@ impl ModelApp {
         // A fresh session is the app's own model too (its commands go into the crash journal),
         // with the same work caps and file access, as the engine keeps them when a command
         // replaces the session, and the window's count of camera requests.
-        self.freeze_deck_units(command, &mut params);
         let progress = Progress::new();
         let (rx, pending) = if SOLVE_BACKGROUND.contains(&command) {
             spawn_solve(&self.session, command, params.clone(), progress.clone())
         } else {
-            let base = if fresh(command) { self.session.empty_like() } else { self.session.clone() };
+            let base = if command == "deck.read" {
+                self.session.empty_like_preserving_units()
+            } else if fresh(command) {
+                self.session.empty_like()
+            } else {
+                self.session.clone()
+            };
             spawn(base, command, params.clone(), progress.clone(), self.bodies.0.clone())
         };
         self.set_status(format!("{title}…"), false);
@@ -978,9 +983,8 @@ impl ModelApp {
     /// drawing with Cancel; the form closes when the command succeeds and shows the error when it
     /// fails. A mesher that would replace a body's mesh asks first ([`Prompt::ReplaceMesh`]).
     pub fn submit_dialog(&mut self) {
-        let Ok((command, mut params)) = self.dialog_params() else { return };
+        let Ok((command, params)) = self.dialog_params() else { return };
         if command == "deck.read" && self.has_unsaved_work() {
-            self.freeze_deck_units(command, &mut params);
             self.prompt_unsaved_or_fracture(Replace::Deck(params));
             return;
         }
@@ -1012,17 +1016,6 @@ impl ModelApp {
         let Ok((command, params)) = self.dialog_params() else { return };
         let Ok(pending_set_created) = self.create_pending_set(&params) else { return };
         self.submit_background_inner(command, params, pending_set_created);
-    }
-
-    /// Preserve the input preset before a fresh job drops the current model. Display overrides
-    /// are intentionally ignored: an Abaqus deck needs one consistent unit system.
-    fn freeze_deck_units(&self, command: &str, params: &mut Value) {
-        if command == "deck.read"
-            && params.get("units").is_none_or(Value::is_null)
-            && let Some(object) = params.as_object_mut()
-        {
-            object.insert("units".into(), json!(self.session.units().preset().label()));
-        }
     }
 
     pub(crate) fn submit_background(&mut self, command: &'static str, params: Value) {
@@ -1349,17 +1342,16 @@ impl ModelApp {
         if self.dialog.as_ref().is_some_and(|d| o.form == Some(d.command)) {
             self.form_done();
         }
-        let _ = &o.params;
         let warnings: Vec<&str> = o.reply.get("warnings").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
         let mut done = o.done;
         if o.command == "deck.read" {
             self.imported_document = Some(self.session.opened());
-            done = format!("Read Abaqus Deck: {} unread keywords (details in the panel)", o.reply["unknown_count"]);
+            done = format!("{}: {} unread keywords (details in the panel)", crate::command_label(o.command), o.reply["unknown_count"]);
             crate::context::opened(self, crate::context::Opened::Reply);
             self.reply = Some(crate::reply::Reply {
                 command: o.command.into(),
                 label: crate::command_label(o.command).into(),
-                params: json!({"format":o.reply["format"], "path":o.reply["path"], "units":o.reply["units"]}),
+                params: o.params.clone(),
                 value: o.reply.clone(),
             });
         }
@@ -2532,6 +2524,53 @@ pub(crate) mod tests {
             assert_eq!(app.session.design.as_ref().unwrap().bodies.len(), 2);
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn warp3d_header_auto_detection_overrides_session_and_run_again_redetects() {
+        let dir = temp("warp3d-header-rerun");
+        let path = dir.join("cube.inp");
+        let body = "\
+material S
+  properties linear e 2e11 nu 0.3
+coordinates
+  1 1.0 0.0 0.0
+  2 2.0 0.0 0.0
+  3 1.0 1.0 0.0
+  4 1.0 0.0 1.0
+incidences
+  1 1 2 3 4
+elements
+  1 type tet4 linear material S
+";
+        std::fs::write(&path, format!("! fieldcraft-units: in-lbf-s-psi\n{body}")).unwrap();
+
+        let mut app = ModelApp::new(Session::default());
+        assert_eq!(app.session.default_units.preset(), fieldcraft_model::units::Preset::MmTonneS);
+        app.open_form("deck.read", json!({"format": "warp3d", "path": path}));
+        app.submit_dialog();
+        app.wait_loaded();
+
+        let reply = app.reply.as_ref().unwrap().clone();
+        assert_eq!(reply.value["units"], "in-lbf-s-psi");
+        assert_eq!(reply.value["units_source"], "header");
+        assert!(reply.params.get("units").is_none(), "Run again must not freeze units: {:?}", reply.params);
+        assert_eq!(app.session.default_units.preset(), fieldcraft_model::units::Preset::MmTonneS);
+        let inch = fieldcraft_model::units::Quantity::Length.parse("1 in", &fieldcraft_model::DisplaySystem::default()).unwrap();
+        assert_eq!(app.session.model.node(1).unwrap().xyz, [inch, 0.0, 0.0]);
+
+        // Edit header on disk and Run again using preserved raw `reply.params`.
+        std::fs::write(&path, format!("! fieldcraft-units: m-kg-s-N-Pa\n{body}")).unwrap();
+        app.open_form("deck.read", reply.params);
+        app.submit_dialog();
+        app.answer_unsaved(Answer::Discard);
+        app.wait_loaded();
+
+        let rerun = app.reply.as_ref().unwrap();
+        assert_eq!(rerun.value["units"], "m-kg-s-N-Pa");
+        assert_eq!(rerun.value["units_source"], "header");
+        assert_eq!(app.session.model.node(1).unwrap().xyz, [1.0, 0.0, 0.0]);
+        assert_eq!(app.session.default_units.preset(), fieldcraft_model::units::Preset::MmTonneS);
     }
 
     #[test]

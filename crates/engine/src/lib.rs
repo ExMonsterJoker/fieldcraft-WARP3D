@@ -1015,6 +1015,15 @@ impl Session {
         }
     }
 
+    /// Like [`Session::empty_like`], while also preserving the active model's `display_units`
+    /// so background `deck.read` imports can fall back to the active preset without mutating
+    /// [`Session::default_units`].
+    pub fn empty_like_preserving_units(&self) -> Session {
+        let mut session = self.empty_like();
+        session.model.set_display_units(self.model.display_units().cloned());
+        session
+    }
+
     /// How many cameras were asked for: a host that saw fewer aims at [`Session::camera`].
     pub fn camera_requests(&self) -> u64 {
         self.camera_requests
