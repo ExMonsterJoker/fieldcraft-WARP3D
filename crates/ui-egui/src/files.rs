@@ -63,10 +63,11 @@ pub type PickOpen = Box<dyn Fn(&[Filter]) -> Option<String>>;
 /// The host picks where to save, starting from a file name; `None` when the user cancelled.
 pub type PickSave = Box<dyn Fn(&str, &[Filter]) -> Option<String>>;
 /// An owned request for a host's asynchronous file chooser.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilePicker {
     Open { filters: Vec<Filter> },
     Save { name: String, filters: Vec<Filter> },
+    Folder,
 }
 /// Hosts return promptly; the future is polled on the UI thread without waiting.
 pub type PickFile = Box<dyn Fn(FilePicker) -> Pin<Box<dyn Future<Output = Option<String>>>>>;
@@ -91,7 +92,7 @@ pub struct Services {
     pub open_url: Option<OpenUrl>,
 }
 
-enum PickerAction {
+pub(crate) enum PickerAction {
     Open,
     Save {
         params: Value,
@@ -105,6 +106,10 @@ enum PickerAction {
     },
     /// File › Run Script…: run the chosen JSON script.
     Script,
+    FormField {
+        opening: u64,
+        field_path: String,
+    },
 }
 
 /// The status when the native file chooser fails inside the host ([`ModelApp::poll_picker`]).
@@ -793,8 +798,14 @@ impl ModelApp {
         self.services.pick_file.is_some() || self.services.pick_save.is_some()
     }
 
+    /// Native desktop file/folder pickers for command forms (`apps/fieldcraft-web` sets
+    /// `pick_open`/`pick_save` for browser uploads/downloads while leaving `pick_file: None`).
+    pub(crate) fn has_path_picker(&self) -> bool {
+        self.services.pick_file.is_some()
+    }
+
     /// Only user actions call this. A pending chooser never blocks commands or the event loop.
-    fn pick_file(&mut self, request: FilePicker, action: PickerAction) -> bool {
+    pub(crate) fn pick_file(&mut self, request: FilePicker, action: PickerAction) -> bool {
         if self.picker.is_some() {
             self.set_status("Finish or cancel the open file chooser first", false);
             return false;
@@ -820,6 +831,7 @@ impl ModelApp {
         let path = match request {
             FilePicker::Open { filters } => self.services.pick_open.as_ref().and_then(|p| p(&filters)),
             FilePicker::Save { name, filters } => self.services.pick_save.as_ref().and_then(|p| p(&name, &filters)),
+            FilePicker::Folder => None,
         };
         path.is_some_and(|path| self.picked_file(action, path))
     }
@@ -901,6 +913,24 @@ impl ModelApp {
                     self.set_status(format!("Wrote {}", file_name(&path)), false);
                 }
                 written
+            }
+            PickerAction::FormField { opening, field_path } => {
+                let Some(d) = self.dialog.as_mut().filter(|d| d.opening == opening) else {
+                    return false;
+                };
+                let (parent, key) = field_path.rsplit_once('/').unwrap_or(("", &field_path));
+                let pointer = if parent.is_empty() { String::new() } else { format!("/{parent}") };
+                if let Ok(mut params) = serde_json::from_str::<Value>(&d.text)
+                    && params.is_object()
+                    && let Some(Value::Object(obj)) = params.pointer_mut(&pointer)
+                {
+                    obj.insert(key.into(), json!(path));
+                    d.text = params.to_string();
+                    d.error = None;
+                    d.refused = None;
+                    d.touched.insert(field_path);
+                }
+                false
             }
         }
     }
@@ -3559,5 +3589,108 @@ elements
         assert!(!app.session.has_unpersisted_fracture() && app.session.model.node(1).is_none());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn form_field_picker_updates_open_save_folder_and_nested_fields_and_drops_stale() {
+        let mut app = ModelApp::new(Session::default());
+        let chooser = deferred(&mut app);
+
+        // 1. Open file write-back clears error/refused and records touched.
+        app.open_form("deck.read", json!({"format": "warp3d"}));
+        let opening = app.dialog.as_ref().unwrap().opening;
+        app.dialog.as_mut().unwrap().error = Some("previous error".into());
+        app.dialog.as_mut().unwrap().refused = Some(("path".into(), "Path: enter a path".into()));
+        app.pick_file(FilePicker::Open { filters: Vec::new() }, PickerAction::FormField { opening, field_path: "path".into() });
+        assert_eq!(chooser.requests.borrow().last(), Some(&FilePicker::Open { filters: Vec::new() }));
+        *chooser.answer.borrow_mut() = Some(Some("/tmp/test_87".into()));
+        assert!(!app.poll_picker());
+        let d = app.dialog.as_ref().unwrap();
+        let params: Value = serde_json::from_str(&d.text).unwrap();
+        assert_eq!(params["path"], "/tmp/test_87");
+        assert!(d.error.is_none() && d.refused.is_none());
+        assert!(d.touched.contains("path"));
+
+        // 2. Save file write-back.
+        app.open_form("file.save_as", json!({}));
+        let save_opening = app.dialog.as_ref().unwrap().opening;
+        app.pick_file(
+            FilePicker::Save { name: "out.fieldcraft".into(), filters: Vec::new() },
+            PickerAction::FormField { opening: save_opening, field_path: "path".into() },
+        );
+        *chooser.answer.borrow_mut() = Some(Some("/tmp/out.fieldcraft".into()));
+        assert!(!app.poll_picker());
+        let params: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();
+        assert_eq!(params["path"], "/tmp/out.fieldcraft");
+
+        // 3. Folder write-back.
+        app.open_form("file.recovery.list", json!({}));
+        let folder_opening = app.dialog.as_ref().unwrap().opening;
+        assert_eq!(app.dialog.as_ref().unwrap().command, "file.recovery.list");
+        assert_ne!(folder_opening, save_opening);
+        app.pick_file(FilePicker::Folder, PickerAction::FormField { opening: folder_opening, field_path: "dir".into() });
+        assert_eq!(chooser.requests.borrow().last(), Some(&FilePicker::Folder));
+        *chooser.answer.borrow_mut() = Some(Some("/tmp/recovery-dir".into()));
+        assert!(!app.poll_picker());
+        let params: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();
+        assert_eq!(params["dir"], "/tmp/recovery-dir");
+
+        // 4. Nested field path write-back.
+        app.dialog.as_mut().unwrap().text = json!({"nested": {"file": "old"}}).to_string();
+        app.pick_file(
+            FilePicker::Open { filters: Vec::new() },
+            PickerAction::FormField { opening: folder_opening, field_path: "nested/file".into() },
+        );
+        *chooser.answer.borrow_mut() = Some(Some("/tmp/nested.inp".into()));
+        assert!(!app.poll_picker());
+        let d = app.dialog.as_ref().unwrap();
+        let params: Value = serde_json::from_str(&d.text).unwrap();
+        assert_eq!(params["nested"]["file"], "/tmp/nested.inp");
+        assert!(d.touched.contains("nested/file"));
+
+        // 5. Stale completion dropped silently when switched to another opening or closed.
+        app.pick_file(FilePicker::Open { filters: Vec::new() }, PickerAction::FormField { opening: folder_opening, field_path: "dir".into() });
+        app.open_form("deck.read", json!({"path": "kept"}));
+        *chooser.answer.borrow_mut() = Some(Some("/tmp/stale".into()));
+        assert!(!app.poll_picker());
+        let params: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();
+        assert_eq!(params["path"], "kept");
+        assert!(params.get("dir").is_none());
+
+        let stale_opening = app.dialog.as_ref().unwrap().opening;
+        app.pick_file(FilePicker::Open { filters: Vec::new() }, PickerAction::FormField { opening: stale_opening, field_path: "path".into() });
+        app.close_dialog();
+        assert!(app.dialog.is_none());
+        *chooser.answer.borrow_mut() = Some(Some("/tmp/stale_closed".into()));
+        assert!(!app.poll_picker());
+        assert!(app.dialog.is_none());
+
+        // 6. Non-object and invalid JSON safely no-op without clobbering text or error.
+        for bad_text in ["[1, 2]", "{invalid"] {
+            app.open_form("deck.read", json!({}));
+            let bad_opening = app.dialog.as_ref().unwrap().opening;
+            let d = app.dialog.as_mut().unwrap();
+            d.text = bad_text.into();
+            d.error = Some("existing".into());
+            app.pick_file(FilePicker::Open { filters: Vec::new() }, PickerAction::FormField { opening: bad_opening, field_path: "path".into() });
+            *chooser.answer.borrow_mut() = Some(Some("/tmp/ignored".into()));
+            assert!(!app.poll_picker());
+            let d = app.dialog.as_ref().unwrap();
+            assert_eq!(d.text, bad_text);
+            assert_eq!(d.error.as_deref(), Some("existing"));
+            assert!(!d.touched.contains("path"));
+        }
+    }
+
+    #[test]
+    fn web_services_disable_form_path_pickers() {
+        let services = Services {
+            pick_file: None,
+            pick_open: Some(Box::new(|_| None)),
+            pick_save: Some(Box::new(|name, _| Some(format!("/files/{name}")))),
+            ..Default::default()
+        };
+        let app = ModelApp::new(Session::default()).with_services(services);
+        assert!(!app.has_path_picker());
     }
 }

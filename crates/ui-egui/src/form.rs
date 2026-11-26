@@ -5,11 +5,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{Id, RichText, Ui};
-use fieldcraft_engine::schema::{self, Collection, Field, Kind, MAX_DEPTH, MAX_ROWS, join};
+use fieldcraft_engine::schema::{self, Collection, Field, Kind, MAX_DEPTH, MAX_ROWS, PathMode, join};
 use fieldcraft_model::DisplaySystem;
 use serde_json::{Map, Value, json};
 
 use crate::fields::{self, NumberEdit, Style};
+use crate::files::FilePicker;
 use crate::theme::Tokens;
 use solidcraft_ui_kit as kit;
 use solidcraft_ui_kit::BackingTooltipExt as _;
@@ -45,6 +46,15 @@ pub struct Context<'a> {
     pub picked: Picked,
     /// The view's selection, for a topology name's Pick ([`crate::selection::topology_name`]).
     pub selection: Option<&'a crate::selection::Selection>,
+    /// Whether the host provides native desktop path pickers for [`Kind::Path`] fields.
+    pub can_browse: bool,
+}
+
+/// A path field's browse button was clicked.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BrowseRequest {
+    pub field_path: String,
+    pub picker: FilePicker,
 }
 
 /// The mesh labels picked in the viewport.
@@ -64,6 +74,8 @@ pub struct Outcome {
     pub invalid: usize,
     /// A reference field's "Create …" was clicked: the collection to add to and the field's path.
     pub create: Option<(Collection, String)>,
+    /// A path field's browse button was clicked.
+    pub browse: Option<BrowseRequest>,
     /// The paths of the fields edited this frame.
     pub touched: Vec<String>,
     /// The body whose row in a list of bodies is under the pointer (the viewport highlights it).
@@ -382,7 +394,7 @@ impl Form<'_> {
                 out
             }
             Kind::Integer { .. } => self.number(ui, id, value, f.hint, true, fill(ui, &s)),
-            Kind::Text | Kind::Path { .. } | Kind::Topology { .. } => {
+            Kind::Text | Kind::Topology { .. } => {
                 let mut text = value.and_then(Value::as_str).unwrap_or_default().to_string();
                 let changed = fields::text(ui, id, &mut text, f.hint, fill(ui, &s));
                 // Definition names go into solver decks, which take no spaces: a typed space
@@ -391,6 +403,50 @@ impl Form<'_> {
                     text = text.replace(' ', "_");
                     ui.data_mut(|d| d.insert_temp(id.with("spaced"), true));
                 }
+                changed.then(|| if text.is_empty() && !f.required { Value::Null } else { json!(text) })
+            }
+            Kind::Path { mode } => {
+                let mut text = value.and_then(Value::as_str).unwrap_or_default().to_string();
+                let changed = if self.cx.can_browse {
+                    let width = fill(ui, &s);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(width);
+                        let changed = fields::text(ui, id, &mut text, f.hint, width);
+                        ui.horizontal_wrapped(|ui| match mode {
+                            PathMode::OpenFile => {
+                                if kit::button(ui, "Browse…", kit::Button::Normal).clicked() {
+                                    self.out.browse =
+                                        Some(BrowseRequest { field_path: path.to_string(), picker: FilePicker::Open { filters: Vec::new() } });
+                                }
+                            }
+                            PathMode::SaveFile => {
+                                if kit::button(ui, "Browse…", kit::Button::Normal).clicked() {
+                                    let name = std::path::Path::new(text.trim()).file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+                                    self.out.browse =
+                                        Some(BrowseRequest { field_path: path.to_string(), picker: FilePicker::Save { name, filters: Vec::new() } });
+                                }
+                            }
+                            PathMode::Folder => {
+                                if kit::button(ui, "Browse…", kit::Button::Normal).clicked() {
+                                    self.out.browse = Some(BrowseRequest { field_path: path.to_string(), picker: FilePicker::Folder });
+                                }
+                            }
+                            PathMode::FolderOrFile => {
+                                if kit::button(ui, "Folder…", kit::Button::Normal).clicked() {
+                                    self.out.browse = Some(BrowseRequest { field_path: path.to_string(), picker: FilePicker::Folder });
+                                }
+                                if kit::button(ui, "File…", kit::Button::Normal).clicked() {
+                                    self.out.browse =
+                                        Some(BrowseRequest { field_path: path.to_string(), picker: FilePicker::Open { filters: Vec::new() } });
+                                }
+                            }
+                        });
+                        changed
+                    })
+                    .inner
+                } else {
+                    fields::text(ui, id, &mut text, f.hint, fill(ui, &s))
+                };
                 changed.then(|| if text.is_empty() && !f.required { Value::Null } else { json!(text) })
             }
             Kind::Bool => {
@@ -1483,38 +1539,41 @@ pub(crate) mod tests {
         let none = |_: Collection| Vec::new();
         let hostile =
             [json!({}), json!({"type": 7, "name": [], "elastic": "x", "target": {"set": 1, "reference_point": 2}, "values": [1], "geometry": {}})];
-        for (c, names) in fieldcraft_engine::commands().iter().flat_map(|c| [(c, &one as &dyn Fn(Collection) -> Vec<String>), (c, &none)]) {
-            let Some(form) = c.form else { continue };
-            for start in hostile.iter().chain([&schema::prefill(form, &json!({}))]) {
-                let mut params = start.as_object().cloned().unwrap_or_default();
-                let before = params.clone();
-                let mut outcome = Outcome::default();
-                let width = crate::context::inner_width();
-                let mut used = 0.0;
-                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    let touched = BTreeSet::new();
-                    let cx = Context {
-                        units: &mm(),
-                        names,
-                        salt: Id::unique(c.id),
-                        touched: &touched,
-                        attempted: true,
-                        refused: None,
-                        problems: &messages(form, &params),
-                        picked: Picked::default(),
-                        selection: None,
-                    };
-                    ui.vertical(|ui| {
-                        ui.set_max_width(width);
-                        outcome = show(ui, &Tokens::get(false), &cx, form, &mut params);
-                        used = ui.min_rect().width();
+        for can_browse in [false, true] {
+            for (c, names) in fieldcraft_engine::commands().iter().flat_map(|c| [(c, &one as &dyn Fn(Collection) -> Vec<String>), (c, &none)]) {
+                let Some(form) = c.form else { continue };
+                for start in hostile.iter().chain([&schema::prefill(form, &json!({}))]) {
+                    let mut params = start.as_object().cloned().unwrap_or_default();
+                    let before = params.clone();
+                    let mut outcome = Outcome::default();
+                    let width = crate::context::inner_width();
+                    let mut used = 0.0;
+                    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                        let touched = BTreeSet::new();
+                        let cx = Context {
+                            units: &mm(),
+                            names,
+                            salt: Id::unique((c.id, can_browse)),
+                            touched: &touched,
+                            attempted: true,
+                            refused: None,
+                            problems: &messages(form, &params),
+                            picked: Picked::default(),
+                            selection: None,
+                            can_browse,
+                        };
+                        ui.vertical(|ui| {
+                            ui.set_max_width(width);
+                            outcome = show(ui, &Tokens::get(false), &cx, form, &mut params);
+                            used = ui.min_rect().width();
+                        });
                     });
-                });
-                // Wider would push the context panel over the viewport.
-                assert!(used <= width + 0.5, "{}: {used}", c.id);
-                out.textures_delta.clear();
-                assert!(!outcome.changed, "{}", c.id);
-                assert_eq!(params, before, "{}", c.id);
+                    // Wider would push the context panel over the viewport.
+                    assert!(used <= width + 0.5, "{} (can_browse={can_browse}): {used}", c.id);
+                    out.textures_delta.clear();
+                    assert!(!outcome.changed, "{}", c.id);
+                    assert_eq!(params, before, "{}", c.id);
+                }
             }
         }
     }
@@ -1782,6 +1841,7 @@ pub(crate) mod tests {
                         problems: &[],
                         picked: Picked::default(),
                         selection: None,
+                        can_browse: false,
                     };
                     ui.vertical(|ui| {
                         ui.set_max_width(crate::context::inner_width());
@@ -1858,59 +1918,62 @@ pub(crate) mod tests {
             || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))), ..Default::default() };
         let one = |c: Collection| vec![format!("{} with a long name", c.label())];
         let mut checked = 0;
-        for width in [crate::context::inner_width(), 200.0] {
-            for c in fieldcraft_engine::commands() {
-                let Some(form) = c.form else { continue };
-                let mut params = schema::prefill(form, &json!({})).as_object().cloned().unwrap_or_default();
-                let mut labels = BTreeSet::new();
-                each_label(form, &mm(), 0, &mut |l, _, _| {
-                    labels.insert(l.to_string());
-                });
-                let (mut left, mut column, mut cut) = (0.0, 0.0, Vec::new());
-                let mut out = ctx.run_ui(input(), |ui| {
-                    let touched = BTreeSet::new();
-                    let cx = Context {
-                        units: &mm(),
-                        names: &one,
-                        salt: Id::unique(c.id),
-                        touched: &touched,
-                        attempted: false,
-                        refused: None,
-                        problems: &[],
-                        picked: Picked::default(),
-                        selection: None,
-                    };
-                    ui.vertical(|ui| {
-                        ui.set_max_width(width);
-                        left = ui.min_rect().left();
-                        column = label_column(ui, form, cx.units, width);
-                        // Every label (also of sections not open), laid out as its row lays it out.
-                        each_label(form, cx.units, 0, &mut |label, required, help| {
-                            let wrap = column - fields::marks_width(required, help);
-                            if fields::label_galley(ui, label, Color32::WHITE, wrap).elided {
-                                cut.push(label.to_string());
-                            }
-                        });
-                        show(ui, &Tokens::get(false), &cx, form, &mut params);
+        for can_browse in [false, true] {
+            for width in [crate::context::inner_width(), 200.0] {
+                for c in fieldcraft_engine::commands() {
+                    let Some(form) = c.form else { continue };
+                    let mut params = schema::prefill(form, &json!({})).as_object().cloned().unwrap_or_default();
+                    let mut labels = BTreeSet::new();
+                    each_label(form, &mm(), 0, &mut |l, _, _| {
+                        labels.insert(l.to_string());
                     });
-                });
-                out.textures_delta.clear();
-                assert!(cut.is_empty(), "{} at {width}: {cut:?} do not fit {column}", c.id);
-                assert!(column <= width - FIELD_MIN, "{}: {column}", c.id);
-                // A row's column starts at its label (nested rows are indented); its marks follow.
-                let mut row_left = left;
-                for shape in &out.shapes {
-                    let egui::Shape::Text(t) = &shape.shape else { continue };
-                    let text = t.galley.text();
-                    let rect = t.galley.rect.translate(t.pos.to_vec2());
-                    let end = row_left + column + 0.5;
-                    if labels.contains(text) && rect.left() < left + width / 2.0 {
-                        row_left = rect.left();
-                        assert!(!t.galley.elided, "{} at {width}: `{text}` elided", c.id);
-                        assert!(rect.right() <= rect.left() + column + 0.5, "{} at {width}: `{text}` past the column", c.id);
-                        checked += 1;
-                    } else if (text == "*" || text == "i") && rect.left() < end {
-                        assert!(rect.right() <= end, "{} at {width}: a mark past the column: {rect:?}", c.id);
+                    let (mut left, mut column, mut cut) = (0.0, 0.0, Vec::new());
+                    let mut out = ctx.run_ui(input(), |ui| {
+                        let touched = BTreeSet::new();
+                        let cx = Context {
+                            units: &mm(),
+                            names: &one,
+                            salt: Id::unique((c.id, can_browse, width.to_bits())),
+                            touched: &touched,
+                            attempted: false,
+                            refused: None,
+                            problems: &[],
+                            picked: Picked::default(),
+                            selection: None,
+                            can_browse,
+                        };
+                        ui.vertical(|ui| {
+                            ui.set_max_width(width);
+                            left = ui.min_rect().left();
+                            column = label_column(ui, form, cx.units, width);
+                            // Every label (also of sections not open), laid out as its row lays it out.
+                            each_label(form, cx.units, 0, &mut |label, required, help| {
+                                let wrap = column - fields::marks_width(required, help);
+                                if fields::label_galley(ui, label, Color32::WHITE, wrap).elided {
+                                    cut.push(label.to_string());
+                                }
+                            });
+                            show(ui, &Tokens::get(false), &cx, form, &mut params);
+                        });
+                    });
+                    out.textures_delta.clear();
+                    assert!(cut.is_empty(), "{} at {width}: {cut:?} do not fit {column}", c.id);
+                    assert!(column <= width - FIELD_MIN, "{}: {column}", c.id);
+                    // A row's column starts at its label (nested rows are indented); its marks follow.
+                    let mut row_left = left;
+                    for shape in &out.shapes {
+                        let egui::Shape::Text(t) = &shape.shape else { continue };
+                        let text = t.galley.text();
+                        let rect = t.galley.rect.translate(t.pos.to_vec2());
+                        let end = row_left + column + 0.5;
+                        if labels.contains(text) && rect.left() < left + width / 2.0 {
+                            row_left = rect.left();
+                            assert!(!t.galley.elided, "{} at {width}: `{text}` elided", c.id);
+                            assert!(rect.right() <= rect.left() + column + 0.5, "{} at {width}: `{text}` past the column", c.id);
+                            checked += 1;
+                        } else if (text == "*" || text == "i") && rect.left() < end {
+                            assert!(rect.right() <= end, "{} at {width}: a mark past the column: {rect:?}", c.id);
+                        }
                     }
                 }
             }
@@ -1986,6 +2049,7 @@ pub(crate) mod tests {
                     problems: &messages(form, &params),
                     picked: Picked::default(),
                     selection: None,
+                    can_browse: false,
                 };
                 show(ui, &Tokens::get(false), &cx, form, &mut params);
             });
@@ -2032,6 +2096,7 @@ pub(crate) mod tests {
                 problems: &[],
                 picked: Picked::default(),
                 selection: None,
+                can_browse: false,
             };
             show(ui, &Tokens::get(false), &cx, FORM, &mut params);
         });
@@ -2060,6 +2125,7 @@ pub(crate) mod tests {
                 problems: &[],
                 picked: Picked { nodes: vec![4, 5], ..Picked::default() },
                 selection: None,
+                can_browse: false,
             };
             show(ui, &Tokens::get(false), &cx, form, &mut params);
         });
@@ -2113,6 +2179,7 @@ pub(crate) mod tests {
                     problems: &[],
                     picked: Picked::default(),
                     selection: None,
+                    can_browse: false,
                 };
                 ui.vertical(|ui| {
                     ui.set_max_width(crate::context::inner_width());
@@ -2148,6 +2215,7 @@ pub(crate) mod tests {
                 problems: &[],
                 picked: Picked::default(),
                 selection: None,
+                can_browse: false,
             };
             ui.vertical(|ui| {
                 ui.set_max_width(crate::context::inner_width());
@@ -2263,6 +2331,7 @@ pub(crate) mod tests {
                     problems: &[],
                     picked: Picked::default(),
                     selection,
+                    can_browse: false,
                 };
                 ui.vertical(|ui| {
                     ui.set_max_width(crate::context::inner_width());
@@ -2405,5 +2474,95 @@ pub(crate) mod tests {
         assert!(step.contains("Reaction force") && step.contains("Heat flux"), "{step}");
         let deformed = drawn("results.deformed", &mm(), json!({"scale": "auto"}));
         assert!(deformed.contains("Auto"), "{deformed}");
+    }
+
+    fn text_center(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == needle => Some(t.pos + t.galley.size() * 0.5),
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    fn click_form_button(id: &str, params: Value, button: &str) -> Option<BrowseRequest> {
+        let form = fieldcraft_engine::find_command(id).and_then(|c| c.form).unwrap();
+        let ctx = egui::Context::default();
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 600.0)));
+        let mut params = params.as_object().cloned().unwrap_or_default();
+        let names = |_: Collection| Vec::new();
+        let touched = BTreeSet::new();
+        let units = mm();
+        let mut run_frame = |input: egui::RawInput| {
+            let mut outcome = Outcome::default();
+            let mut out = ctx.run_ui(input, |ui| {
+                let cx = Context {
+                    units: &units,
+                    names: &names,
+                    salt: Id::unique((id, button)),
+                    touched: &touched,
+                    attempted: false,
+                    refused: None,
+                    problems: &[],
+                    picked: Picked::default(),
+                    selection: None,
+                    can_browse: true,
+                };
+                ui.vertical(|ui| {
+                    ui.set_max_width(crate::context::inner_width());
+                    outcome = show(ui, &Tokens::get(false), &cx, form, &mut params);
+                });
+            });
+            out.textures_delta.clear();
+            (out.shapes, outcome)
+        };
+
+        let (shapes, _) = run_frame(egui::RawInput { screen_rect: screen, ..Default::default() });
+        let pos = text_center(&shapes, button).unwrap_or_else(|| panic!("{id}: button `{button}` not drawn"));
+        let (_, outcome) = run_frame(egui::RawInput {
+            screen_rect: screen,
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ],
+            ..Default::default()
+        });
+        outcome.browse
+    }
+
+    #[test]
+    fn path_fields_show_browse_buttons_only_when_can_browse_and_emit_requests() {
+        for id in ["deck.read", "deck.write", "file.recovery.list", "results.read"] {
+            let text = drawn(id, &mm(), json!({}));
+            assert!(!text.contains("Browse…") && !text.contains("Folder…") && !text.contains("File…"), "{id}: {text}");
+        }
+
+        assert_eq!(
+            click_form_button("deck.read", json!({}), "Browse…"),
+            Some(BrowseRequest { field_path: "path".into(), picker: FilePicker::Open { filters: Vec::new() } })
+        );
+        assert_eq!(
+            click_form_button("deck.write", json!({"path": " /tmp/out/model.inp "}), "Browse…"),
+            Some(BrowseRequest { field_path: "path".into(), picker: FilePicker::Save { name: "model.inp".into(), filters: Vec::new() } })
+        );
+        assert_eq!(
+            click_form_button("deck.write", json!({}), "Browse…"),
+            Some(BrowseRequest { field_path: "path".into(), picker: FilePicker::Save { name: String::new(), filters: Vec::new() } })
+        );
+        assert_eq!(
+            click_form_button("file.recovery.list", json!({}), "Browse…"),
+            Some(BrowseRequest { field_path: "dir".into(), picker: FilePicker::Folder })
+        );
+        assert_eq!(
+            click_form_button("results.read", json!({}), "Folder…"),
+            Some(BrowseRequest { field_path: "path".into(), picker: FilePicker::Folder })
+        );
+        assert_eq!(
+            click_form_button("results.read", json!({}), "File…"),
+            Some(BrowseRequest { field_path: "path".into(), picker: FilePicker::Open { filters: Vec::new() } })
+        );
     }
 }

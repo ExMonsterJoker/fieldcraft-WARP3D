@@ -321,8 +321,9 @@ fn form(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens, bounds: Rect, anchor:
     let relax_note = app.relax_note().or_else(|| app.node_move_note());
     let fluid_note = app.fluid_note();
     let units = app.session.units().clone();
-    // Escape closes an open menu or the command search, not the form under it.
-    let escape_elsewhere = app.ui.menu.is_some() || app.ui.palette;
+    let can_browse = app.has_path_picker();
+    // Escape closes an open menu, command search, or native file chooser, not the form under it.
+    let escape_elsewhere = app.ui.menu.is_some() || app.ui.palette || app.picker.is_some();
     // The nodes, elements and element faces picked in the viewport, for Use selection.
     let mut picked = crate::form::Picked::default();
     for item in app.pick.selection.items() {
@@ -338,6 +339,7 @@ fn form(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens, bounds: Rect, anchor:
     // The set Use selection will make on OK is offered with the others.
     let pending = app.dialog.as_ref().and_then(|d| d.pending_set.as_ref()).and_then(|s| s.get("name")).and_then(Value::as_str).map(str::to_string);
     let d = app.dialog.as_mut()?;
+    let opening = d.opening;
     let Some(spec) = fieldcraft_engine::find_command(d.command) else {
         app.dialog = None;
         return None;
@@ -352,7 +354,7 @@ fn form(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens, bounds: Rect, anchor:
         _ => Vec::new(),
     };
     let missing = problems.iter().map(|(_, m)| m.as_str()).collect::<Vec<_>>().join("\n");
-    let (mut invalid, mut create, mut hover_body, mut use_selection) = (0, None, None, false);
+    let (mut invalid, mut create, mut browse, mut hover_body, mut use_selection) = (0, None, None, None, false);
     let ctx = ui.ctx().clone();
     let side = kit::frame::Side::Right;
     let frame = kit::Panel::feature_frame(&ctx, kit::LayoutMode::current(&ctx), side);
@@ -421,10 +423,12 @@ fn form(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens, bounds: Rect, anchor:
                     problems: &problems,
                     picked: picked.clone(),
                     selection: Some(selection),
+                    can_browse,
                 };
                 let out = crate::form::show(ui, t, &cx, fields, &mut obj);
                 invalid = out.invalid;
                 create = out.create;
+                browse = out.browse;
                 hover_body = out.hover_body;
                 if out.changed {
                     d.text = Value::Object(obj).to_string();
@@ -495,6 +499,8 @@ fn form(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens, bounds: Rect, anchor:
         app.close_dialog();
     } else if let Some((collection, path)) = create {
         app.create_from_form(collection, path);
+    } else if let Some(req) = browse {
+        app.pick_file(req.picker, crate::files::PickerAction::FormField { opening, field_path: req.field_path });
     } else if action == kit::Action::Ok && ready {
         app.submit_dialog();
     } else if use_selection
@@ -1188,5 +1194,41 @@ mod tests {
         assert!(value_text(&long).starts_with("500 items: 0, 1, 2"));
         let text = json!({"a": "x".repeat(400)});
         assert!(value_text(&text).ends_with('…') && value_text(&text).chars().count() == 161);
+    }
+
+    #[test]
+    fn escape_does_not_close_form_while_picker_is_open() {
+        let mut app = ModelApp::new(fieldcraft_engine::Session::default())
+            .with_services(crate::Services { pick_file: Some(Box::new(|_| Box::pin(std::future::pending()))), ..Default::default() });
+        app.open_form("deck.read", json!({}));
+        let opening = app.dialog.as_ref().unwrap().opening;
+        app.pick_file(
+            crate::files::FilePicker::Open { filters: Vec::new() },
+            crate::files::PickerAction::FormField { opening, field_path: "path".into() },
+        );
+        assert!(app.picker.is_some());
+
+        let ctx = egui::Context::default();
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)));
+        let esc = || egui::RawInput {
+            screen_rect: screen,
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        };
+
+        let mut out = ctx.run_ui(esc(), |ui| panel(&mut app, ui));
+        out.textures_delta.clear();
+        assert!(app.dialog.is_some(), "Escape must not close form while native chooser is pending");
+
+        app.picker = None;
+        let mut out2 = ctx.run_ui(esc(), |ui| panel(&mut app, ui));
+        out2.textures_delta.clear();
+        assert!(app.dialog.is_none(), "Escape closes form once native chooser finishes");
     }
 }

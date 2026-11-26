@@ -2675,20 +2675,19 @@ const SAVE_GEOMETRY: Field = choice("geometry", "Geometry", &[("refer", "Refer t
 pub const FILE_SAVE: &[Field] =
     &[path("path", "File", true).help("Where to save; the model's own file when empty.").hint("the model's file"), SAVE_RESULTS, SAVE_GEOMETRY];
 pub const FILE_SAVE_AS: &[Field] = &[path("path", "File", true).help("The file to save to.").req(), SAVE_RESULTS, SAVE_GEOMETRY];
-pub const RECOVERY_LIST: &[Field] =
-    &[path("dir", "Folder", false).help("The recovery folder; the default one when empty.").hint("the recovery folder")];
+pub const RECOVERY_LIST: &[Field] = &[folder("dir", "Folder").help("The recovery folder; the default one when empty.").hint("the recovery folder")];
 pub const CRASH_REPORTS: &[Field] = &[
     int("limit", "Limit", 1, 1000).help("At most this many reports, newest first.").hint("20"),
-    path("dir", "Folder", false).help("The crash folder; the default one when empty.").hint("the crash folder"),
+    folder("dir", "Folder").help("The crash folder; the default one when empty.").hint("the crash folder"),
 ];
 pub const CRASH_REPORT: &[Field] = &[
     text("id", "Report").help("The crash report to show.").req(),
-    path("dir", "Folder", false).help("The crash folder; the default one when empty.").hint("the crash folder"),
+    folder("dir", "Folder").help("The crash folder; the default one when empty.").hint("the crash folder"),
 ];
 pub const CRASH_REPORTS_DELETE: &[Field] = &[
     text("id", "Report").help("The crash report to delete.").hint("or All"),
     flag("all", "All").help("Delete every crash report instead of one."),
-    path("dir", "Folder", false).help("The crash folder; the default one when empty.").hint("the crash folder"),
+    folder("dir", "Folder").help("The crash folder; the default one when empty.").hint("the crash folder"),
 ];
 pub const BUG_REPORT: &[Field] = &[
     text("title", "Title").help("The issue's title; one is made up when empty."),
@@ -2701,12 +2700,12 @@ pub const CRASH_TEST: &[Field] =
     &[choice("mode", "Mode", &[("panic", "Panic"), ("recovered", "Recovered panic"), ("abort", "Abort")]).help("How to crash.").req()];
 pub const RECOVER: &[Field] = &[
     text("id", "Autosave").help("The autosave to recover.").req(),
-    path("dir", "Folder", false).help("The recovery folder; the default one when empty.").hint("the recovery folder"),
+    folder("dir", "Folder").help("The recovery folder; the default one when empty.").hint("the recovery folder"),
 ];
 pub const RECOVERY_DISCARD: &[Field] = &[
     text("id", "Autosave").help("The autosave to discard."),
     flag("all", "All").help("Discard every autosave."),
-    path("dir", "Folder", false).help("The recovery folder; the default one when empty.").hint("the recovery folder"),
+    folder("dir", "Folder").help("The recovery folder; the default one when empty.").hint("the recovery folder"),
 ];
 pub const SAMPLE: &[Field] = &[choice(
     "name",
@@ -3278,7 +3277,7 @@ pub const REACTIONS: &[Field] = &[
 
 pub const RESULTS_READ: &[Field] = &[
     choice("format", "Format", &[("warp3d", "WARP3D flat files")]).help("External results format to read.").req().def("\"warp3d\""),
-    path("path", "Results folder or deck", false)
+    path_or_folder("path", "Results folder or deck")
         .help("Directory containing WARP3D flat result files (wnd*_text, wns*_text, wes*_text, wnr*_text) or a file inside it.")
         .req(),
     reference("step", "Step", C::Step).help("Model step the results belong to; the only structural step when empty.").hint("the only one"),
@@ -3778,6 +3777,6 @@ mod tests {
     #[test]
     fn image_form_types_its_size() {
         assert!(matches!(field_of("view.image.save", "size").kind, Kind::Tuple { min_len: 2, whole: true, .. }));
-        assert!(matches!(field_of("view.image.save", "path").kind, Kind::Path { save: true }));
+        assert!(matches!(field_of("view.image.save", "path").kind, Kind::Path { mode: PathMode::SaveFile }));
     }
 }

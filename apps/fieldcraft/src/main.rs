@@ -156,14 +156,19 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
         pick_file: Some(Box::new(move |request| {
             let dialog = dialog.clone();
             Box::pin(async move {
-                let (filters, name) = match request {
-                    FilePicker::Open { filters } => (filters, None),
-                    FilePicker::Save { filters, name } => (filters, Some(name)),
+                let (filters, name, folder) = match request {
+                    FilePicker::Open { filters } => (filters, None, false),
+                    FilePicker::Save { filters, name } => (filters, Some(name), false),
+                    FilePicker::Folder => (Vec::new(), None, true),
                 };
                 let dialog = filters.iter().fold(dialog, |d, f| d.add_filter(f.name, f.extensions.as_slice()));
-                let file = match name {
-                    Some(name) => dialog.set_file_name(name).save_file().await,
-                    None => dialog.pick_file().await,
+                let file = if folder {
+                    dialog.pick_folder().await
+                } else if let Some(name) = name {
+                    let dialog = if name.is_empty() { dialog } else { dialog.set_file_name(name) };
+                    dialog.save_file().await
+                } else {
+                    dialog.pick_file().await
                 };
                 file.map(|f| f.path().to_string_lossy().into_owned())
             })

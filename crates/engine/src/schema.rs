@@ -67,9 +67,9 @@ pub enum Kind {
         max: i64,
     },
     Text,
-    /// A file path; `save` when the command writes it.
+    /// A file or folder path; `mode` governs desktop file/folder picking.
     Path {
-        save: bool,
+        mode: PathMode,
     },
     Bool,
     /// One of these strings: (value, label).
@@ -192,6 +192,15 @@ impl Side3 {
             Side3::Vertex => "vertex",
         }
     }
+}
+
+/// What a [`Kind::Path`] field picks on desktop hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathMode {
+    OpenFile,
+    SaveFile,
+    Folder,
+    FolderOrFile,
 }
 
 /// What a [`Kind::Labels`] list labels.
@@ -628,7 +637,13 @@ pub const fn text(key: &'static str, label: &'static str) -> Field {
     field(key, label, Kind::Text)
 }
 pub const fn path(key: &'static str, label: &'static str, save: bool) -> Field {
-    field(key, label, Kind::Path { save })
+    field(key, label, Kind::Path { mode: if save { PathMode::SaveFile } else { PathMode::OpenFile } })
+}
+pub const fn folder(key: &'static str, label: &'static str) -> Field {
+    field(key, label, Kind::Path { mode: PathMode::Folder })
+}
+pub const fn path_or_folder(key: &'static str, label: &'static str) -> Field {
+    field(key, label, Kind::Path { mode: PathMode::FolderOrFile })
 }
 pub const fn flag(key: &'static str, label: &'static str) -> Field {
     field(key, label, Kind::Bool)
@@ -1907,5 +1922,31 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "documented but not in the form:\n{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn path_modes_keep_string_json_schema_and_enter_a_path_phrase() {
+        const FIELDS: &[Field] = &[
+            path("open", "Open", false).req(),
+            path("save", "Save", true).req(),
+            folder("dir", "Folder").req(),
+            path_or_folder("either", "Results").req(),
+        ];
+        let modes: Vec<_> = FIELDS
+            .iter()
+            .map(|f| match f.kind {
+                Kind::Path { mode } => mode,
+                other => panic!("expected Path, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(modes, [PathMode::OpenFile, PathMode::SaveFile, PathMode::Folder, PathMode::FolderOrFile]);
+
+        let schema = json_schema(FIELDS);
+        for (key, label) in [("open", "Open"), ("save", "Save"), ("dir", "Folder"), ("either", "Results")] {
+            assert_eq!(schema["properties"][key], json!({"title": label, "type": "string"}), "{key}");
+        }
+
+        let msgs: Vec<String> = problems(FIELDS, &json!({})).iter().map(Problem::for_form).collect();
+        assert_eq!(msgs, ["Open: enter a path", "Save: enter a path", "Folder: enter a path", "Results: enter a path"]);
     }
 }
