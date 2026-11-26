@@ -25,11 +25,11 @@ const MAX_FLAT_LINE_BYTES: usize = 16 * 1024;
 const MAX_SKIPPED_LINES: usize = 100_000;
 const MAX_STEPS: usize = 10_000;
 const MAX_INP_HEADER_LINES: usize = 128;
-const MAX_DOMAIN_LINES: usize = 200_000;
+const MAX_DOMAIN_LINES: usize = 1_000_000;
 const MAX_DOMAINS: usize = 4_096;
 const MAX_RINGS_PER_DOMAIN: usize = 64;
-const MIN_J_DENOM: f64 = 1e-12; // unit-factors: denominator floor for path-independence ring spread
-const MIN_VEC_NORM: f64 = 1e-15;
+pub(crate) const MIN_J_DENOM: f64 = 1e-12; // unit-factors: denominator floor for path-independence ring spread
+pub(crate) const MIN_VEC_NORM: f64 = 1e-15;
 
 pub(crate) fn clamp_str_utf8(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
@@ -464,16 +464,17 @@ impl DomainAccum {
     }
 }
 
-fn push_finalized(out: &mut Vec<(DomainIntegralResult, Vec<u32>)>, acc: DomainAccum) {
-    if out.len() >= MAX_DOMAINS {
-        return;
-    }
+fn push_finalized(out: &mut Vec<(DomainIntegralResult, Vec<u32>)>, acc: DomainAccum, truncated: &mut bool) {
     if let Some(built) = acc.build(false) {
+        if out.len() >= MAX_DOMAINS {
+            *truncated = true;
+            return;
+        }
         out.push(built);
     }
 }
 
-fn flush_active_domain(out: &mut Vec<(DomainIntegralResult, Vec<u32>)>, acc: DomainAccum, is_schematic_interaction: bool) {
+fn flush_active_domain(out: &mut Vec<(DomainIntegralResult, Vec<u32>)>, acc: DomainAccum, is_schematic_interaction: bool, truncated: &mut bool) {
     if is_schematic_interaction {
         if let Some((built, _)) = acc.build(true)
             && let Some((existing, _)) = out.iter_mut().rev().find(|(r, _)| r.domain_id == built.domain_id && r.step == built.step)
@@ -481,7 +482,7 @@ fn flush_active_domain(out: &mut Vec<(DomainIntegralResult, Vec<u32>)>, acc: Dom
             merge_interaction_into_existing(existing, built);
         }
     } else {
-        push_finalized(out, acc);
+        push_finalized(out, acc, truncated);
     }
 }
 
@@ -596,6 +597,7 @@ pub(crate) struct DomainIntegralParser<'a> {
     awaiting_j_summary_values: bool,
     awaiting_i_summary_values: Option<PendingSummary>,
     domain_lines: usize,
+    domains_truncated: bool,
 }
 
 impl<'a> DomainIntegralParser<'a> {
@@ -612,6 +614,7 @@ impl<'a> DomainIntegralParser<'a> {
             awaiting_j_summary_values: false,
             awaiting_i_summary_values: None,
             domain_lines: 0,
+            domains_truncated: false,
         }
     }
 
@@ -637,6 +640,7 @@ impl<'a> DomainIntegralParser<'a> {
             return;
         }
         if self.domain_lines >= MAX_DOMAIN_LINES {
+            self.domains_truncated = true;
             return;
         }
         self.domain_lines += 1;
@@ -661,6 +665,8 @@ impl<'a> DomainIntegralParser<'a> {
                     self.current_dump = None;
                     if self.pending_dumps.len() < MAX_DOMAINS || self.pending_dumps.contains_key(&finished.domain_id) {
                         self.pending_dumps.insert(finished.domain_id.clone(), finished);
+                    } else {
+                        self.domains_truncated = true;
                     }
                     continue;
                 }
@@ -721,11 +727,11 @@ impl<'a> DomainIntegralParser<'a> {
                 && let Some(after) = trimmed.get("domain id:".len()..)
             {
                 if let Some(prev) = self.active.take() {
-                    flush_active_domain(&mut self.results, prev, self.active_is_schematic_interaction);
+                    flush_active_domain(&mut self.results, prev, self.active_is_schematic_interaction, &mut self.domains_truncated);
                 }
                 let id = after.split_whitespace().next().unwrap_or("").to_string();
                 if !id.is_empty() {
-                    let dump = self.pending_dumps.remove(&id);
+                    let dump = self.pending_dumps.get(&id).cloned();
                     self.active = Some(DomainAccum::new(id, current_step, dump));
                     self.active_is_schematic_interaction = false;
                     self.mode = ParserMode::Warp(WarpSection::None);
@@ -738,9 +744,9 @@ impl<'a> DomainIntegralParser<'a> {
             // 3. Schematic `Domain: <id>` header.
             if let Some((id, is_interaction, step_hint)) = parse_schematic_header(trimmed) {
                 if let Some(prev) = self.active.take() {
-                    flush_active_domain(&mut self.results, prev, self.active_is_schematic_interaction);
+                    flush_active_domain(&mut self.results, prev, self.active_is_schematic_interaction, &mut self.domains_truncated);
                 }
-                let dump = self.pending_dumps.remove(&id);
+                let dump = self.pending_dumps.get(&id).cloned();
                 let mut acc = DomainAccum::new(id, step_hint.max(current_step), dump);
                 if step_hint > 1 {
                     acc.step = step_hint;
@@ -771,7 +777,7 @@ impl<'a> DomainIntegralParser<'a> {
                 if let Some(prev) = finished
                     && !trimmed.starts_with(">>> Invalid domain definition")
                 {
-                    flush_active_domain(&mut self.results, prev, was_interaction);
+                    flush_active_domain(&mut self.results, prev, was_interaction, &mut self.domains_truncated);
                 }
                 continue;
             }
@@ -1209,9 +1215,9 @@ impl<'a> DomainIntegralParser<'a> {
         self.awaiting_i_summary_values = awaiting_i_summary_values;
     }
 
-    pub(crate) fn finish(mut self) -> (Vec<DomainIntegralResult>, Vec<Vec<u32>>) {
+    pub(crate) fn finish(mut self) -> (Vec<DomainIntegralResult>, Vec<Vec<u32>>, bool) {
         if let Some(prev) = self.active.take() {
-            flush_active_domain(&mut self.results, prev, self.active_is_schematic_interaction);
+            flush_active_domain(&mut self.results, prev, self.active_is_schematic_interaction, &mut self.domains_truncated);
         }
 
         let mut domains = Vec::with_capacity(self.results.len());
@@ -1220,11 +1226,11 @@ impl<'a> DomainIntegralParser<'a> {
             domains.push(d);
             stations.push(s);
         }
-        (domains, stations)
+        (domains, stations, self.domains_truncated)
     }
 }
 
-fn parse_domain_integrals_with_meta(stdout: &str, label_map: &LabelMap) -> (Vec<DomainIntegralResult>, Vec<Vec<u32>>) {
+fn parse_domain_integrals_with_meta(stdout: &str, label_map: &LabelMap) -> (Vec<DomainIntegralResult>, Vec<Vec<u32>>, bool) {
     let mut parser = DomainIntegralParser::new(label_map);
     for raw_line in stdout.lines() {
         parser.feed_line(raw_line);
@@ -1379,8 +1385,8 @@ pub(crate) fn enrich_domain_geometry(domains: &mut [DomainIntegralResult], stati
 pub fn read_results_dir(model: &fieldcraft_model::Model, step: &str, dir_or_file: &Path, units: Option<Preset>) -> Result<Warp3dSolution> {
     let (dir, explicit_file) = resolve_dir(dir_or_file)?;
     let mut warnings = Vec::new();
-    let stdout_log = read_optional_stdout(&dir, explicit_file, &mut warnings);
-    read_results_dir_inner(model, step, dir_or_file, units, stdout_log, None, MAX_FRAME_VALUES, warnings)
+    let (stdout_log, stdout_truncated) = read_optional_stdout(&dir, explicit_file, &mut warnings);
+    read_results_dir_inner(model, step, dir_or_file, units, stdout_log, stdout_truncated, None, MAX_FRAME_VALUES, warnings)
 }
 
 /// Internal entry point shared with tests or batch callers when `stdout_log` is already captured.
@@ -1393,7 +1399,7 @@ pub(crate) fn read_results_dir_with_stdout(
     stdout_log: String,
     warnings: Vec<String>,
 ) -> Result<Warp3dSolution> {
-    read_results_dir_inner(model, step, dir_or_file, units, stdout_log, None, MAX_FRAME_VALUES, warnings)
+    read_results_dir_inner(model, step, dir_or_file, units, stdout_log, false, None, MAX_FRAME_VALUES, warnings)
 }
 
 /// Internal entry point used by [`crate::runner::run_warp3d`] when stdout domain integrals were
@@ -1405,10 +1411,10 @@ pub(crate) fn read_results_dir_with_preparsed_fracture(
     dir_or_file: &Path,
     units: Option<Preset>,
     stdout_log: String,
-    preparsed_fracture: (Vec<DomainIntegralResult>, Vec<Vec<u32>>),
+    preparsed_fracture: (Vec<DomainIntegralResult>, Vec<Vec<u32>>, bool),
     warnings: Vec<String>,
 ) -> Result<Warp3dSolution> {
-    read_results_dir_inner(model, step, dir_or_file, units, stdout_log, Some(preparsed_fracture), MAX_FRAME_VALUES, warnings)
+    read_results_dir_inner(model, step, dir_or_file, units, stdout_log, false, Some(preparsed_fracture), MAX_FRAME_VALUES, warnings)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1418,7 +1424,8 @@ fn read_results_dir_inner(
     dir_or_file: &Path,
     units: Option<Preset>,
     stdout_log: String,
-    preparsed_fracture: Option<(Vec<DomainIntegralResult>, Vec<Vec<u32>>)>,
+    stdout_truncated: bool,
+    preparsed_fracture: Option<(Vec<DomainIntegralResult>, Vec<Vec<u32>>, bool)>,
     max_frame_values: usize,
     mut warnings: Vec<String>,
 ) -> Result<Warp3dSolution> {
@@ -1663,13 +1670,17 @@ fn read_results_dir_inner(
         contacts: Vec::new(),
     };
 
-    let (mut fracture, station_nodes) = match preparsed_fracture {
+    let (mut fracture, station_nodes, parser_truncated) = match preparsed_fracture {
         Some(pre) => pre,
         None => parse_domain_integrals_with_meta(&stdout_log, &label_map),
     };
+    if parser_truncated {
+        warnings.push("WARP3D fracture domain integral output exceeded parser bounds; fracture results may be incomplete".into());
+    }
+    let domains_truncated = stdout_truncated || parser_truncated;
     convert_domain_integrals_to_si(&mut fracture, &display)?;
     enrich_domain_geometry(&mut fracture, &station_nodes, model);
-    Ok(Warp3dSolution { static_result, fracture, warnings, stdout_log })
+    Ok(Warp3dSolution { static_result, fracture, step_numbers: step_nums, domains_truncated, warnings, stdout_log })
 }
 
 fn resolve_dir(dir_or_file: &Path) -> Result<(PathBuf, Option<&Path>)> {
@@ -1744,35 +1755,45 @@ fn detect_preset(
     fallback
 }
 
-fn read_capped_stdout(path: &Path, max_bytes: u64, warnings: &mut Vec<String>) -> Option<String> {
+fn read_capped_stdout(path: &Path, max_bytes: u64, warnings: &mut Vec<String>) -> Option<(String, bool)> {
+    use std::io::Read;
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
         return None;
     }
-    if meta.len() > max_bytes {
+    let file = File::open(path).ok()?;
+    let cap_usize = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut buf = Vec::with_capacity(meta.len().min(max_bytes).min(1024 * 1024) as usize);
+    file.take(max_bytes.saturating_add(1)).read_to_end(&mut buf).ok()?;
+    let truncated = meta.len() > max_bytes || buf.len() > cap_usize;
+    if truncated {
+        buf.truncate(cap_usize);
         warnings.push(format!(
-            "WARP3D output file `{}` ({} bytes) exceeds {max_bytes}-byte limit; fracture domain integrals may be incomplete",
+            "WARP3D output file `{}` ({} bytes) exceeds {max_bytes}-byte limit; streamed first {max_bytes} bytes and fracture domain integrals may be incomplete",
             path.display(),
             meta.len()
         ));
-        return None;
     }
-    std::fs::read_to_string(path).ok()
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if truncated && let Some(nl) = text.rfind('\n') {
+        text.truncate(nl + 1);
+    }
+    Some((text, truncated))
 }
 
-fn read_optional_stdout(dir: &Path, explicit_file: Option<&Path>, warnings: &mut Vec<String>) -> String {
+fn read_optional_stdout(dir: &Path, explicit_file: Option<&Path>, warnings: &mut Vec<String>) -> (String, bool) {
     read_optional_stdout_with_cap(dir, explicit_file, MAX_STDOUT_BYTES, warnings)
 }
 
-fn read_optional_stdout_with_cap(dir: &Path, explicit_file: Option<&Path>, max_bytes: u64, warnings: &mut Vec<String>) -> String {
+fn read_optional_stdout_with_cap(dir: &Path, explicit_file: Option<&Path>, max_bytes: u64, warnings: &mut Vec<String>) -> (String, bool) {
     if let Some(file) = explicit_file
         && file.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "out" | "log" | "txt"))
-        && let Some(text) = read_capped_stdout(file, max_bytes, warnings)
+        && let Some(res) = read_capped_stdout(file, max_bytes, warnings)
     {
-        return text;
+        return res;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return String::new();
+        return (String::new(), false);
     };
     let mut logs: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -1780,11 +1801,11 @@ fn read_optional_stdout_with_cap(dir: &Path, explicit_file: Option<&Path>, max_b
         .collect();
     logs.sort();
     for log in logs {
-        if let Some(text) = read_capped_stdout(&log, max_bytes, warnings) {
-            return text;
+        if let Some(res) = read_capped_stdout(&log, max_bytes, warnings) {
+            return res;
         }
     }
-    String::new()
+    (String::new(), false)
 }
 
 fn parse_flat_filename(name: &str) -> Option<(&'static str, usize)> {
@@ -2618,14 +2639,16 @@ Domain: d1 (interaction integral, step 2)
      1  1500.0     0.0      0.0     -10.0    -3.0
      2  1600.0     0.0      0.0     -11.0    -3.2
 ";
-        let (batch_domains, batch_nodes) = parse_domain_integrals_with_meta(domain_log, &label_map);
+        let (batch_domains, batch_nodes, batch_truncated) = parse_domain_integrals_with_meta(domain_log, &label_map);
+        assert!(!batch_truncated);
         let mut streamed = DomainIntegralParser::new(&label_map);
         for line in domain_log.lines() {
             streamed.feed_line(line);
         }
-        let (stream_domains, stream_nodes) = streamed.finish();
+        let (stream_domains, stream_nodes, stream_truncated) = streamed.finish();
         assert_eq!(stream_domains, batch_domains);
         assert_eq!(stream_nodes, batch_nodes);
+        assert!(!stream_truncated);
 
         // Overlong non-domain filler lines beyond MAX_DOMAIN_LINES must not starve late domain output,
         // and multi-byte UTF-8 lines exceeding MAX_LINE_BYTES must clamp without panicking.
@@ -2638,8 +2661,9 @@ Domain: d1 (interaction integral, step 2)
         for line in domain_log.lines() {
             late_parser.feed_line(line);
         }
-        let (late_domains, _) = late_parser.finish();
+        let (late_domains, _, late_truncated) = late_parser.finish();
         assert_eq!(late_domains, batch_domains);
+        assert!(!late_truncated);
     }
 
     #[test]
@@ -2675,14 +2699,15 @@ Domain: d1 (interaction integral, step 2)
         let err = collect_step_files_with_cap(&steps_dir, 1).unwrap_err();
         assert!(err.to_string().contains("maximum step limit"), "{err}");
 
-        // 3. Oversized .out produces an explicit warning.
+        // 3. Oversized .out streams up to cap, trims trailing partial line when newlines exist, and warns.
         let out_dir = dir.join("oversized_out");
         fs::create_dir_all(&out_dir).unwrap();
-        fs::write(out_dir.join("job.out"), "Domain: d1\n").unwrap();
+        fs::write(out_dir.join("job.out"), "Domain: d1\n  J_mean: 11.0\nDomain: d2\n").unwrap();
         let mut warnings = Vec::new();
-        let text = read_optional_stdout_with_cap(&out_dir, None, 4, &mut warnings);
-        assert!(text.is_empty());
-        assert!(warnings.iter().any(|w| w.contains("exceeds 4-byte limit")), "{warnings:?}");
+        let (text, trunc) = read_optional_stdout_with_cap(&out_dir, None, 15, &mut warnings);
+        assert!(trunc);
+        assert_eq!(text, "Domain: d1\n");
+        assert!(warnings.iter().any(|w| w.contains("exceeds 15-byte limit")), "{warnings:?}");
 
         // 4. Nonlinear step skips opening intermediate wnd*/wnr* once frames_full, while preserving
         //    Increment metadata and still reading the final step (`is_last`).
@@ -2736,10 +2761,126 @@ Domain: d1 (interaction integral, step 2)
         fs::write(nl_dir.join("wnd00003_text"), "CORRUPT_NOT_OPENED\n").unwrap();
         fs::write(nl_dir.join("wnr00003_text"), "CORRUPT_NOT_OPENED\n").unwrap();
 
-        let sol = read_results_dir_inner(&model, "Pull", &nl_dir, None, String::new(), None, 48, Vec::new()).unwrap();
+        let sol = read_results_dir_inner(&model, "Pull", &nl_dir, None, String::new(), false, None, 48, Vec::new()).unwrap();
         let hist = sol.static_result.nonlinear.as_ref().unwrap();
         assert_eq!(hist.increments.len(), 4);
+        assert_eq!(sol.step_numbers, vec![1, 2, 3, 4]);
+        assert!(!sol.domains_truncated);
         assert!(sol.warnings.iter().any(|w| w.contains("the frames stop at load factor")), "{:?}", sol.warnings);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multistep_parser_retains_dumps_tracks_truncation_and_records_sparse_step_numbers() {
+        let mut model = Model::default();
+        for (id, x, y, z) in [
+            (2u32, 0.0, 0.0, 0.0),
+            (3, 1.0, 0.0, 0.0),
+            (4, 1.0, 1.0, 0.0),
+            (5, 0.0, 1.0, 0.0),
+            (6, 0.0, 0.0, 1.0),
+            (7, 1.0, 0.0, 1.0),
+            (8, 1.0, 1.0, 1.0),
+            (9, 0.0, 1.0, 1.0),
+        ] {
+            model.set_node(id, [x, y, z]).unwrap();
+        }
+        model.set_element(10, ElementKind::Hex8, vec![2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
+        model.add_material("Steel", Material { elastic: Some(Elastic::Isotropic { young: 210e9, poisson: 0.3 }), ..Default::default() }).unwrap();
+        model.add_set("All", Set { elements: vec![10], ..Set::default() }).unwrap();
+        model.add_set("Fix", Set { nodes: vec![2, 3, 4, 5], ..Set::default() }).unwrap();
+        model.add_set("Top", Set { nodes: vec![6, 7, 8, 9], ..Set::default() }).unwrap();
+        model
+            .add_section(
+                "Solid",
+                Section { set: "All".into(), material: "Steel".into(), kind: SectionKind::Solid {}, formulation: Default::default() },
+            )
+            .unwrap();
+        model.add_boundary_condition("Clamp", BoundaryCondition::Fixed { target: Target::Set("Fix".into()) }).unwrap();
+        model
+            .add_load("PullLoad", Load::Force { target: Target::Set("Top".into()), vector: [0.0, 0.0, 100.0], distribution: Default::default() })
+            .unwrap();
+        let mut step = Step::new("Pull", Procedure::NonlinearStatic(NonlinearStatic::default()));
+        step.boundary_conditions.insert("Clamp".into());
+        step.loads.insert("PullLoad".into());
+        model.add_step(step, None).unwrap();
+
+        let label_map = LabelMap::from_model(&model);
+
+        // 1. Multi-step WARP3D dump metadata is retained across steps 1, 2, 3 without being removed.
+        let mut log = String::from(
+            "\
+loading: Pull step: 1
+Domain definition: cf_0001
+  Number of front nodes: 1 Nodes on front:
+  1
+  Direction cosines: 0.0 1.0 0.0
+  Tangent vector direction cosines: 0.0 0.0 1.0
+  Domain type: 1
+** end of domain definition **
+domain id: cf_0001
+  J-integral components
+  1 10.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 10.0
+>>> Completed domain integral calculations
+",
+        );
+        for s in [2usize, 3] {
+            log.push_str(&format!(
+                "\
+loading: Pull step: {s}
+domain id: cf_0001
+  J-integral components
+  1 {j:.1} 0.0 0.0 0.0 0.0 0.0 0.0 0.0 {j:.1}
+>>> Completed domain integral calculations
+",
+                j = (s as f64) * 10.0
+            ));
+        }
+        let (domains, stations, truncated) = parse_domain_integrals_with_meta(&log, &label_map);
+        assert!(!truncated);
+        assert_eq!(domains.len(), 3);
+        assert_eq!(stations.len(), 3);
+        for (idx, step_no) in [1usize, 2, 3].into_iter().enumerate() {
+            assert_eq!(domains[idx].step, step_no);
+            assert_eq!(domains[idx].front_nodes, vec![2], "step {step_no} lost dump front_nodes");
+            assert_eq!(domains[idx].normal, [0.0, 1.0, 0.0], "step {step_no} lost normal");
+            assert_eq!(domains[idx].tangent, [0.0, 0.0, 1.0], "step {step_no} lost tangent");
+        }
+
+        // 2. MAX_DOMAINS cap sets `domains_truncated = true`.
+        let mut cap_parser = DomainIntegralParser::new(&label_map);
+        for i in 0..=MAX_DOMAINS {
+            cap_parser.feed_line(&format!("Domain: d{i}"));
+            cap_parser.feed_line("  J_mean: 1.0");
+        }
+        let (capped_domains, _, cap_truncated) = cap_parser.finish();
+        assert_eq!(capped_domains.len(), MAX_DOMAINS);
+        assert!(cap_truncated);
+
+        // 3. MAX_DOMAIN_LINES cap sets `domains_truncated = true`.
+        let mut line_parser = DomainIntegralParser::new(&label_map);
+        line_parser.domain_lines = MAX_DOMAIN_LINES;
+        line_parser.feed_line("Domain: d_overflow");
+        let (_, _, line_truncated) = line_parser.finish();
+        assert!(line_truncated);
+
+        // 4. Sparse step_numbers ([5, 10]) and oversized stdout warning propagate to Warp3dSolution.
+        let dir = temp_dir("sparse-steps");
+        let vec_rows = "0.0 0.0 0.0\n".repeat(8);
+        let stress_rows = format!("{}\n", format_26col_row(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)).repeat(8);
+        let elem_rows = format!("{}\n", format_26col_row(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+        for s in [5usize, 10] {
+            fs::write(dir.join(format!("wnd{s:05}_text")), &vec_rows).unwrap();
+            fs::write(dir.join(format!("wnr{s:05}_text")), &vec_rows).unwrap();
+            fs::write(dir.join(format!("wns{s:05}_text")), &stress_rows).unwrap();
+        }
+        fs::write(dir.join("wes00010_text"), &elem_rows).unwrap();
+        fs::write(dir.join("job.out"), "Domain: cf_0001 (step 5)\n  J_mean: 10.0\nDomain: cf_0001 (step 10)\n  J_mean: 20.0\n").unwrap();
+        let sol = read_results_dir(&model, "Pull", &dir, Some(Preset::MKgS)).unwrap();
+        assert_eq!(sol.step_numbers, vec![5, 10]);
+        assert!(!sol.domains_truncated);
+        assert_eq!(sol.fracture.len(), 2);
 
         let _ = fs::remove_dir_all(&dir);
     }

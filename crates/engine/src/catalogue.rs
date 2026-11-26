@@ -788,7 +788,7 @@ pub static CATALOGUE: &[Capability] = &[
         "Membrane, bending and peak stresses along a path through a wall (ASME VIII-2 Annex 5-A)",
     ),
     soon("results.free_body", "Free Body", Results, "Query", "M9", "Free-body forces across a cut"),
-    ready("results.xy", "XY Plot", Results, "Plots", "Plot a quantity against the load factor, time or mode"),
+    ready_more("results.xy", "XY Plot", Results, "Plots", "Plot a quantity against the load factor, time or mode", &["results.ffs"]),
     ready("results.path", "Path Plot", Results, "Plots", "Interpolate a solid nodal field along a reference-coordinate path, with CSV export"),
     soon("results.cut", "Cut", Results, "Plots", "M9", "Section cuts through the model"),
     soon("results.display_group", "Display Group", Results, "Plots", "M9", "Show and hide parts of the model"),

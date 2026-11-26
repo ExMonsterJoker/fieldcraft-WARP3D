@@ -373,7 +373,13 @@ pub(super) fn parse_crack_front_with(p: &Value, allow_empty_set: bool) -> Result
         }
     };
 
-    Ok(Some(fieldcraft_warp3d::CrackFrontSpec { set, normal, symmetric, rings, interaction_integral, function_type }))
+    let every_step = match obj.get("every_step") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(EngineError::invalid("crack_front/every_step", "must be true or false")),
+    };
+
+    Ok(Some(fieldcraft_warp3d::CrackFrontSpec { set, normal, symmetric, rings, interaction_integral, function_type, every_step }))
 }
 
 fn write(s: &mut Session, p: &Value) -> Result<Value> {

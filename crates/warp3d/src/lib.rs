@@ -16,6 +16,7 @@
 
 pub mod check;
 pub mod deck;
+pub mod ffs;
 pub mod fracture;
 pub mod reader;
 pub mod results;
@@ -33,6 +34,12 @@ pub use check::{
     CheckScope, DiagnosticSeverity, Warp3dCheckReport, Warp3dDiagnostic, Warp3dQuickNote, quick_note, validate_model, validate_resolved,
 };
 pub use deck::write_deck;
+pub use ffs::{
+    FAD_CURVE_POINTS, FadConfig, FadOption, FadPoint, FadSummary, FfsDiagnostic, FfsError, FfsMaterialDefaults, FfsReport, FfsRequest, KrSource,
+    LimitingMode, LrInput, MAX_RING_EXCLUSION, Option2Curve, Option2Evaluator, ReactionComponent, RingExclusion, SpreadStatus, StationProfile,
+    StationSelection, ToughnessInput, build_station_profiles, evaluate_fad_curve, evaluate_step_ffs, evaluate_step_ffs_detailed,
+    extract_material_defaults, reserve_factor,
+};
 pub use results::{parse_domain_integrals, read_results_dir};
 pub use runner::{Warp3dBinarySource, Warp3dBinaryStatus, find_warp3d_binary, resolve_warp3d_binary, run_warp3d, run_warp3d_with_override};
 
@@ -169,6 +176,10 @@ pub struct CrackFrontSpec {
     /// Pointwise (a/b/c per station) vs whole-front average (type d).
     #[serde(default)]
     pub function_type: CrackFunctionType,
+    /// Emit domain integral evaluation after every nonlinear load increment (`Some(true)`),
+    /// rather than only after the final step (`None` / `Some(false)`).
+    #[serde(default)]
+    pub every_step: Option<bool>,
 }
 
 /// Values extracted for one ring of a WARP3D domain integral evaluation.
@@ -232,6 +243,11 @@ pub struct WrittenDeck {
 pub struct Warp3dSolution {
     pub static_result: StaticResult,
     pub fracture: Vec<DomainIntegralResult>,
+    /// Exact ascending WARP3D flat-file step numbers (`wnd*` keys) corresponding to solved
+    /// increments (`history.increments[pos]` / `history.frames[pos + 1]`).
+    pub step_numbers: Vec<usize>,
+    /// True if stdout or domain-integral parser bounds truncated any fracture output.
+    pub domains_truncated: bool,
     pub warnings: Vec<String>,
     pub stdout_log: String,
 }

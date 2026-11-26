@@ -529,6 +529,7 @@ mod tests {
             rings: Some(4),
             interaction_integral: Some(false),
             function_type: CrackFunctionType::Pointwise,
+            every_step: None,
         };
         let ordered = order_crack_front(&model, "crack_front", &[50, 12, 99, 3, 27]).unwrap();
         assert_eq!(ordered.corners, vec![3, 27, 12, 99, 50]);
@@ -624,6 +625,7 @@ mod tests {
             rings: Some(5),
             interaction_integral: Some(true),
             function_type: CrackFunctionType::Pointwise,
+            every_step: None,
         };
         let ordered = order_crack_front(&model, "crack_front", &[88, 50, 3, 77, 27]).unwrap();
         assert_eq!(ordered.corners, vec![3, 27, 50]);
@@ -734,6 +736,7 @@ mod tests {
             rings: Some(3),
             interaction_integral: Some(false),
             function_type: CrackFunctionType::Pointwise,
+            every_step: None,
         };
         let mut out = String::new();
         emit_domain_commands(&mut out, &model, &resolved, &step, &label_map, &spec).unwrap();

@@ -703,12 +703,7 @@ enum Product {
     PathPlot(Option<Arc<fieldcraft_engine::path::Plot>>, fieldcraft_engine::path::Cache),
     /// A lightweight structural solve or external result read (`SOLVE_BACKGROUND`) merges the
     /// solved step and optional fracture data back into the live session in place.
-    SolvedStep {
-        result: Arc<fieldcraft_engine::StepResult>,
-        fracture: Option<(Vec<fieldcraft_engine::results::DomainIntegralResult>, Option<String>)>,
-        opened: u64,
-        revision: u64,
-    },
+    SolvedStep { result: Arc<fieldcraft_engine::StepResult>, fracture: Option<fieldcraft_engine::SolvedFracture>, opened: u64, revision: u64 },
 }
 
 fn failure_from_engine(e: fieldcraft_engine::EngineError) -> crate::Failure {

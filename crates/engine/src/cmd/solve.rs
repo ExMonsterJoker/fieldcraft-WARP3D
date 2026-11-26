@@ -571,7 +571,7 @@ fn run_static(s: &mut Session, p: &Value) -> Result<Value> {
             summary["fracture"] = json!(&sol.fracture);
         }
         s.store_result(StepResult::Implicit(ImplicitResult::Static(sol.static_result)));
-        s.store_fracture_results(step_name, sol.fracture, crack_front.as_ref().map(|c| c.set.as_str()));
+        s.store_fracture_results(step_name, sol.fracture, sol.step_numbers, sol.domains_truncated, crack_front.as_ref().map(|c| c.set.as_str()));
         return Ok(summary);
     }
     let model = &s.model;
@@ -597,7 +597,7 @@ fn run_nonlinear(s: &mut Session, p: &Value) -> Result<Value> {
             summary["fracture"] = json!(&sol.fracture);
         }
         s.store_result(StepResult::Implicit(ImplicitResult::Static(sol.static_result)));
-        s.store_fracture_results(step_name, sol.fracture, crack_front.as_ref().map(|c| c.set.as_str()));
+        s.store_fracture_results(step_name, sol.fracture, sol.step_numbers, sol.domains_truncated, crack_front.as_ref().map(|c| c.set.as_str()));
         return Ok(summary);
     }
     let model = &s.model;

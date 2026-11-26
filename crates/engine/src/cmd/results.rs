@@ -1160,7 +1160,7 @@ impl Table {
 }
 
 /// A column name with its unit: `ux [mm]`.
-fn titled(name: &str, unit: Option<&str>) -> String {
+pub(super) fn titled(name: &str, unit: Option<&str>) -> String {
     match unit {
         Some(u) => format!("{name} [{u}]"),
         None => name.to_string(),
@@ -1346,7 +1346,7 @@ fn read(s: &mut Session, p: &Value) -> Result<Value> {
         summary["fracture"] = json!(&sol.fracture);
     }
     s.store_result(crate::StepResult::Implicit(fieldcraft_solver::StepResult::Static(sol.static_result)));
-    s.store_fracture_results(step_name, sol.fracture, None);
+    s.store_fracture_results(step_name, sol.fracture, sol.step_numbers, sol.domains_truncated, None);
     Ok(summary)
 }
 

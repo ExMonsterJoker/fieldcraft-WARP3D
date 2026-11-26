@@ -10,6 +10,7 @@ pub(crate) mod define;
 pub mod diagnostics;
 mod edit;
 mod extrude;
+mod ffs;
 pub(crate) mod file;
 pub(crate) mod forms;
 mod geometry;
@@ -258,6 +259,7 @@ pub static ALL: &[CommandSpec] = &[
     results::EXPORT_CSV,
     results::EXPORT_VTU,
     results::READ,
+    ffs::FFS,
     render::SAVE,
     render::DELETE,
     render::EXPORT,

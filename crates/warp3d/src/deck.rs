@@ -554,9 +554,16 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
         push_wrapped(&mut out, "output flat text nodal stresses");
         push_wrapped(&mut out, "output flat text nodal reactions");
         push_wrapped(&mut out, "output flat text element stresses");
+        if let Some(spec) = crack
+            && spec.every_step == Some(true)
+        {
+            emit_domain_commands(&mut out, &expressed, &resolved, step_ref, &label_map, spec)?;
+        }
     }
 
-    if let Some(spec) = crack {
+    if let Some(spec) = crack
+        && spec.every_step != Some(true)
+    {
         emit_domain_commands(&mut out, &expressed, &resolved, step_ref, &label_map, spec)?;
     }
 
@@ -744,6 +751,7 @@ mod tests {
             rings: Some(4),
             interaction_integral: Some(true),
             function_type: CrackFunctionType::FrontAverage,
+            every_step: None,
         };
         // `fix` forms a quad loop [1,4,8,5], check open edge subset instead:
         model.add_set("front_edge", Set { nodes: vec![1, 5], ..Set::default() }).unwrap();
@@ -902,5 +910,50 @@ mod tests {
         assert!(written.warnings.iter().any(|w| w.contains("B-bar")));
         assert!(written.warnings.iter().any(|w| w.contains("rotations")));
         assert!(written.warnings.iter().any(|w| w.contains("plasticity")));
+    }
+
+    #[test]
+    fn write_deck_every_step_emits_domain_inside_each_increment_only_when_enabled() {
+        let mut model = unit_hex8_model();
+        model.add_set("front_edge", Set { nodes: vec![1, 5], ..Set::default() }).unwrap();
+        let mut step = Step::new(
+            "NL",
+            Procedure::NonlinearStatic(NonlinearStatic { initial_increment: 1.0 / 3.0, max_increments: 10, ..NonlinearStatic::default() }),
+        );
+        step.boundary_conditions.insert("clamp".into());
+        step.loads.insert("pull".into());
+        model.add_step(step, None).unwrap();
+
+        let base_crack = CrackFrontSpec {
+            set: "front_edge".into(),
+            normal: Some([0.0, 1.0, 0.0]),
+            symmetric: Some(false),
+            rings: Some(3),
+            interaction_integral: Some(false),
+            function_type: CrackFunctionType::FrontAverage,
+            every_step: None,
+        };
+
+        let post_only = write_deck(&model, Some("NL"), Some(&base_crack), Preset::MKgS).unwrap();
+        assert_eq!(post_only.step_count, 3);
+        assert_eq!(post_only.text.matches("compute domain integral").count(), 1);
+        let step3_pos = post_only.text.find("compute displacements for loading NL step 3").unwrap();
+        let dom_pos = post_only.text.find("compute domain integral").unwrap();
+        assert!(dom_pos > step3_pos);
+
+        let per_step_crack = CrackFrontSpec { every_step: Some(true), ..base_crack };
+        let per_step = write_deck(&model, Some("NL"), Some(&per_step_crack), Preset::MKgS).unwrap();
+        assert_eq!(per_step.text.matches("compute domain integral").count(), 3);
+        for k in 1..=3usize {
+            let step_pat = format!("compute displacements for loading NL step {k}");
+            let s_pos = per_step.text.find(&step_pat).unwrap();
+            let next_pos = if k < 3 {
+                per_step.text.find(&format!("compute displacements for loading NL step {}", k + 1)).unwrap()
+            } else {
+                per_step.text.find("stop").unwrap()
+            };
+            let slice = &per_step.text[s_pos..next_pos];
+            assert_eq!(slice.matches("compute domain integral").count(), 1, "step {k} slice: {slice}");
+        }
     }
 }

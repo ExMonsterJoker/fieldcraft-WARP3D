@@ -386,6 +386,8 @@ pub enum Dim {
     Area,
     InverseLength,
     Stress,
+    /// Stress intensity factor ($K_I$, $K_{II}$, $K_{III}$, $K_{\text{mat}}$), shown in `<Pressure>·√<Length>`.
+    StressIntensity,
     Density,
     Force,
     Moment,
@@ -441,6 +443,7 @@ impl Dim {
         use Quantity as Q;
         Some(match self {
             Dim::None
+            | Dim::StressIntensity
             | Dim::SpringStiffness
             | Dim::SpringDamping
             | Dim::Motion
@@ -519,6 +522,7 @@ impl Dim {
     pub fn name(self) -> Option<&'static str> {
         Some(match self {
             Dim::None => return None,
+            Dim::StressIntensity => "stress intensity",
             Dim::SpringStiffness => "stiffness",
             Dim::SpringDamping => "damping",
             Dim::Motion => "displacement",
@@ -534,6 +538,9 @@ impl Dim {
     /// dependent dimensions give the unit of their usual case (a translation, a spring along
     /// a direction).
     pub fn unit(self, display: &DisplaySystem) -> Option<String> {
+        if self == Dim::StressIntensity {
+            return Some(format!("{}·√{}", display.symbol(Quantity::Pressure), display.symbol(Quantity::Length)));
+        }
         if let Some(fixed) = self.fixed() {
             return Some(fixed.to_string());
         }

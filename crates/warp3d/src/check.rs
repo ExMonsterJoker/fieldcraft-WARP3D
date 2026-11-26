@@ -1387,6 +1387,7 @@ mod tests {
             rings: Some(3),
             interaction_integral: Some(false),
             function_type: CrackFunctionType::Pointwise,
+            every_step: None,
         };
         let report = validate_model(&model, Some("Pull"), Some(&crack), Some("cface"), CheckScope::Export);
         assert!(report.ready, "{report:?}");
@@ -1512,6 +1513,7 @@ mod tests {
             rings: Some(99),
             interaction_integral: None,
             function_type: CrackFunctionType::Pointwise,
+            every_step: None,
         };
         let t0 = std::time::Instant::now();
         let report = validate_resolved(&model, &si_resolved, None, Some(&crack), Some("missing_face"), CheckScope::Export);

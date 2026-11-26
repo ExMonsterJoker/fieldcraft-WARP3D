@@ -192,10 +192,73 @@ pub fn read(v: &Value, q: Quantity, input: &DisplaySystem) -> Option<std::result
     Some(input_value.to_si(q, input))
 }
 
+/// Whether `a` and `b` read a bare stress-intensity value (`Pressure·√Length`) alike.
+fn same_stress_intensity_unit(a: &DisplaySystem, b: &DisplaySystem) -> bool {
+    same_unit(a.unit_ref(Quantity::Pressure), b.unit_ref(Quantity::Pressure)) && same_unit(a.unit_ref(Quantity::Length), b.unit_ref(Quantity::Length))
+}
+
+fn split_leading_number(text: &str) -> Option<(f64, &str)> {
+    let end = text.find(|c: char| !(c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | 'e' | 'E'))).unwrap_or(text.len());
+    (1..=end).rev().find_map(|i| {
+        let head = text.get(..i)?;
+        let v: f64 = head.parse().ok()?;
+        v.is_finite().then(|| (v, text.get(i..).unwrap_or("")))
+    })
+}
+
+fn parse_stress_intensity_unit(raw: &str, path: &str) -> Result<(Unit, Unit)> {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 128 {
+        return Err(EngineError::invalid(path, "stress-intensity unit must combine pressure and √length (for example \"MPa·√m\")"));
+    }
+    let split = if let Some((l, r)) = s.split_once('√') {
+        let left = l.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '·' | '*'));
+        let right = r.trim();
+        let right = right.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(right).trim();
+        Some((left, right))
+    } else if let Some((l, r)) = s.split_once("sqrt(") {
+        r.strip_suffix(')').map(|inside| {
+            let left = l.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '·' | '*'));
+            (left, inside.trim())
+        })
+    } else if let Some(base) = s.strip_suffix("^0.5") {
+        base.rsplit_once(['·', '*', ' ']).map(|(l, r)| (l.trim(), r.trim()))
+    } else {
+        None
+    };
+    let Some((p_str, l_str)) = split.filter(|(l, r)| !l.is_empty() && !r.is_empty()) else {
+        return Err(EngineError::invalid(
+            path,
+            "stress-intensity unit must combine pressure and √length (for example \"MPa·√m\", \"MPa*sqrt(m)\", or \"ksi·√in\")",
+        ));
+    };
+    let p_unit = Unit::parse(p_str).map_err(|e| unit_error(path, e))?;
+    let l_unit = Unit::parse(l_str).map_err(|e| unit_error(path, e))?;
+    Ok((p_unit, l_unit))
+}
+
+/// Physical unit classification passed to [`Leaf::number`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeafUnit {
+    None,
+    Quantity(Quantity),
+    StressIntensity,
+}
+
+fn resolve_leaf_unit(dim: Dim, parent: Option<&Value>, index: usize) -> LeafUnit {
+    if dim == Dim::StressIntensity {
+        LeafUnit::StressIntensity
+    } else if let Some(q) = dim.resolve(parent, index) {
+        LeafUnit::Quantity(q)
+    } else {
+        LeafUnit::None
+    }
+}
+
 /// What to do with each number a form describes.
 trait Leaf {
-    /// `v` at `path`, of quantity `q` (`None`: no unit), a bare number in `fixed` when set.
-    fn number(&mut self, v: &mut Value, q: Option<Quantity>, fixed: Option<&'static str>, path: &str) -> Result<()>;
+    /// `v` at `path`, of unit `unit` (`LeafUnit::None`: dimensionless), a bare number in `fixed` when set.
+    fn number(&mut self, v: &mut Value, unit: LeafUnit, fixed: Option<&'static str>, path: &str) -> Result<()>;
 }
 
 /// Converts every number to `target`: bare ones are in `input` (or their fixed unit).
@@ -214,24 +277,53 @@ impl ToTarget<'_> {
         let si = q.to_si(x, from).map_err(|e| unit_error(path, e))?;
         q.express(si, to).map_err(|e| unit_error(path, e))
     }
+
+    fn bare_stress_intensity(&self, x: f64, path: &str) -> Result<f64> {
+        if !x.is_finite() {
+            return Err(EngineError::param(path, crate::schema::ProblemKind::NotANumber));
+        }
+        if same_stress_intensity_unit(self.input, self.target) {
+            return Ok(x);
+        }
+        let (scale, _) = stress_sqrt_length_scale(self.input, self.target);
+        Ok(x * scale)
+    }
+
+    fn stress_intensity_from_unit(&self, x: f64, p_unit: &Unit, l_unit: &Unit, path: &str) -> Result<f64> {
+        if !x.is_finite() {
+            return Err(EngineError::param(path, crate::schema::ProblemKind::NotANumber));
+        }
+        let p_si = Quantity::Pressure.to_si(1.0, p_unit).map_err(|e| unit_error(path, e))?;
+        let l_si = Quantity::Length.to_si(1.0, l_unit).map_err(|e| unit_error(path, e))?;
+        if !l_si.is_finite() || l_si <= 0.0 {
+            return Err(EngineError::invalid(path, "length unit in stress intensity must be positive"));
+        }
+        let si_val = x * p_si * l_si.sqrt();
+        let (target_scale, _) = stress_sqrt_length_scale(si(), self.target);
+        Ok(si_val * target_scale)
+    }
 }
 
 impl Leaf for ToTarget<'_> {
-    fn number(&mut self, v: &mut Value, q: Option<Quantity>, fixed: Option<&'static str>, path: &str) -> Result<()> {
+    fn number(&mut self, v: &mut Value, unit: LeafUnit, fixed: Option<&'static str>, path: &str) -> Result<()> {
         // A field of a fixed unit is given to its command in that unit; the others in the target.
         let fixed_unit = fixed.map(Unit::parse).transpose().map_err(|e| unit_error(path, e))?;
-        let out = match (&*v, q) {
+        let out = match (&*v, unit) {
             (Value::Null, _) => return Ok(()),
             // A number without a unit passes as it is, and so does a bare number of a fixed unit.
-            (Value::Number(_), None) => return Ok(()),
-            (Value::Number(_), Some(_)) if fixed_unit.is_some() => return Ok(()),
-            (Value::Number(n), Some(q)) => {
+            (Value::Number(_), LeafUnit::None) => return Ok(()),
+            (Value::Number(_), LeafUnit::Quantity(_)) if fixed_unit.is_some() => return Ok(()),
+            (Value::Number(n), LeafUnit::Quantity(q)) => {
                 let x = n.as_f64().unwrap_or(f64::NAN);
                 self.bare(x, q, self.input.unit_ref(q), path)?
             }
+            (Value::Number(n), LeafUnit::StressIntensity) => {
+                let x = n.as_f64().unwrap_or(f64::NAN);
+                self.bare_stress_intensity(x, path)?
+            }
             // Text and objects of a field without a unit are the command's to read.
-            (Value::String(_) | Value::Object(_), None) => return Ok(()),
-            (Value::String(_) | Value::Object(_), Some(q)) => {
+            (Value::String(_) | Value::Object(_), LeafUnit::None) => return Ok(()),
+            (Value::String(_) | Value::Object(_), LeafUnit::Quantity(q)) => {
                 let input: ValueInput = serde_json::from_value(v.clone())
                     .map_err(|_| EngineError::invalid(path, "must be a number, a value with its unit (\"210 GPa\") or {\"value\", \"unit\"}"))?;
                 let si = match (&input, &fixed_unit) {
@@ -244,6 +336,36 @@ impl Leaf for ToTarget<'_> {
                 .map_err(|e| unit_error(path, e))?;
                 let to = fixed_unit.as_ref().unwrap_or_else(|| self.target.unit_ref(q));
                 q.express(si, to).map_err(|e| unit_error(path, e))?
+            }
+            (Value::String(_) | Value::Object(_), LeafUnit::StressIntensity) => {
+                let input: ValueInput = serde_json::from_value(v.clone())
+                    .map_err(|_| EngineError::invalid(path, "must be a number, a value with its unit (\"50 MPa·√m\") or {\"value\", \"unit\"}"))?;
+                match input {
+                    ValueInput::Number(x) => self.bare_stress_intensity(x, path)?,
+                    ValueInput::Text(t) => {
+                        let trimmed = t.trim();
+                        if trimmed.is_empty() {
+                            return Err(EngineError::invalid(path, "must not be empty"));
+                        }
+                        if trimmed.len() > 128 {
+                            return Err(EngineError::invalid(path, "unit text is too long"));
+                        }
+                        let (x, rest) = split_leading_number(trimmed).ok_or_else(|| {
+                            EngineError::invalid(path, "must be a number, a value with its unit (\"50 MPa·√m\") or {\"value\", \"unit\"}")
+                        })?;
+                        let rest = rest.trim();
+                        if rest.is_empty() {
+                            self.bare_stress_intensity(x, path)?
+                        } else {
+                            let (p_unit, l_unit) = parse_stress_intensity_unit(rest, path)?;
+                            self.stress_intensity_from_unit(x, &p_unit, &l_unit, path)?
+                        }
+                    }
+                    ValueInput::WithUnit(w) => {
+                        let (p_unit, l_unit) = parse_stress_intensity_unit(&w.unit, path)?;
+                        self.stress_intensity_from_unit(w.value, &p_unit, &l_unit, path)?
+                    }
+                }
             }
             // Not a number: left for the command to refuse.
             _ => return Ok(()),
@@ -260,14 +382,23 @@ struct Annotate<'a> {
 }
 
 impl Leaf for Annotate<'_> {
-    fn number(&mut self, v: &mut Value, q: Option<Quantity>, fixed: Option<&'static str>, _: &str) -> Result<()> {
-        if let (Value::Number(n), Some(q), None) = (&*v, q, fixed)
-            && let Some(x) = n.as_f64()
-        {
-            let unit = self.input.symbol(q);
-            if unit != "1" {
-                *v = json!(WithUnit { value: x, unit: unit.to_string() });
+    fn number(&mut self, v: &mut Value, unit: LeafUnit, fixed: Option<&'static str>, _: &str) -> Result<()> {
+        match (&*v, unit, fixed) {
+            (Value::Number(n), LeafUnit::Quantity(q), None) => {
+                if let Some(x) = n.as_f64() {
+                    let sym = self.input.symbol(q);
+                    if sym != "1" {
+                        *v = json!(WithUnit { value: x, unit: sym.to_string() });
+                    }
+                }
             }
+            (Value::Number(n), LeafUnit::StressIntensity, None) => {
+                if let Some(x) = n.as_f64() {
+                    let sym = format!("{}·√{}", self.input.symbol(Quantity::Pressure), self.input.symbol(Quantity::Length));
+                    *v = json!(WithUnit { value: x, unit: sym });
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -305,23 +436,23 @@ fn field(f: &Field, v: &mut Value, parent: &Value, path: &str, leaf: &mut dyn Le
     let holder = parent;
     let parent = Some(parent);
     match f.kind {
-        Kind::Number { dim, .. } => leaf.number(v, dim.resolve(parent, 0), dim.fixed(), path),
-        Kind::NumberOrAuto { dim, .. } if v.as_str() != Some("auto") => leaf.number(v, dim.resolve(parent, 0), dim.fixed(), path),
+        Kind::Number { dim, .. } => leaf.number(v, resolve_leaf_unit(dim, parent, 0), dim.fixed(), path),
+        Kind::NumberOrAuto { dim, .. } if v.as_str() != Some("auto") => leaf.number(v, resolve_leaf_unit(dim, parent, 0), dim.fixed(), path),
         Kind::PerAxis { dim, .. } | Kind::Vector { dim, .. } => match v {
             Value::Array(items) => {
                 for (i, x) in items.iter_mut().enumerate() {
-                    leaf.number(x, dim.resolve(parent, i), dim.fixed(), path)?;
+                    leaf.number(x, resolve_leaf_unit(dim, parent, i), dim.fixed(), path)?;
                 }
                 Ok(())
             }
-            _ => leaf.number(v, dim.resolve(parent, 0), dim.fixed(), path),
+            _ => leaf.number(v, resolve_leaf_unit(dim, parent, 0), dim.fixed(), path),
         },
         Kind::Points { dim, .. } => {
             if let Value::Array(rows) = v {
                 for row in rows.iter_mut() {
                     if let Value::Array(cols) = row {
                         for (c, x) in cols.iter_mut().enumerate() {
-                            leaf.number(x, dim.resolve(parent, c), dim.fixed(), path)?;
+                            leaf.number(x, resolve_leaf_unit(dim, parent, c), dim.fixed(), path)?;
                         }
                     }
                 }
@@ -425,7 +556,7 @@ fn inner_numbers(
 
 /// Whether a dimension's quantity depends on the values beside it.
 fn depends(d: Dim) -> bool {
-    d != Dim::None && d.quantity().is_none()
+    d != Dim::None && d != Dim::StressIntensity && d.quantity().is_none()
 }
 
 /// Every number of `v` (a number, a value with its unit, or a list of lists of them) to `leaf`.
@@ -437,7 +568,7 @@ fn each_number(v: &mut Value, dim: Dim, parent: Option<&Value>, index: usize, pa
             }
             Ok(())
         }
-        _ => leaf.number(v, dim.resolve(parent, index), dim.fixed(), path),
+        _ => leaf.number(v, resolve_leaf_unit(dim, parent, index), dim.fixed(), path),
     }
 }
 
@@ -767,6 +898,7 @@ const GEOMETRY_REPLIES: &[(&str, Numbers)] = &[
         ],
     ),
     ("mesh.plan.apply", PLAN_APPLIED),
+    ("results.ffs", FFS),
 ];
 
 /// A static step's summary.
@@ -806,6 +938,33 @@ const FRACTURE: &[(&str, Dim)] = &[
     ("/fracture/*/t_33_mean", Dim::Stress),
     ("/fracture/*/rings/*/t_11", Dim::Stress),
     ("/fracture/*/rings/*/t_33", Dim::Stress),
+];
+
+/// Failure-Assessment-Diagram (FFS) reply values (`results.ffs`).
+const FFS: &[(&str, Dim)] = &[
+    ("/defaults/young", Dim::Stress),
+    ("/defaults/sigma_ys", Dim::Stress),
+    ("/active_profiles/*/s_length", Dim::Length),
+    ("/active_profiles/*/j_mean", Dim::Of(Quantity::ForcePerLength)),
+    ("/active_profiles/*/j_min", Dim::Of(Quantity::ForcePerLength)),
+    ("/active_profiles/*/j_max", Dim::Of(Quantity::ForcePerLength)),
+    ("/active_profiles/*/t_11_mean", Dim::Stress),
+    ("/active_profiles/*/t_33_mean", Dim::Stress),
+    ("/active_profiles/*/k_i_mean", Dim::StressIntensity),
+    ("/active_profiles/*/k_ii_mean", Dim::StressIntensity),
+    ("/active_profiles/*/k_iii_mean", Dim::StressIntensity),
+    ("/active_profiles/*/k_j_plane_strain", Dim::StressIntensity),
+    ("/active_profiles/*/k_j_plane_stress", Dim::StressIntensity),
+    ("/fad/sigma_ys", Dim::Stress),
+    ("/fad/sigma_uts", Dim::Stress),
+    ("/fad/k_mat", Dim::StressIntensity),
+    ("/fad/j_mat", Dim::Of(Quantity::ForcePerLength)),
+    ("/fad/trajectory/*/k_eff", Dim::StressIntensity),
+    ("/fad/trajectory/*/reaction_value", Dim::Force),
+    ("/fad/active_stations/*/k_eff", Dim::StressIntensity),
+    ("/fad/active_stations/*/reaction_value", Dim::Force),
+    ("/fad/active_verdict/k_eff", Dim::StressIntensity),
+    ("/fad/active_verdict/reaction_value", Dim::Force),
 ];
 
 /// Scale factor and formatted unit label (`<stress>·√<length>`) for stress-intensity factors
@@ -976,6 +1135,16 @@ fn express_all(
             }
         }
         Value::Number(n) => {
+            if dim == Dim::StressIntensity {
+                let x = n.as_f64().unwrap_or(f64::NAN);
+                let (scale, k_unit) = stress_sqrt_length_scale(from, to);
+                let y = if same_stress_intensity_unit(from, to) { x } else { x * scale };
+                if let Some(n) = serde_json::Number::from_f64(y) {
+                    *v = Value::Number(n);
+                }
+                units.insert("stress_intensity".into(), json!(k_unit));
+                return Ok(());
+            }
             let Some(q) = dim.resolve(parent, index) else { return Ok(()) };
             let x = n.as_f64().unwrap_or(f64::NAN);
             let (a, b) = (from.unit_ref(q), to.unit_ref(q));
@@ -1387,5 +1556,81 @@ mod tests {
             assert!((round_tripped - 100.0).abs() <= 1e-9, "{preset:?}: expected 100.0, got {round_tripped}");
         }
         let _ = std::fs::remove_dir_all(&parity_dir);
+    }
+
+    #[test]
+    fn stress_intensity_dim_conversion_and_results_ffs_reply() {
+        const K_FORM: &[Field] = &[crate::schema::above("k_mat", "Toughness", Dim::StressIntensity, 0.0, 1e12).req()];
+        let mm = DisplaySystem::new(Preset::MmTonneS);
+
+        // Bare number, string with unit, WithUnit object, and with_units round-trip across Preset::ALL.
+        for preset in Preset::ALL {
+            let display = DisplaySystem::new(preset);
+            let k_si = 60.0e6; // 60 MPa·√m
+            let expected_in_display = k_si * stress_sqrt_length_scale(si(), &display).0;
+            let converted_to_si = convert_params(K_FORM, &json!({"k_mat": expected_in_display}), &display, si()).unwrap();
+            let back = converted_to_si["k_mat"].as_f64().unwrap();
+            assert!((back - k_si).abs() <= 1e-6 * k_si, "{preset:?}: {back} != {k_si}");
+
+            let annotated = with_units(K_FORM, &json!({"k_mat": expected_in_display}), &display);
+            assert_eq!(annotated["k_mat"]["unit"], format!("{}·√{}", display.symbol(Quantity::Pressure), display.symbol(Quantity::Length)));
+            let from_annotated = convert_params(K_FORM, &annotated, si(), si()).unwrap();
+            assert!((from_annotated["k_mat"].as_f64().unwrap() - k_si).abs() <= 1e-6 * k_si, "{preset:?}: annotated round-trip");
+        }
+
+        // String / object expressions convert to target units; invalid unit strings fail on `k_mat`.
+        let parsed = convert_params(K_FORM, &json!({"k_mat": "60 MPa·√m"}), &mm, si()).unwrap();
+        assert!((parsed["k_mat"].as_f64().unwrap() - 60.0e6).abs() < 1e-3);
+        let parsed_sqrt = convert_params(K_FORM, &json!({"k_mat": "60 MPa*sqrt(m)"}), &mm, &mm).unwrap();
+        assert!((parsed_sqrt["k_mat"].as_f64().unwrap() - 60.0 * 1000.0_f64.sqrt()).abs() < 1e-9);
+        for bad in
+            [json!({"k_mat": "60 MPa"}), json!({"k_mat": "60 m·√m"}), json!({"k_mat": "nope"}), json!({"k_mat": ""}), json!({"k_mat": {"value": 10}})]
+        {
+            let err = convert_params(K_FORM, &bad, &mm, si()).unwrap_err();
+            assert!(matches!(err, EngineError::Param(ref p) if p.path == "k_mat"), "expected param error on k_mat for {bad}: {err:?}");
+        }
+        assert_eq!(Dim::StressIntensity.name(), Some("stress intensity"));
+        assert_eq!(Dim::StressIntensity.unit(&mm).as_deref(), Some("MPa·√mm"));
+
+        // `convert_reply("results.ffs", ...)` converts all SI fields & records `units["stress_intensity"]`.
+        let mut reply = json!({
+            "step": "Load",
+            "defaults": { "young": 200.0e9, "sigma_ys": 400.0e6 },
+            "active_profiles": [{
+                "s_length": 0.025,
+                "j_mean": 12000.0,
+                "j_min": 11500.0,
+                "j_max": 12500.0,
+                "k_i_mean": 50.0e6,
+                "k_ii_mean": null,
+                "k_iii_mean": 2.0e6,
+                "k_j_plane_strain": 52.0e6,
+                "k_j_plane_stress": 50.0e6,
+                "t_11_mean": -15.0e6,
+                "t_33_mean": -4.0e6
+            }],
+            "fad": {
+                "sigma_ys": 400.0e6,
+                "sigma_uts": 550.0e6,
+                "k_mat": 100.0e6,
+                "j_mat": 45000.0,
+                "trajectory": [{ "k_eff": 50.0e6, "reaction_value": 12500.0 }],
+                "active_stations": [{ "k_eff": 50.0e6, "reaction_value": 12500.0 }],
+                "active_verdict": { "k_eff": 50.0e6, "reaction_value": 12500.0 }
+            }
+        });
+        let (k_scale, k_sym) = stress_sqrt_length_scale(si(), &mm);
+        convert_reply("results.ffs", &mut reply, si(), &mm).unwrap();
+        assert_eq!(reply["units"]["stress_intensity"], k_sym);
+        assert_eq!(reply["units"]["pressure"], "MPa");
+        assert_eq!(reply["units"]["length"], "mm");
+        assert_eq!(reply["units"]["force"], "N");
+        assert_eq!(reply["units"]["force_per_length"], "N/mm");
+        assert!((reply["defaults"]["young"].as_f64().unwrap() - 200_000.0).abs() < 1e-6);
+        assert!((reply["active_profiles"][0]["s_length"].as_f64().unwrap() - 25.0).abs() < 1e-12);
+        assert!((reply["active_profiles"][0]["j_mean"].as_f64().unwrap() - 12.0).abs() < 1e-12);
+        assert!((reply["fad"]["k_mat"].as_f64().unwrap() - 100.0e6 * k_scale).abs() < 1e-6);
+        assert!((reply["fad"]["active_verdict"]["k_eff"].as_f64().unwrap() - 50.0e6 * k_scale).abs() < 1e-6);
+        assert!((reply["fad"]["trajectory"][0]["reaction_value"].as_f64().unwrap() - 12500.0).abs() < 1e-9);
     }
 }

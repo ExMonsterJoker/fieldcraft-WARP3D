@@ -340,7 +340,7 @@ fn stream_stdout(
     label_map: &crate::LabelMap,
     step_count: usize,
     progress: Option<std::sync::Arc<fieldcraft_model::progress::Progress>>,
-) -> ((Vec<crate::DomainIntegralResult>, Vec<Vec<u32>>), String) {
+) -> ((Vec<crate::DomainIntegralResult>, Vec<Vec<u32>>, bool), String) {
     let mut parser = crate::results::DomainIntegralParser::new(label_map);
     let Some(s) = stream else {
         return (parser.finish(), String::new());
@@ -1044,6 +1044,7 @@ mod tests {
             rings: Some(4),
             interaction_integral: Some(true),
             function_type: crate::CrackFunctionType::Pointwise,
+            every_step: None,
         };
         let cancel = AtomicBool::new(false);
         let sol = match run_warp3d(&model, "Load", Some(&crack), 2, None, &cancel) {

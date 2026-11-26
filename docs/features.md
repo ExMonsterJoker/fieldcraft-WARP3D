@@ -159,7 +159,7 @@ the control channel and AI agents over MCP (docs/mcp.md) run the same commands.
 | Query | Fluid Measurements — Saved-frame face averages, flow, heat rates and pressure drop, with CSV | ready | `results.fluid.measure` |
 | Query | Linearize — Membrane, bending and peak stresses along a path through a wall (ASME VIII-2 Annex 5-A) | ready | `results.linearize` |
 | Query | Free Body — Free-body forces across a cut | coming soon (M9) |  |
-| Plots | XY Plot — Plot a quantity against the load factor, time or mode | ready | `results.xy` |
+| Plots | XY Plot — Plot a quantity against the load factor, time or mode | ready | `results.xy`, `results.ffs` |
 | Plots | Path Plot — Interpolate a solid nodal field along a reference-coordinate path, with CSV export | ready | `results.path` |
 | Plots | Cut — Section cuts through the model | coming soon (M9) |  |
 | Plots | Display Group — Show and hide parts of the model | coming soon (M9) |  |

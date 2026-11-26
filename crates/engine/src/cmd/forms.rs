@@ -9,6 +9,18 @@ use crate::schema::*;
 
 // ---- Shared pieces ----
 
+const fn greater_than(key: &'static str, label: &'static str, dim: D, min: f64) -> Field {
+    let mut f = num(key, label, dim);
+    f.kind = Kind::Number { dim, min: Some(min), max: None, open: true };
+    f
+}
+
+const fn at_least(key: &'static str, label: &'static str, dim: D, min: f64) -> Field {
+    let mut f = num(key, label, dim);
+    f.kind = Kind::Number { dim, min: Some(min), max: None, open: false };
+    f
+}
+
 /// The smallest fan relaxation a form takes (the model takes any in (0, 1]).
 const MIN_FAN_RELAXATION: f64 = 1e-6; // unit-factors: a fraction per time step
 /// The largest merge distance a form takes: a cap on hostile input, in the display unit it is typed in.
@@ -2746,6 +2758,8 @@ pub const CRACK_FRONT: &[Field] = &[
     choice("function_type", "q-function type", &[("pointwise", "Pointwise (types a/b/c per station)"), ("front_average", "Front average (type d)")])
         .def("\"pointwise\"")
         .help("Virtual crack extension q-function along the front."),
+    flag("every_step", "Every increment")
+        .help("Emit WARP3D domain integral commands inside every nonlinear increment instead of only after the loading block."),
 ];
 
 pub const DECK: &[Field] = &[
@@ -3232,6 +3246,87 @@ pub const RESULTS_PATH: &[Field] = &[
     int("mode", "Mode", 1, 1_000_000).help("Frequency results only; empty means mode 1."),
     path("path", "CSV file", true).help("Optional distance,x,y,z,value CSV in display units; gaps have empty values."),
 ];
+const FAD_CONFIG: &[Field] = &[
+    choice("option", "FAD option", &[("option1", "API 579 Option 1"), ("option2", "API 579 Option 2")])
+        .def("\"option1\"")
+        .help("API 579-1 / ASME FFS-1 Part 9 assessment curve: material-independent Option 1 or stress-strain curve Option 2."),
+    choice("option2_source", "Option 2 curve", &[("model_material", "Crack-zone model material"), ("ramberg_osgood", "Ramberg-Osgood parameters")])
+        .def("\"model_material\"")
+        .help("True stress-strain curve source when `option` is `option2`."),
+    greater_than("ramberg_alpha", "Ramberg-Osgood α", D::None, 0.0)
+        .help("Ramberg-Osgood plastic offset constant α (> 0), required when `option2_source` is `ramberg_osgood`."),
+    greater_than("ramberg_n", "Ramberg-Osgood n", D::None, 1.0)
+        .help("Ramberg-Osgood hardening exponent n (> 1), required when `option2_source` is `ramberg_osgood`."),
+    choice(
+        "lr_mode",
+        "Load ratio mode",
+        &[
+            ("reference_stress", "Reference stress at λ = 1"),
+            ("direct_load_ratio", "Direct load ratio L_r at λ = 1"),
+            ("reaction_ratio", "Reaction force / limit load"),
+        ],
+    )
+    .def("\"reference_stress\"")
+    .help("How the plastic collapse load ratio L_r is computed along loading increments."),
+    at_least("sigma_ref_full", "Reference stress σ_ref (λ = 1)", D::Stress, 0.0)
+        .help("Full-load reference stress at unit load factor (≥ 0), required for `reference_stress`."),
+    at_least("l_r_full", "Direct L_r (λ = 1)", D::None, 0.0).help("Full-load ratio L_r at unit load factor (≥ 0), required for `direct_load_ratio`."),
+    reference("bc_set", "Reaction BC set", C::Set).help("Fixed/displaced node set whose nodal reaction force sum drives `reaction_ratio`."),
+    choice("reaction_component", "Reaction component", &[("magnitude", "Magnitude"), ("x", "X force"), ("y", "Y force"), ("z", "Z force")])
+        .def("\"magnitude\"")
+        .help("Reaction force component or Euclidean magnitude summed across `bc_set`."),
+    greater_than("limit_load", "Limit load R_limit", D::Force, 0.0).help("Plastic collapse limit load R_limit (> 0), required for `reaction_ratio`."),
+    choice("toughness_mode", "Toughness input", &[("k_mat", "Fracture toughness K_mat"), ("j_ic", "Critical J-integral J_Ic")])
+        .def("\"k_mat\"")
+        .help("Whether material fracture toughness is supplied as K_mat or critical J_Ic."),
+    greater_than("k_mat", "Toughness K_mat", D::StressIntensity, 0.0)
+        .help("Material fracture toughness K_mat (> 0), required when `toughness_mode` is `k_mat`."),
+    greater_than("j_ic", "Critical J-integral J_Ic", D::Of(Quantity::ForcePerLength), 0.0)
+        .help("Critical J-integral J_Ic (> 0), required when `toughness_mode` is `j_ic`."),
+    flag("j_ic_plane_strain", "Plane strain J_Ic conversion")
+        .def("true")
+        .help("Convert J_Ic to K_mat using plane-strain E/(1-ν²) when true, or plane-stress E when false."),
+    choice(
+        "kr_source",
+        "K_r source",
+        &[
+            ("auto", "Auto (EPFM double-count guarded)"),
+            ("elastic_ki", "Interaction integral K_I"),
+            ("linear_scaled_step1_ki", "Linear-scaled Step-1 K_I"),
+            ("kj_plane_strain", "Equivalent K_J (plane strain)"),
+            ("kj_plane_stress", "Equivalent K_J (plane stress)"),
+        ],
+    )
+    .def("\"auto\"")
+    .help("Applied stress-intensity source used in K_r = K_eff / K_mat."),
+    choice("station_mode", "Trajectory station", &[("governing", "Governing station per increment"), ("domain_id", "Named crack-front domain ID")])
+        .def("\"governing\"")
+        .help("Which crack-front station represents each increment along the FAD loading trajectory."),
+    text("domain_id", "Domain ID").help("WARP3D domain identifier (e.g. `cf_0001`), required when `station_mode` is `domain_id`."),
+    greater_than("sigma_ys", "Yield strength σ_ys", D::Stress, 0.0)
+        .help("Optional reference yield strength σ_ys (> 0); defaults to the crack-zone material's initial yield."),
+    greater_than("sigma_uts", "Ultimate tensile strength σ_uts", D::Stress, 0.0)
+        .help("Optional ultimate tensile strength σ_uts (≥ σ_ys) used for default flow-stress cutoff L_r,max."),
+    at_least("l_r_max", "Cutoff L_r,max", D::None, 1.0).help("Optional plastic collapse cutoff L_r,max (≥ 1.0); overrides the flow-stress estimate."),
+    greater_than("young", "Young's modulus E", D::Stress, 0.0)
+        .help("Optional isotropic Young's modulus E (> 0); overrides crack-zone material extraction."),
+    above("poisson", "Poisson's ratio ν", D::None, -1.0, 0.5)
+        .help("Optional isotropic Poisson's ratio ν (-1.0 < ν < 0.5); overrides crack-zone material extraction."),
+];
+pub const RESULTS_FFS: &[Field] = &[
+    reference("step", "Step", C::SolvedStep)
+        .help("Solved structural step with WARP3D fracture results; defaults to the shown step or sole current fracture step."),
+    int("frame", "Frame", 0, 1_000_000_000).help("Nonlinear increment frame index (0 = unloaded); empty evaluates the final frame."),
+    choice(
+        "exclude_inner_rings",
+        "Exclude inner rings",
+        &[("auto", "Auto (drop ring 1 when ≥3 rings)"), ("0", "0 rings"), ("1", "1 ring"), ("2", "2 rings"), ("3", "3 rings"), ("4", "4 rings")],
+    )
+    .def("\"auto\"")
+    .help("Inner q-domain rings discarded before computing mean J and ring spread."),
+    group("fad", "FAD assessment", FAD_CONFIG).help("Optional API 579-1 / ASME FFS-1 Option 1 or Option 2 Failure Assessment Diagram inputs."),
+    path("path", "CSV file", true).help("Optional RFC 4180 CSV report path in display units (`trajectory` followed by `station` rows)."),
+];
 pub const RESULTS_LINEARIZE: &[Field] = &[
     SOLVED,
     xyz("from", "From", D::Length)
@@ -3447,6 +3542,7 @@ mod tests {
         "no relaxation field",
         "no saved view",
         "no render",
+        "no WARP3D fracture results",
     ];
 
     /// Fill top-level required names (a fresh one) and references (the first existing item).
