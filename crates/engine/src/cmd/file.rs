@@ -447,6 +447,8 @@ impl Session {
         // The hosts count camera requests across documents.
         opened.camera_requests = self.camera_requests;
         opened.clear_history();
+        opened.fracture_results.clear();
+        opened.fracture_inputs.clear();
         opened.mark_opened();
         *self = opened;
     }
@@ -569,15 +571,32 @@ fn save_to(s: &mut Session, path: &str, keep: Keep) -> Result<Value> {
     s.mark_saved(target.clone());
     s.pack_geometry = keep.geometry;
     let mut reply = json!({"path": target, "bytes": bytes.len(), "contents": holds});
+    let mut warnings: Vec<String> = Vec::new();
+    if keep.results && s.has_unpersisted_fracture() {
+        warnings.push(format!(
+            "WARP3D fracture results for step(s) {} are session-only and not saved in .fieldcraft files (export via results.export.csv with what: \"fracture\")",
+            s.unpersisted_fracture_steps().join(", ")
+        ));
+    }
     if let Some(kept) = kept {
         let name = |p: &Path| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
         reply["backup"] = json!(kept.to_string_lossy());
-        reply["summary"] = json!(format!(
+        let mut summary = format!(
             "saved {} in format {}; the file it replaced is kept as {}",
             name(Path::new(&target)),
             fieldcraft_io::FORMAT_VERSION,
             name(&kept)
-        ));
+        );
+        if !warnings.is_empty() {
+            summary.push_str("; ");
+            summary.push_str(&warnings.join("; "));
+        }
+        reply["summary"] = json!(summary);
+    } else if !warnings.is_empty() {
+        reply["summary"] = json!(warnings.join("; "));
+    }
+    if !warnings.is_empty() {
+        reply["warnings"] = json!(warnings);
     }
     Ok(reply)
 }
@@ -1824,5 +1843,92 @@ mod tests {
             assert_eq!(std::fs::read(dir.join("design-mesh-results.v3.fieldcraft")).unwrap(), original, "{release}: the format 3 file is kept");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn save_warns_on_unpersisted_fracture_and_omits_when_stale_or_no_results() {
+        let d = std::env::temp_dir().join(format!("fieldcraft-save-frac-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        let mut s = Session::default();
+        s.run_script(&json!([
+            {"command": "model.units", "params": {"system": "m-kg-s-N-Pa"}},
+            {"command": "mesh.node.add", "params": {"label": 1, "xyz": [0, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 2, "xyz": [1, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 3, "xyz": [1, 1, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 4, "xyz": [0, 1, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 5, "xyz": [0, 0, 1]}},
+            {"command": "mesh.node.add", "params": {"label": 6, "xyz": [1, 0, 1]}},
+            {"command": "mesh.node.add", "params": {"label": 7, "xyz": [1, 1, 1]}},
+            {"command": "mesh.node.add", "params": {"label": 8, "xyz": [0, 1, 1]}},
+            {"command": "mesh.element.add", "params": {"label": 1, "kind": "hex8", "nodes": [1, 2, 3, 4, 5, 6, 7, 8]}},
+            {"command": "model.set.create", "params": {"name": "all", "elements": [1]}},
+            {"command": "model.set.create", "params": {"name": "fix", "nodes": [1, 2, 3, 4]}},
+            {"command": "model.set.create", "params": {"name": "top", "nodes": [5, 6, 7, 8]}},
+            {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": 2.0e11, "poisson": 0.3}}},
+            {"command": "model.section.create", "params": {"name": "solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+            {"command": "model.boundary_condition.create", "params": {"name": "clamp", "type": "fixed", "target": {"set": "fix"}}},
+            {"command": "model.load.create", "params": {"name": "pull", "type": "force", "target": {"set": "top"}, "vector": [0, 0, 100]}},
+            {"command": "model.step.create", "params": {"name": "Pull", "procedure": {"type": "static"}, "boundary_conditions": ["clamp"], "loads": ["pull"]}}
+        ]))
+        .unwrap();
+
+        let sample_domain = fieldcraft_warp3d::DomainIntegralResult {
+            domain_id: "cf_0001".into(),
+            step: 1,
+            front_nodes: vec![1],
+            s_position: Some(0.0),
+            normal: [0.0, 1.0, 0.0],
+            tangent: [0.0, 0.0, 1.0],
+            advance: [1.0, 0.0, 0.0],
+            area_aq: 1.0,
+            rings: vec![],
+            j_mean: 100.0,
+            j_min: 100.0,
+            j_max: 100.0,
+            ring_spread: 0.0,
+            j_total: None,
+            k_j_plane_strain: None,
+            k_j_plane_stress: None,
+            k_i_mean: None,
+            k_ii_mean: None,
+            k_iii_mean: None,
+            t_11_mean: None,
+            t_33_mean: None,
+        };
+        s.store_fracture_results("Pull".into(), vec![sample_domain.clone()], None);
+        assert!(s.has_unpersisted_fracture());
+
+        // 1. Save with results: true emits warning in both reply["warnings"] and reply["summary"].
+        let path_a = d.join("model_a.fieldcraft");
+        let r1 = s.execute("file.save_as", &json!({"path": path_a, "results": true})).unwrap();
+        assert_eq!(r1["warnings"].as_array().unwrap().len(), 1);
+        assert!(r1["warnings"][0].as_str().unwrap().contains("Pull"));
+        assert!(r1["summary"].as_str().unwrap().contains("results.export.csv"));
+
+        // 2. Save with results: false omits warning cleanly.
+        let path_b = d.join("model_b.fieldcraft");
+        let r2 = s.execute("file.save_as", &json!({"path": path_b, "results": false})).unwrap();
+        assert!(r2.get("warnings").is_none(), "{r2}");
+        assert!(r2.get("summary").is_none(), "{r2}");
+
+        // 3. Backup save preserves both backup sentence and fracture warning inside summary.
+        let path_old = d.join("migrated.fieldcraft");
+        std::fs::write(&path_old, b"prior unrecognised file content").unwrap();
+        s.store_fracture_results("Pull".into(), vec![sample_domain], None);
+        let r_mig = s.execute("file.save_as", &json!({"path": path_old, "results": true})).unwrap();
+        assert!(r_mig["backup"].is_string(), "{r_mig}");
+        let mig_sum = r_mig["summary"].as_str().unwrap();
+        assert!(mig_sum.contains("kept as") && mig_sum.contains("Pull") && mig_sum.contains("results.export.csv"), "{mig_sum}");
+        assert_eq!(r_mig["warnings"].as_array().unwrap().len(), 1);
+
+        // 4. After a model edit makes fracture stale, file.save emits no fracture warning.
+        s.execute("mesh.node.add", &json!({"label": 99, "xyz": [2, 2, 2]})).unwrap();
+        assert!(!s.has_unpersisted_fracture());
+        let r3 = s.execute("file.save", &json!({"results": true})).unwrap();
+        assert!(r3.get("warnings").is_none(), "{r3}");
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "fieldcraft-warp3d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fieldcraft-model.workspace = true
+fieldcraft-solver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

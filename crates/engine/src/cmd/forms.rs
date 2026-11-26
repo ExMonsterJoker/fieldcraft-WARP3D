@@ -2734,11 +2734,35 @@ pub const SAMPLE: &[Field] = &[choice(
 .def("\"cantilever\"")];
 pub const COUNT: &[Field] = &[int("count", "Count", 1, 1_000_000).help("How many steps.").def("1")];
 
+pub const CRACK_FRONT: &[Field] = &[
+    reference("set", "Crack front set", C::Set).req().help("Ordered or unordered node set lying along the 3D Hex8/Hex20 crack front."),
+    xyz("normal", "Crack plane normal", D::None)
+        .help("Unit or non-zero vector normal to the crack plane (x2); inferred from an active symmetry BC on the front when omitted.")
+        .hint("from symmetry BC"),
+    flag("symmetric", "Half symmetry")
+        .help("True when only half the crack geometry is modeled across a symmetry plane; defaults to true when inferred from a symmetry BC."),
+    int("rings", "Domain rings", 1, 20).def("4").help("Number of automatic q-function rings for domain integral evaluation (1 to 20)."),
+    flag("interaction_integral", "Interaction integrals")
+        .help("Also emit `plane strain output for interaction integral` and `compute domain interaction integral` for K_I, K_II, K_III, T11, T33."),
+    choice("function_type", "q-function type", &[("pointwise", "Pointwise (types a/b/c per station)"), ("front_average", "Front average (type d)")])
+        .def("\"pointwise\"")
+        .help("Virtual crack extension q-function along the front."),
+];
+
 pub const DECK: &[Field] = &[
-    choice("format", "Format", &[("abaqus", "Abaqus input (.inp)"), ("nastran", "Nastran bulk data (.bdf)"), ("lsdyna", "LS-DYNA keyword (.k)")])
-        .help("The solver deck format.")
-        .req()
-        .def("\"abaqus\""),
+    choice(
+        "format",
+        "Format",
+        &[
+            ("abaqus", "Abaqus input (.inp)"),
+            ("nastran", "Nastran bulk data (.bdf)"),
+            ("lsdyna", "LS-DYNA keyword (.k)"),
+            ("warp3d", "WARP3D input (.inp)"),
+        ],
+    )
+    .help("The solver deck format.")
+    .req()
+    .def("\"abaqus\""),
     path("path", "File", true).help("Where to write the deck.").req(),
     references("steps", "Steps", C::Step).help("The steps to write; all when empty.").hint("all"),
     choice(
@@ -2754,6 +2778,7 @@ pub const DECK: &[Field] = &[
     )
     .help("The consistent unit system the deck is written in, stated in its header.")
     .hint("the display system's"),
+    group("crack_front", "Crack front (WARP3D)", CRACK_FRONT).help("Optional 3D fracture mechanics domain integral specification for WARP3D decks."),
 ];
 
 pub const DECK_READ: &[Field] = &[
@@ -2852,13 +2877,25 @@ const MAX_FACTOR: Field = int("max_factor_entries", "Max factor entries", 1, sup
     .hint("400000000");
 const THREADS: Field = int("threads", "Threads", 1, 256).help("Threads to use; the session's setting when empty.").hint("the session's");
 
-pub const SOLVE_STATIC: &[Field] = &[STEP, MAX_DOFS, MAX_FACTOR, THREADS];
+const SOLVER_BACKEND: Field = choice("backend", "Backend", &[("native", "FieldCraft (native)"), ("warp3d", "WARP3D (external)")])
+    .help("Solver backend to execute the step: FieldCraft's native solver or external WARP3D.")
+    .hint("native (or FIELDCRAFT_STRUCTURAL_BACKEND)");
+const DECK_PATH: Field =
+    path("deck_path", "Deck file", true).help("Optional path where the generated WARP3D input deck is also saved (WARP3D backend only).");
+const CRACK_FRONT_FIELD: Field = group("crack_front", "Crack front (WARP3D)", CRACK_FRONT)
+    .help("Optional 3D fracture mechanics domain integral specification (WARP3D backend only).");
+
+pub const SOLVE_HEAT: &[Field] = &[STEP, MAX_DOFS, MAX_FACTOR, THREADS];
+pub const SOLVE_STATIC: &[Field] = &[STEP, MAX_DOFS, MAX_FACTOR, THREADS, SOLVER_BACKEND, DECK_PATH, CRACK_FRONT_FIELD];
 pub const SOLVE_NONLINEAR: &[Field] = &[
     STEP,
     MAX_DOFS,
     MAX_FACTOR,
     int("max_newton_iterations", "Max Newton iterations", 1, 100_000).help("Cap on the Newton iterations over the whole step.").hint("100000"),
     THREADS,
+    SOLVER_BACKEND,
+    DECK_PATH,
+    CRACK_FRONT_FIELD,
 ];
 pub const SOLVE_FREQUENCY: &[Field] = &[
     STEP,
@@ -3102,7 +3139,10 @@ pub const STREAMLINES: &[Field] = &[
     FLUID_FRAME,
 ];
 pub const EXPORT_CSV: &[Field] = &[
-    choice("what", "Export", &[("reactions", "Reaction sums"), ("probe", "Probed nodes")]).help("What to write.").req().def("\"reactions\""),
+    choice("what", "Export", &[("reactions", "Reaction sums"), ("probe", "Probed nodes"), ("fracture", "Fracture integrals")])
+        .help("What to write.")
+        .req()
+        .def("\"reactions\""),
     path("path", "File", true).help("The CSV file to write.").req(),
     SOLVED,
     references("sets", "Sets", C::Set).help("Reactions: the sets to sum; the step's BC sets when empty.").hint("the step's BC sets"),
@@ -3234,6 +3274,27 @@ pub const REACTIONS: &[Field] = &[
     xyz("about", "About point", D::Length).help("The point moments are taken about."),
     int("frame", "Frame", 0, 1_000_000_000)
         .help("Nonlinear static steps: the frame (converged increment) whose reactions to sum; the final state when empty."),
+];
+
+pub const RESULTS_READ: &[Field] = &[
+    choice("format", "Format", &[("warp3d", "WARP3D flat files")]).help("External results format to read.").req().def("\"warp3d\""),
+    path("path", "Results folder or deck", false)
+        .help("Directory containing WARP3D flat result files (wnd*_text, wns*_text, wes*_text, wnr*_text) or a file inside it.")
+        .req(),
+    reference("step", "Step", C::Step).help("Model step the results belong to; the only structural step when empty.").hint("the only one"),
+    choice(
+        "units",
+        "Result units",
+        &[
+            ("mm-t-s-N-MPa", "mm, t, s, N, MPa"),
+            ("m-kg-s-N-Pa", "m, kg, s, N, Pa"),
+            ("mm-kg-ms-kN-GPa", "mm, kg, ms, kN, GPa"),
+            ("mm-g-ms-N-MPa", "mm, g, ms, N, MPa"),
+            ("in-lbf-s-psi", "in, lbf·s²/in, s, lbf, psi"),
+        ],
+    )
+    .help("Unit system of the external results; auto-detected from `! fieldcraft-units:` header when empty.")
+    .hint("auto-detect"),
 ];
 
 #[cfg(test)]

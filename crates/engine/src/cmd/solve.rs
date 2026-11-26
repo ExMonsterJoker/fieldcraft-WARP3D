@@ -33,7 +33,7 @@ pub const RUN: CommandSpec = CommandSpec {
 pub const STATIC: CommandSpec = CommandSpec {
     id: "solve.static",
     label: "Solve Static Step",
-    params: r#"{"step": "Load", "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — solves a linear static or coupled temperature–displacement step (the only one when `step` is left out) and keeps the result in the session; `max_dofs` may only be lowered; `max_factor_entries` defaults to 400000000 and may be deliberately raised up to 2000000000 (8 bytes per factor value; indices and workspace are additional); `threads` (1 to 256, by default the session's: `FIELDCRAFT_THREADS` or the cores) changes only the time, never the result"#,
+    params: r#"{"step": "Load", "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8, "backend": "native|warp3d", "deck_path": "out.inp", "crack_front": {"set": "front"}} — solves a linear static or coupled temperature–displacement step (the only one when `step` is left out) and keeps the result in the session; `max_dofs` may only be lowered; `max_factor_entries` defaults to 400000000 and may be deliberately raised up to 2000000000 (8 bytes per factor value; indices and workspace are additional); `threads` (1 to 256, by default the session's: `FIELDCRAFT_THREADS` or the cores) changes only the time, never the result; `backend` defaults to `"native"` (or `"warp3d"` when `FIELDCRAFT_STRUCTURAL_BACKEND=warp3d`); `deck_path` and `crack_front` (only with `"backend": "warp3d"`) save the generated WARP3D input deck and evaluate 3D domain/interaction integrals (returning `"fracture"`)"#,
     form: Some(super::forms::SOLVE_STATIC),
     kind: CommandKind::Model,
     requires: &[Requirement::Analysable, Requirement::ElementMaterial, Requirement::ElementSection, Requirement::Step],
@@ -43,7 +43,7 @@ pub const STATIC: CommandSpec = CommandSpec {
 pub const NONLINEAR: CommandSpec = CommandSpec {
     id: "solve.nonlinear",
     label: "Solve Nonlinear Static Step",
-    params: r#"{"step": "Inflate", "max_dofs": 6000000, "max_factor_entries": 400000000, "max_newton_iterations": 100000, "threads": 8} — solves a nonlinear static step (the only one when `step` is left out) in load increments with Newton–Raphson iterations and keeps the result in the session: the final displacements, reactions, Cauchy stresses and logarithmic strains (small strains without nonlinear geometry), the equivalent plastic strain of plastic materials (the largest in the summary), every increment's load factor, iterations and residuals (force, displacement and energy, relative to their tolerances' scales), and a frame per converged increment (its displacements, reactions and contact states, and its nodal stresses when the step's `output` requests stress, for results.frame), and with contact pairs (interaction.contact.pair: mortar contact by augmented Lagrangian, Coulomb friction by a return map) each contact's force, normal force, largest pressure, closed and slipping nodes, deepest penetration and augmentations (solve.probe gives each secondary node's pressure, gap and status, and with friction its shear traction and slip); `max_dofs` and `max_newton_iterations` may only be lowered (the latter over the whole step); `max_factor_entries` and `threads` as for solve.static"#,
+    params: r#"{"step": "Inflate", "max_dofs": 6000000, "max_factor_entries": 400000000, "max_newton_iterations": 100000, "threads": 8, "backend": "native|warp3d", "deck_path": "out.inp", "crack_front": {"set": "front"}} — solves a nonlinear static step (the only one when `step` is left out) in load increments with Newton–Raphson iterations and keeps the result in the session: the final displacements, reactions, Cauchy stresses and logarithmic strains (small strains without nonlinear geometry), the equivalent plastic strain of plastic materials (the largest in the summary), every increment's load factor, iterations and residuals (force, displacement and energy, relative to their tolerances' scales), and a frame per converged increment (its displacements, reactions and contact states, and its nodal stresses when the step's `output` requests stress, for results.frame), and with contact pairs (interaction.contact.pair: mortar contact by augmented Lagrangian, Coulomb friction by a return map) each contact's force, normal force, largest pressure, closed and slipping nodes, deepest penetration and augmentations (solve.probe gives each secondary node's pressure, gap and status, and with friction its shear traction and slip); `max_dofs` and `max_newton_iterations` may only be lowered (the latter over the whole step); `max_factor_entries`, `threads`, `backend`, `deck_path` and `crack_front` as for solve.static"#,
     form: Some(super::forms::SOLVE_NONLINEAR),
     kind: CommandKind::Model,
     requires: &[Requirement::Analysable, Requirement::ElementMaterial, Requirement::ElementSection, Requirement::Step],
@@ -54,7 +54,7 @@ pub const HEAT: CommandSpec = CommandSpec {
     id: "solve.heat",
     label: "Solve Heat Transfer Step",
     params: r#"{"step": "Heat", "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — steady or transient heat conduction of a heat transfer step (the only one when `step` is left out): temperatures, heat flux and the heat flow at prescribed temperatures, kept in the session; `max_dofs` may only be lowered; `max_factor_entries` and `threads` as for solve.static"#,
-    form: Some(super::forms::SOLVE_STATIC),
+    form: Some(super::forms::SOLVE_HEAT),
     kind: CommandKind::Model,
     requires: &[Requirement::Analysable, Requirement::ElementMaterial, Requirement::ElementSection, Requirement::Step],
     run: run_heat,
@@ -253,11 +253,12 @@ fn run_all(s: &mut Session, _: &Value) -> Result<Value> {
     use fieldcraft_model::Procedure;
     type Solve = fn(&mut Session, &Value) -> Result<Value>;
     // Each solve with the command whose summary it gives (its units).
-    let steps: Vec<(String, &'static str, Solve, &'static str)> = s
+    let steps: Vec<(String, &'static str, Solve, &'static str, bool)> = s
         .model
         .steps()
         .iter()
         .map(|st| {
+            let coupled = matches!(st.procedure, Procedure::CoupledTemperatureDisplacement {});
             let (solve, id): (Solve, &str) = match st.procedure {
                 Procedure::Static {} | Procedure::CoupledTemperatureDisplacement {} => (run_static, "solve.static"),
                 Procedure::HeatTransfer { .. } => (run_heat, "solve.heat"),
@@ -267,24 +268,43 @@ fn run_all(s: &mut Session, _: &Value) -> Result<Value> {
                 Procedure::Fluid { .. } => (run_fluid, "solve.fluid"),
                 Procedure::NonlinearStatic(_) => (run_nonlinear, "solve.nonlinear"),
             };
-            (st.name.clone(), st.procedure.name(), solve, id)
+            (st.name.clone(), st.procedure.name(), solve, id, coupled)
         })
         .collect();
     if steps.is_empty() {
         return Err(EngineError::Params("the model has no steps to solve: add one (model.step.create)".into()));
     }
+    let env_warp3d = structural_machine_backend()? == Some(StructuralBackend::Warp3d);
     let mut done = Vec::new();
     let count = steps.len();
-    for (index, (name, procedure, solve, id)) in steps.into_iter().enumerate() {
+    for (index, (name, procedure, solve, id, coupled)) in steps.into_iter().enumerate() {
         fieldcraft_model::progress::step(&name, index + 1, count);
         fieldcraft_model::progress::check()?;
-        let params = json!({"step": name});
+        let (params, mut notice) = if env_warp3d && coupled {
+            (
+                json!({"step": name, "backend": "native"}),
+                Some(format!("step `{name}` fell back to native solver (WARP3D does not support coupled temperature-displacement)")),
+            )
+        } else {
+            (json!({"step": name}), None)
+        };
         let progress = fieldcraft_model::progress::current();
         let before = progress.as_ref().map_or(0, |p| p.observations());
-        let outcome = solve(s, &params);
+        let outcome = match solve(s, &params) {
+            Err(e) if env_warp3d && matches!(id, "solve.static" | "solve.nonlinear") && is_warp3d_unsupported(&e) => {
+                notice = Some(format!("step `{name}` fell back to native solver ({e})"));
+                solve(s, &json!({"step": name, "backend": "native"}))
+            }
+            other => other,
+        };
         let display = s.units().clone();
         let outcome = outcome.and_then(|mut summary| {
             crate::units::convert_reply(id, &mut summary, crate::units::si(), &display)?;
+            if let Some(n) = &notice
+                && let Some(obj) = summary.as_object_mut()
+            {
+                obj.insert("notice".into(), json!(n));
+            }
             Ok(summary)
         });
         let outcome = match progress {
@@ -321,13 +341,159 @@ fn smallest(values: impl Iterator<Item = (u32, f64)>) -> Value {
     extreme(values, |v, b| v < b)
 }
 
-fn run_static(s: &mut Session, p: &Value) -> Result<Value> {
-    let limits = limits(p)?;
-    let step = opt::<String>(p, "step")?;
-    let model = &s.model;
-    let r = with_threads(threads(s, p)?, || solve_static(model, step.as_deref(), &limits))?;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StructuralBackend {
+    Native,
+    Warp3d,
+}
 
-    let summary = json!({
+fn structural_machine_backend() -> Result<Option<StructuralBackend>> {
+    let Ok(raw) = std::env::var("FIELDCRAFT_STRUCTURAL_BACKEND") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.eq_ignore_ascii_case("native") {
+        Ok(Some(StructuralBackend::Native))
+    } else if trimmed.eq_ignore_ascii_case("warp3d") {
+        Ok(Some(StructuralBackend::Warp3d))
+    } else {
+        Err(EngineError::Params(format!("FIELDCRAFT_STRUCTURAL_BACKEND must be `native` or `warp3d`, got `{trimmed}`")))
+    }
+}
+
+fn is_warp3d_unsupported(err: &EngineError) -> bool {
+    matches!(err, EngineError::Solver(fieldcraft_solver::Error::NotSupported(msg)) if msg.contains("WARP3D cannot express"))
+}
+
+fn structural_backend(p: &Value) -> Result<StructuralBackend> {
+    match p.get("backend") {
+        None | Some(Value::Null) => Ok(structural_machine_backend()?.unwrap_or(StructuralBackend::Native)),
+        Some(Value::String(s)) if s == "native" => Ok(StructuralBackend::Native),
+        Some(Value::String(s)) if s == "warp3d" => Ok(StructuralBackend::Warp3d),
+        Some(_) => Err(EngineError::invalid("backend", "must be `native` or `warp3d`")),
+    }
+}
+
+fn optional_deck_path(s: &Session, p: &Value, backend: StructuralBackend) -> Result<Option<std::path::PathBuf>> {
+    match p.get("deck_path") {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => {
+            let path = super::file_param(s, p, "deck_path", fieldcraft_io::roots::Access::Write)?;
+            if backend == StructuralBackend::Native {
+                return Err(EngineError::invalid("deck_path", "`deck_path` is only supported with `backend: \"warp3d\"`"));
+            }
+            Ok(Some(std::path::PathBuf::from(path)))
+        }
+    }
+}
+
+fn optional_crack_front(p: &Value, backend: StructuralBackend) -> Result<Option<fieldcraft_warp3d::CrackFrontSpec>> {
+    let crack = super::deck::parse_crack_front(p)?;
+    if crack.is_some() && backend == StructuralBackend::Native {
+        return Err(EngineError::invalid("crack_front", "`crack_front` is only supported with `backend: \"warp3d\"`"));
+    }
+    Ok(crack)
+}
+
+fn select_warp3d_step<'a>(model: &'a fieldcraft_model::Model, step: Option<&str>, want_nonlinear: bool) -> Result<&'a fieldcraft_model::Step> {
+    use fieldcraft_model::Procedure;
+    let chosen = if let Some(name) = step {
+        model.step(name).ok_or_else(|| EngineError::Solver(fieldcraft_solver::Error::Invalid(format!("step `{name}` does not exist"))))?
+    } else {
+        let matching: Vec<&fieldcraft_model::Step> =
+            model
+                .steps()
+                .iter()
+                .filter(|st| {
+                    if want_nonlinear { matches!(st.procedure, Procedure::NonlinearStatic(_)) } else { matches!(st.procedure, Procedure::Static {}) }
+                })
+                .collect();
+        match matching.as_slice() {
+            [only] => *only,
+            [] => {
+                if model.steps().is_empty() {
+                    return Err(EngineError::Solver(fieldcraft_solver::Error::Invalid("the model has no steps to solve".into())));
+                }
+                let expected = if want_nonlinear { "nonlinear static" } else { "static" };
+                return Err(EngineError::Solver(fieldcraft_solver::Error::Invalid(format!("the model has no {expected} step to solve with WARP3D"))));
+            }
+            _ => {
+                return Err(EngineError::Solver(fieldcraft_solver::Error::Invalid("the model has several matching steps; specify `step`".into())));
+            }
+        }
+    };
+    match (want_nonlinear, &chosen.procedure) {
+        (false, Procedure::Static {}) | (true, Procedure::NonlinearStatic(_)) => Ok(chosen),
+        (false, other) => Err(EngineError::Solver(fieldcraft_solver::Error::Invalid(format!(
+            "step `{}` is {} (expected static for WARP3D solve.static)",
+            chosen.name,
+            other.name()
+        )))),
+        (true, other) => Err(EngineError::Solver(fieldcraft_solver::Error::Invalid(format!(
+            "step `{}` is {} (expected nonlinear_static for WARP3D solve.nonlinear)",
+            chosen.name,
+            other.name()
+        )))),
+    }
+}
+
+fn warp3d_to_engine(err: fieldcraft_warp3d::Warp3dError) -> EngineError {
+    use fieldcraft_warp3d::Warp3dError;
+    match err {
+        Warp3dError::Cancelled => EngineError::Model(fieldcraft_model::Error::Cancelled),
+        Warp3dError::Model(m) => EngineError::Model(m),
+        Warp3dError::SolverFailed { .. } | Warp3dError::Timeout { .. } => {
+            EngineError::Solver(fieldcraft_solver::Error::NotConverged(err.to_string()))
+        }
+        Warp3dError::Parse(_) | Warp3dError::Io(_) => EngineError::Solver(fieldcraft_solver::Error::Internal(err.to_string())),
+        Warp3dError::BinaryNotFound(_) | Warp3dError::Unsupported(_) => EngineError::Solver(fieldcraft_solver::Error::NotSupported(err.to_string())),
+    }
+}
+
+fn run_warp3d_bridged(
+    model: &fieldcraft_model::Model,
+    step_name: &str,
+    crack_front: Option<&fieldcraft_warp3d::CrackFrontSpec>,
+    threads: usize,
+    deck_path: Option<&std::path::Path>,
+) -> Result<fieldcraft_warp3d::Warp3dSolution> {
+    use std::sync::atomic::AtomicBool;
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::sync::atomic::Ordering;
+    let cancel = AtomicBool::new(false);
+    #[cfg(not(target_arch = "wasm32"))]
+    let res = if let Some(progress) = fieldcraft_model::progress::current() {
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    if progress.is_cancelled() {
+                        cancel.store(true, Ordering::Release);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            });
+            let out = fieldcraft_warp3d::run_warp3d(model, step_name, crack_front, threads, deck_path, &cancel);
+            done.store(true, Ordering::Release);
+            out
+        })
+    } else {
+        fieldcraft_warp3d::run_warp3d(model, step_name, crack_front, threads, deck_path, &cancel)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let res = {
+        let _ = (model, step_name, crack_front, threads, deck_path, &cancel);
+        fieldcraft_warp3d::run_warp3d(model, step_name, crack_front, threads, deck_path, &cancel)
+    };
+    res.map_err(warp3d_to_engine)
+}
+
+pub(super) fn static_summary(r: &StaticResult, display: &DisplaySystem) -> Value {
+    json!({
         "step": r.step,
         "dofs": r.stats.dofs,
         "equations": r.stats.equations,
@@ -343,19 +509,13 @@ fn run_static(s: &mut Session, p: &Value) -> Result<Value> {
             "reaction": p.reaction,
         })).collect::<Vec<_>>(),
         "max_temperature": r.temperature.as_ref().map(|t| largest(r.nodes.iter().copied().zip(t.iter().copied()))),
-        "warnings": warnings_with(&r.warnings, &r.table_ranges, s.units(), "the step's heat conduction: "),
-    });
-    s.store_result(StepResult::Implicit(ImplicitResult::Static(r)));
-    Ok(summary)
+        "warnings": warnings_with(&r.warnings, &r.table_ranges, display, "the step's heat conduction: "),
+    })
 }
 
-fn run_nonlinear(s: &mut Session, p: &Value) -> Result<Value> {
-    let limits = limits(p)?;
-    let step = opt::<String>(p, "step")?;
-    let model = &s.model;
-    let r = with_threads(threads(s, p)?, || solve_nonlinear(model, step.as_deref(), &limits))?;
+pub(super) fn nonlinear_summary(r: &StaticResult, display: &DisplaySystem) -> Value {
     let history = r.nonlinear.as_ref();
-    let summary = json!({
+    json!({
         "step": r.step,
         "dofs": r.stats.dofs,
         "equations": r.stats.equations,
@@ -386,8 +546,58 @@ fn run_nonlinear(s: &mut Session, p: &Value) -> Result<Value> {
             "displacement": p.displacement,
             "reaction": p.reaction,
         })).collect::<Vec<_>>(),
-        "warnings": warnings_with(&r.warnings, &r.table_ranges, s.units(), "the step's heat conduction: "),
-    });
+        "warnings": warnings_with(&r.warnings, &r.table_ranges, display, "the step's heat conduction: "),
+    })
+}
+
+fn run_static(s: &mut Session, p: &Value) -> Result<Value> {
+    let backend = structural_backend(p)?;
+    let deck_path = optional_deck_path(s, p, backend)?;
+    let crack_front = optional_crack_front(p, backend)?;
+    let limits = limits(p)?;
+    let step = opt::<String>(p, "step")?;
+    let thread_count = threads(s, p)?;
+    if backend == StructuralBackend::Warp3d {
+        let step_name = select_warp3d_step(&s.model, step.as_deref(), false)?.name.clone();
+        let sol = run_warp3d_bridged(&s.model, &step_name, crack_front.as_ref(), thread_count, deck_path.as_deref())?;
+        let mut summary = static_summary(&sol.static_result, s.units());
+        summary["backend"] = json!("warp3d");
+        if !sol.fracture.is_empty() {
+            summary["fracture"] = json!(&sol.fracture);
+        }
+        s.store_result(StepResult::Implicit(ImplicitResult::Static(sol.static_result)));
+        s.store_fracture_results(step_name, sol.fracture, crack_front.as_ref().map(|c| c.set.as_str()));
+        return Ok(summary);
+    }
+    let model = &s.model;
+    let r = with_threads(thread_count, || solve_static(model, step.as_deref(), &limits))?;
+    let summary = static_summary(&r, s.units());
+    s.store_result(StepResult::Implicit(ImplicitResult::Static(r)));
+    Ok(summary)
+}
+
+fn run_nonlinear(s: &mut Session, p: &Value) -> Result<Value> {
+    let backend = structural_backend(p)?;
+    let deck_path = optional_deck_path(s, p, backend)?;
+    let crack_front = optional_crack_front(p, backend)?;
+    let limits = limits(p)?;
+    let step = opt::<String>(p, "step")?;
+    let thread_count = threads(s, p)?;
+    if backend == StructuralBackend::Warp3d {
+        let step_name = select_warp3d_step(&s.model, step.as_deref(), true)?.name.clone();
+        let sol = run_warp3d_bridged(&s.model, &step_name, crack_front.as_ref(), thread_count, deck_path.as_deref())?;
+        let mut summary = nonlinear_summary(&sol.static_result, s.units());
+        summary["backend"] = json!("warp3d");
+        if !sol.fracture.is_empty() {
+            summary["fracture"] = json!(&sol.fracture);
+        }
+        s.store_result(StepResult::Implicit(ImplicitResult::Static(sol.static_result)));
+        s.store_fracture_results(step_name, sol.fracture, crack_front.as_ref().map(|c| c.set.as_str()));
+        return Ok(summary);
+    }
+    let model = &s.model;
+    let r = with_threads(thread_count, || solve_nonlinear(model, step.as_deref(), &limits))?;
+    let summary = nonlinear_summary(&r, s.units());
     s.store_result(StepResult::Implicit(ImplicitResult::Static(r)));
     Ok(summary)
 }
@@ -4128,5 +4338,725 @@ pub(crate) mod tests {
         s.execute("interaction.tie", &json!({"name": "back", "main": "pad_bottom", "secondary": "chip_top", "position_tolerance": 0.1})).unwrap();
         let e = s.execute("solve.heat", &json!({"step": "Steady"})).unwrap_err().to_string();
         assert!(e.contains("tie `back`") && e.contains("tie `chip`"), "{e}");
+    }
+
+    #[test]
+    fn solve_heat_form_stays_isolated() {
+        assert!(HEAT.form.is_some_and(|f| {
+            f.iter().map(|x| x.key).collect::<Vec<_>>() == crate::cmd::forms::SOLVE_HEAT.iter().map(|x| x.key).collect::<Vec<_>>()
+        }));
+        let heat_keys: Vec<&str> = HEAT.form.unwrap().iter().map(|f| f.key).collect();
+        assert_eq!(heat_keys, ["step", "max_dofs", "max_factor_entries", "threads"]);
+        assert!(!crate::cmd::forms::SOLVE_HEAT.iter().any(|f| f.key == "backend" || f.key == "deck_path" || f.key == "crack_front"));
+        for form in [crate::cmd::forms::SOLVE_STATIC, crate::cmd::forms::SOLVE_NONLINEAR] {
+            let backend = form.iter().find(|f| f.key == "backend").unwrap();
+            assert_eq!(backend.default, None);
+            assert!(backend.hint.contains("FIELDCRAFT_STRUCTURAL_BACKEND"));
+            assert!(form.iter().any(|f| f.key == "deck_path"));
+            assert!(form.iter().any(|f| f.key == "crack_front"));
+        }
+
+        let mut s = Session::default();
+        cantilever(&mut s);
+        let dir = std::env::temp_dir().join(format!("fieldcraft-solve-iso-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let deck_out = dir.join("native.inp");
+        let err_deck = s.execute("solve.static", &json!({"step": "Load", "backend": "native", "deck_path": deck_out.to_string_lossy()})).unwrap_err();
+        assert!(matches!(&err_deck, EngineError::Param(p) if p.path == "deck_path"), "{err_deck}");
+        assert!(!deck_out.exists());
+
+        for cmd_id in ["solve.static", "solve.nonlinear"] {
+            let err_crack = s.execute(cmd_id, &json!({"step": "Load", "backend": "native", "crack_front": {"set": "root"}})).unwrap_err();
+            assert!(matches!(&err_crack, EngineError::Param(p) if p.path == "crack_front"), "{cmd_id}: {err_crack}");
+            let err_bad = s.execute(cmd_id, &json!({"step": "Load", "backend": "native", "crack_front": {"set": ""}})).unwrap_err();
+            assert!(matches!(&err_bad, EngineError::Param(p) if p.path == "crack_front/set"), "{cmd_id}: {err_bad}");
+        }
+
+        let err_backend = s.execute("solve.static", &json!({"step": "Load", "backend": "bogus"})).unwrap_err();
+        assert!(matches!(&err_backend, EngineError::Param(p) if p.path == "backend"), "{err_backend}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn solve_static_and_nonlinear_dispatch_to_mock_warp3d() {
+        #[allow(clippy::unwrap_used)]
+        fn hex8_model(nonlinear: bool) -> Session {
+            let mut s = Session::default();
+            let mut script = json!([
+                {"command": "model.units", "params": {"system": "mm-t-s-N-MPa"}},
+                {"command": "mesh.node.add", "params": {"label": 1, "xyz": [0, 0, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 2, "xyz": [1000, 0, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 3, "xyz": [1000, 1000, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 4, "xyz": [0, 1000, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 5, "xyz": [0, 0, 1000]}},
+                {"command": "mesh.node.add", "params": {"label": 6, "xyz": [1000, 0, 1000]}},
+                {"command": "mesh.node.add", "params": {"label": 7, "xyz": [1000, 1000, 1000]}},
+                {"command": "mesh.node.add", "params": {"label": 8, "xyz": [0, 1000, 1000]}},
+                {"command": "mesh.element.add", "params": {"label": 1, "kind": "hex8", "nodes": [1, 2, 3, 4, 5, 6, 7, 8]}},
+                {"command": "model.set.create", "params": {"name": "all", "elements": [1]}},
+                {"command": "model.set.create", "params": {"name": "fix", "nodes": [1, 4, 5, 8]}},
+                {"command": "model.set.create", "params": {"name": "tip", "nodes": [2, 3, 6, 7]}},
+                {
+                    "command": "model.material.create",
+                    "params": {
+                        "name": "Steel",
+                        "elastic": {"type": "isotropic", "young": 200000, "poisson": 0.3},
+                        "plastic": {"type": "bilinear", "yield_stress": 200, "hardening_modulus": 2000, "hardening": "isotropic"}
+                    }
+                },
+                {"command": "model.section.create", "params": {"name": "solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+                {"command": "model.boundary_condition.create", "params": {"name": "clamp", "type": "fixed", "target": {"set": "fix"}}},
+                {"command": "model.load.create", "params": {"name": "pull", "type": "force", "target": {"set": "tip"}, "vector": [100000, 0, 0]}}
+            ]);
+            let step = if nonlinear {
+                json!({
+                    "command": "model.step.create",
+                    "params": {
+                        "name": "Pull",
+                        "procedure": {"type": "nonlinear_static", "initial_increment": 1.0, "max_increments": 5},
+                        "boundary_conditions": ["clamp"],
+                        "loads": ["pull"],
+                        "output": ["displacement", "stress", "reaction_force"]
+                    }
+                })
+            } else {
+                json!({
+                    "command": "model.step.create",
+                    "params": {
+                        "name": "Pull",
+                        "procedure": {"type": "static"},
+                        "boundary_conditions": ["clamp"],
+                        "loads": ["pull"]
+                    }
+                })
+            };
+            script.as_array_mut().unwrap().push(step);
+            s.run_script(&script).unwrap();
+            s
+        }
+
+        #[allow(clippy::unwrap_used)]
+        fn write_mock_scripts(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+            let mut stress_26 = vec!["0.0"; 26];
+            stress_26[0] = "1.0e5"; // 1.0e5 Pa in MKgS
+            stress_26[7] = "1.0e5";
+            let stress_row = stress_26.join(" ");
+            let mut elem_26 = vec!["0.0"; 26];
+            elem_26[8] = "0.004";
+            let elem_row = elem_26.join(" ");
+
+            #[cfg(windows)]
+            {
+                let ps_ok = dir.join("mock_ok.ps1");
+                let body = format!(
+                    "$null = [Console]::In.ReadToEnd()\n\
+                     $wnd = (1..8 | ForEach-Object {{ if ($_ -in 2,3,6,7) {{ '5.0e-4 0.0 0.0' }} else {{ '0.0 0.0 0.0' }} }}) -join \"`n\"\n\
+                     $wnr = (1..8 | ForEach-Object {{ if ($_ -in 1,4,5,8) {{ '-25000.0 0.0 0.0' }} else {{ '0.0 0.0 0.0' }} }}) -join \"`n\"\n\
+                     $wns = (1..8 | ForEach-Object {{ '{stress_row}' }}) -join \"`n\"\n\
+                     $wes = '{elem_row}'\n\
+                     Set-Content -Path 'wnd0000001_text' -Value \"#`n$wnd\"\n\
+                     Set-Content -Path 'wnr0000001_text' -Value \"#`n$wnr\"\n\
+                     Set-Content -Path 'wns0000001_text' -Value \"#`n$wns\"\n\
+                     Set-Content -Path 'wes0000001_text' -Value \"#`n$wes\"\n\
+                     Write-Output 'WARP3D mock complete'\n"
+                );
+                std::fs::write(&ps_ok, body).unwrap();
+                let ok_cmd = dir.join("mock_ok.cmd");
+                std::fs::write(&ok_cmd, format!("@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n", ps_ok.display()))
+                    .unwrap();
+                let fail_cmd = dir.join("mock_fail.cmd");
+                std::fs::write(&fail_cmd, "@echo off\r\necho WARP3D fatal: singular tangent\r\nexit /b 1\r\n").unwrap();
+                let slow_cmd = dir.join("mock_slow.cmd");
+                std::fs::write(&slow_cmd, "@echo off\r\nfor /L %%i in (1,1,5000000) do @rem\r\n").unwrap();
+                (ok_cmd, fail_cmd, slow_cmd)
+            }
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let ok_sh = dir.join("mock_ok.sh");
+                let ok_body = format!(
+                    "#!/bin/sh\nset -e\ncat >/dev/null\n\
+                     printf '#\\n0 0 0\\n5.0e-4 0 0\\n5.0e-4 0 0\\n0 0 0\\n0 0 0\\n5.0e-4 0 0\\n5.0e-4 0 0\\n0 0 0\\n' > wnd0000001_text\n\
+                     printf '#\\n-25000.0 0 0\\n0 0 0\\n0 0 0\\n-25000.0 0 0\\n-25000.0 0 0\\n0 0 0\\n0 0 0\\n-25000.0 0 0\\n' > wnr0000001_text\n\
+                     printf '#\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n' > wns0000001_text\n\
+                     printf '#\\n{e}\\n' > wes0000001_text\n\
+                     echo 'WARP3D mock complete'\n",
+                    s = stress_row,
+                    e = elem_row,
+                );
+                std::fs::write(&ok_sh, ok_body).unwrap();
+                let mut perms = std::fs::metadata(&ok_sh).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&ok_sh, perms).unwrap();
+
+                let fail_sh = dir.join("mock_fail.sh");
+                std::fs::write(&fail_sh, "#!/bin/sh\necho 'WARP3D fatal: singular tangent'\nexit 1\n").unwrap();
+                let mut fperms = std::fs::metadata(&fail_sh).unwrap().permissions();
+                fperms.set_mode(0o755);
+                std::fs::set_permissions(&fail_sh, fperms).unwrap();
+
+                let slow_sh = dir.join("mock_slow.sh");
+                std::fs::write(&slow_sh, "#!/bin/sh\nexec sleep 30\n").unwrap();
+                let mut sperms = std::fs::metadata(&slow_sh).unwrap().permissions();
+                sperms.set_mode(0o755);
+                std::fs::set_permissions(&slow_sh, sperms).unwrap();
+                (ok_sh, fail_sh, slow_sh)
+            }
+        }
+
+        if let Some(mode) = std::env::var_os("FIELDCRAFT_WARP3D_MOCK_CHILD") {
+            let mode = mode.to_string_lossy();
+            let dir = std::path::PathBuf::from(std::env::var_os("FIELDCRAFT_WARP3D_TEST_DIR").unwrap());
+            if mode == "ok_explicit" {
+                let mut s_lin = hex8_model(false);
+                let deck_out = dir.join("saved_lin.inp");
+                let r_lin =
+                    s_lin.execute("solve.static", &json!({"step": "Pull", "backend": "warp3d", "deck_path": deck_out.to_string_lossy()})).unwrap();
+                assert_eq!(r_lin["backend"], "warp3d");
+                assert!(deck_out.is_file());
+                // Model is in mm-t-s-N-MPa: 5e-4 m -> 0.5 mm; 1e5 Pa -> 0.1 MPa.
+                assert!((r_lin["max_displacement"]["value"].as_f64().unwrap() - 0.5).abs() < 1e-12, "{r_lin}");
+                assert!((r_lin["max_von_mises"]["value"].as_f64().unwrap() - 0.1).abs() < 1e-9, "{r_lin}");
+                assert!(s_lin.result("Pull").is_some());
+
+                let mut s_nl = hex8_model(true);
+                let r_nl = s_nl.execute("solve.nonlinear", &json!({"step": "Pull", "backend": "warp3d"})).unwrap();
+                assert_eq!(r_nl["backend"], "warp3d");
+                assert!((r_nl["max_plastic_strain"]["value"].as_f64().unwrap() - 0.004).abs() < 1e-12, "{r_nl}");
+                let stored = s_nl.result("Pull").unwrap().clone();
+                let crate::results::Kind::Static(st) = stored.kind() else { panic!() };
+                assert!(st.nonlinear.as_ref().is_some_and(|h| h.frames.len() == 2));
+                assert_eq!(st.elements[0].plastic_strain, vec![0.004]);
+            } else if mode == "ok_env" {
+                let mut s_env = hex8_model(false);
+                let r_env = s_env.execute("solve.static", &json!({"step": "Pull"})).unwrap();
+                assert_eq!(r_env["backend"], "warp3d");
+            } else if mode == "fail_diag" {
+                let mut s_fail = hex8_model(false);
+                let diag_dir = dir.join("diag");
+                std::fs::create_dir_all(&diag_dir).unwrap();
+                s_fail.solver_diagnostics = Some(diag_dir.clone());
+                let before_model = s_fail.model.clone();
+                let err = s_fail.execute("solve.static", &json!({"step": "Pull", "backend": "warp3d"})).unwrap_err();
+                assert!(err.to_string().contains("singular tangent"), "{err}");
+                assert_eq!(s_fail.model, before_model);
+                assert!(s_fail.take_solver_diagnostic().is_some(), "solver failure should record a solver_diagnostic");
+            } else if mode == "cancel_bridge" {
+                let mut s_cancel = hex8_model(false);
+                let diag_dir = dir.join("diag_cancel");
+                std::fs::create_dir_all(&diag_dir).unwrap();
+                s_cancel.solver_diagnostics = Some(diag_dir);
+                let before_model = s_cancel.model.clone();
+                let progress = fieldcraft_model::progress::Progress::new();
+                let p_trig = progress.clone();
+                let t0 = std::time::Instant::now();
+                let killer = std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                    p_trig.cancel();
+                });
+                let res = fieldcraft_model::progress::scoped(Some(progress), || {
+                    s_cancel.execute("solve.static", &json!({"step": "Pull", "backend": "warp3d"}))
+                });
+                let _ = killer.join();
+                let elapsed = t0.elapsed();
+                let err = res.unwrap_err();
+                assert!(err.is_cancelled(), "expected cancelled error, got: {err}");
+                assert!(elapsed < std::time::Duration::from_secs(3), "cancel took too long: {elapsed:?}");
+                assert_eq!(s_cancel.model, before_model);
+                assert!(s_cancel.take_solver_diagnostic().is_none(), "cancelled run must not record solver_diagnostic");
+            } else {
+                panic!("unknown mock child mode: {mode}");
+            }
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("fieldcraft-solve-warp3d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ok_bin, fail_bin, slow_bin) = write_mock_scripts(&dir);
+        let test_name = format!(
+            "{}::solve_static_and_nonlinear_dispatch_to_mock_warp3d",
+            module_path!().strip_prefix("fieldcraft_engine::").unwrap_or(module_path!())
+        );
+
+        let exe = std::env::current_exe().unwrap();
+        for (mode, bin, extra_env) in [
+            ("ok_explicit", &ok_bin, None),
+            ("ok_env", &ok_bin, Some(("FIELDCRAFT_STRUCTURAL_BACKEND", "warp3d"))),
+            ("fail_diag", &fail_bin, None),
+            ("cancel_bridge", &slow_bin, None),
+        ] {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.arg("--exact")
+                .arg(&test_name)
+                .arg("--nocapture")
+                .env("FIELDCRAFT_WARP3D_MOCK_CHILD", mode)
+                .env("FIELDCRAFT_WARP3D_TEST_DIR", &dir)
+                .env("FIELDCRAFT_WARP3D_BIN", bin);
+            if let Some((k, v)) = extra_env {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "mode `{mode}` failed:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            assert!(stdout.contains("1 passed"), "mode `{mode}` did not match exact test `{test_name}`:\n{stdout}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn solve_warp3d_fracture_integrals_probe_units_and_invalidation() {
+        #[allow(clippy::unwrap_used)]
+        fn hex8_crack_model(nonlinear: bool) -> Session {
+            let mut s = Session::default();
+            let mut script = json!([
+                {"command": "model.units", "params": {"system": "mm-t-s-N-MPa"}},
+                {"command": "mesh.node.add", "params": {"label": 1, "xyz": [0, 0, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 2, "xyz": [1000, 0, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 3, "xyz": [1000, 1000, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 4, "xyz": [0, 1000, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 5, "xyz": [0, 0, 1000]}},
+                {"command": "mesh.node.add", "params": {"label": 6, "xyz": [1000, 0, 1000]}},
+                {"command": "mesh.node.add", "params": {"label": 7, "xyz": [1000, 1000, 1000]}},
+                {"command": "mesh.node.add", "params": {"label": 8, "xyz": [0, 1000, 1000]}},
+                {"command": "mesh.element.add", "params": {"label": 1, "kind": "hex8", "nodes": [1, 2, 3, 4, 5, 6, 7, 8]}},
+                {"command": "model.set.create", "params": {"name": "all", "elements": [1]}},
+                {"command": "model.set.create", "params": {"name": "fix", "nodes": [1, 4, 5, 8]}},
+                {"command": "model.set.create", "params": {"name": "front", "nodes": [2, 3]}},
+                {"command": "model.set.create", "params": {"name": "tip", "nodes": [2, 3, 6, 7]}},
+                {
+                    "command": "model.material.create",
+                    "params": {
+                        "name": "Steel",
+                        "elastic": {"type": "isotropic", "young": 200000, "poisson": 0.3},
+                        "plastic": {"type": "bilinear", "yield_stress": 200, "hardening_modulus": 2000, "hardening": "isotropic"}
+                    }
+                },
+                {"command": "model.section.create", "params": {"name": "solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+                {"command": "model.boundary_condition.create", "params": {"name": "clamp", "type": "fixed", "target": {"set": "fix"}}},
+                {"command": "model.load.create", "params": {"name": "pull", "type": "force", "target": {"set": "tip"}, "vector": [100000, 0, 0]}}
+            ]);
+            let step = if nonlinear {
+                json!({
+                    "command": "model.step.create",
+                    "params": {
+                        "name": "Pull",
+                        "procedure": {"type": "nonlinear_static", "initial_increment": 1.0, "max_increments": 5},
+                        "boundary_conditions": ["clamp"],
+                        "loads": ["pull"],
+                        "output": ["displacement", "stress", "reaction_force"]
+                    }
+                })
+            } else {
+                json!({
+                    "command": "model.step.create",
+                    "params": {
+                        "name": "Pull",
+                        "procedure": {"type": "static"},
+                        "boundary_conditions": ["clamp"],
+                        "loads": ["pull"]
+                    }
+                })
+            };
+            script.as_array_mut().unwrap().push(step);
+            s.run_script(&script).unwrap();
+            s
+        }
+
+        #[allow(clippy::unwrap_used)]
+        fn write_mock_fracture_bin(dir: &std::path::Path) -> std::path::PathBuf {
+            let mut stress_26 = vec!["0.0"; 26];
+            stress_26[0] = "1.0e5";
+            stress_26[7] = "1.0e5";
+            let stress_row = stress_26.join(" ");
+            let mut elem_26 = vec!["0.0"; 26];
+            elem_26[8] = "0.002";
+            let elem_row = elem_26.join(" ");
+
+            // Domain-integral stdout in WARP3D SI (MKgS) units: A_q = 2.5e-5 m^2,
+            // J = 11500..12500 N/m (mean 12000), KI = 51e6 Pa*sqrt(m), T11 = -15e6 Pa, T33 = -4.5e6 Pa.
+            let domain_stdout_lines = [
+                "     Domain definition:  cf_0001",
+                "",
+                "        Number of front nodes:    2 Nodes on front:",
+                "              2      3",
+                "        Direction cosines:   0.000000  1.000000  0.000000",
+                "        Tangent vector direction cosines:   0.000000  0.000000  1.000000",
+                "        Front order:  1     Verify front: T Domain type:  1",
+                "     ** end of domain definition **",
+                "",
+                "                         domain-integral post-processing",
+                "                         -------------------------------",
+                " step:     1",
+                " domain id: cf_0001",
+                " area under q along front:        2.500000E-05",
+                "",
+                "                                             J-integral components",
+                "                                          ===========================",
+                " domain        dm1          dm2          dm3          dm4          dm5          dm6          dm7          dm8       total J   killed ele",
+                "     1     1.1500E+04   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   1.1500E+04   (  0)",
+                "     2     1.2500E+04   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   1.2500E+04   (  0)",
+                "",
+                "    average:  1.2000E+04   minimum:  1.1500E+04   maximum: 1.2500E+04     (cf_0001)",
+                "  1.2000E+04  1.1500E+04  1.2500E+04",
+                "",
+                "          Stress intensity factors obtained from J-values assuming pure mode I, mode II or mode III loading",
+                " domain   KI plane stress   KI plane strain   KII plane stress   KII plane strain   KIII anti-plane shear",
+                "     1     5.0000E+07       5.2000E+07        0.0000E+00        0.0000E+00          0.0000E+00",
+                "     2     5.4000E+07       5.6000E+07        0.0000E+00        0.0000E+00          0.0000E+00",
+                "",
+                "               Static I-values",
+                "                          -- KI = 1, KII = 0, KIII = 0, plane strain --",
+                " domain        II1          II2          II3          II4          II5          II6          II7          II8       total I     KI (pstrn) killed ele",
+                "     1     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   5.0000E+07   (  0)",
+                "     2     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   5.2000E+07   (  0)",
+                "    average:  5.1000E+07   minimum:  5.0000E+07   maximum: 5.2000E+07     (cf_0001)",
+                "  5.1000E+07  5.0000E+07  5.2000E+07",
+                "",
+                "                          --T-stress (\"plane strain\" auxiliary fields)--",
+                " domain        II1          II2          II3          II4          II5          II6          II7          II8       total I     T11 (pstrn)      T33     killed ele",
+                "     1     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00  -1.4000E+07  -4.0000E+06   (  0)",
+                "     2     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00  -1.6000E+07  -5.0000E+06   (  0)",
+                "    average:     minimum:     maximum:     (cf_0001)",
+                " -1.5000E+07 -1.4000E+07 -1.6000E+07",
+                " -4.5000E+06 -4.0000E+06 -5.0000E+06",
+            ];
+
+            #[cfg(windows)]
+            {
+                let ps_ok = dir.join("mock_frac.ps1");
+                let escaped_lines: Vec<String> = domain_stdout_lines.iter().map(|l| l.replace('\'', "''")).collect();
+                let domain_block = escaped_lines.join("`n");
+                let body = format!(
+                    "$stdinText = [Console]::In.ReadToEnd()\n\
+                     if ($stdinText -notmatch 'compute domain interaction integral') {{ Write-Error 'missing domain integral command'; exit 2 }}\n\
+                     $wnd = (1..8 | ForEach-Object {{ if ($_ -in 2,3,6,7) {{ '5.0e-4 0.0 0.0' }} else {{ '0.0 0.0 0.0' }} }}) -join \"`n\"\n\
+                     $wnr = (1..8 | ForEach-Object {{ if ($_ -in 1,4,5,8) {{ '-25000.0 0.0 0.0' }} else {{ '0.0 0.0 0.0' }} }}) -join \"`n\"\n\
+                     $wns = (1..8 | ForEach-Object {{ '{stress_row}' }}) -join \"`n\"\n\
+                     $wes = '{elem_row}'\n\
+                     Set-Content -Path 'wnd0000001_text' -Value \"#`n$wnd\"\n\
+                     Set-Content -Path 'wnr0000001_text' -Value \"#`n$wnr\"\n\
+                     Set-Content -Path 'wns0000001_text' -Value \"#`n$wns\"\n\
+                     Set-Content -Path 'wes0000001_text' -Value \"#`n$wes\"\n\
+                     Write-Output '{domain_block}'\n"
+                );
+                std::fs::write(&ps_ok, body).unwrap();
+                let ok_cmd = dir.join("mock_frac.cmd");
+                std::fs::write(&ok_cmd, format!("@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n", ps_ok.display()))
+                    .unwrap();
+                ok_cmd
+            }
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let sh = dir.join("mock_frac.sh");
+                let domain_text = domain_stdout_lines.join("\n");
+                let domain_path = dir.join("domain_stdout.txt");
+                std::fs::write(&domain_path, format!("{domain_text}\n")).unwrap();
+                let body = format!(
+                    "#!/bin/sh\nset -e\n\
+                     stdin_file=\"$(pwd)/stdin_deck.inp\"\n\
+                     cat > \"$stdin_file\"\n\
+                     grep -q 'compute domain interaction integral' \"$stdin_file\"\n\
+                     printf '#\\n0 0 0\\n5.0e-4 0 0\\n5.0e-4 0 0\\n0 0 0\\n0 0 0\\n5.0e-4 0 0\\n5.0e-4 0 0\\n0 0 0\\n' > wnd0000001_text\n\
+                     printf '#\\n-25000.0 0 0\\n0 0 0\\n0 0 0\\n-25000.0 0 0\\n-25000.0 0 0\\n0 0 0\\n0 0 0\\n-25000.0 0 0\\n' > wnr0000001_text\n\
+                     printf '#\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n' > wns0000001_text\n\
+                     printf '#\\n{e}\\n' > wes0000001_text\n\
+                     cat \"{d}\"\n",
+                    s = stress_row,
+                    e = elem_row,
+                    d = domain_path.display(),
+                );
+                std::fs::write(&sh, body).unwrap();
+                let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&sh, perms).unwrap();
+                sh
+            }
+        }
+
+        if let Some(mode) = std::env::var_os("FIELDCRAFT_WARP3D_FRAC_CHILD") {
+            assert_eq!(mode, "run");
+            let mm = DisplaySystem::new(fieldcraft_model::units::Preset::MmTonneS);
+            let k_scale_mm = crate::units::stress_sqrt_length_scale(crate::units::si(), &mm).0;
+            let expected_ki_mm = 51.0e6 * k_scale_mm;
+            let expected_kj_pstrn_mm = 54.0e6 * k_scale_mm;
+
+            // 1. solve.static with crack_front -> returns display fracture + stores SI in Session (no k_unit).
+            let mut s_lin = hex8_crack_model(false);
+            let r_lin = s_lin
+                .execute(
+                    "solve.static",
+                    &json!({
+                        "step": "Pull",
+                        "backend": "warp3d",
+                        "crack_front": {"set": "front", "normal": [0, 1, 0], "rings": 2, "interaction_integral": true}
+                    }),
+                )
+                .unwrap();
+            assert_eq!(r_lin["backend"], "warp3d");
+            assert!(r_lin.get("k_unit").is_none());
+            assert_eq!(r_lin["units"]["stress_intensity"], "MPa·√mm");
+            assert_eq!(r_lin["units"]["force_per_length"], "N/mm");
+            assert_eq!(r_lin["units"]["area"], "mm²");
+            let f_lin = &r_lin["fracture"][0];
+            assert_eq!(f_lin["domain_id"], "cf_0001");
+            assert_eq!(f_lin["front_nodes"], json!([2]));
+            assert!((f_lin["area_aq"].as_f64().unwrap() - 25.0).abs() < 1e-12);
+            assert!((f_lin["j_mean"].as_f64().unwrap() - 12.0).abs() < 1e-12);
+            assert!((f_lin["j_min"].as_f64().unwrap() - 11.5).abs() < 1e-12);
+            assert!((f_lin["j_max"].as_f64().unwrap() - 12.5).abs() < 1e-12);
+            assert!((f_lin["ring_spread"].as_f64().unwrap() - (1000.0 / 12000.0)).abs() < 1e-12);
+            assert!((f_lin["t_11_mean"].as_f64().unwrap() - (-15.0)).abs() < 1e-9);
+            assert!((f_lin["t_33_mean"].as_f64().unwrap() - (-4.5)).abs() < 1e-9);
+            assert!((f_lin["k_i_mean"].as_f64().unwrap() - expected_ki_mm).abs() < 1e-9);
+            assert!((f_lin["k_j_plane_strain"].as_f64().unwrap() - expected_kj_pstrn_mm).abs() < 1e-9);
+
+            // Session::fracture_results stays in SI.
+            let stored = s_lin.fracture_results("Pull").unwrap();
+            assert_eq!(stored.len(), 1);
+            assert!((stored[0].j_mean - 12_000.0).abs() < 1e-9);
+            assert!((stored[0].area_aq - 2.5e-5).abs() < 1e-15);
+
+            // 2. solve.probe no longer attaches fracture data or k_unit.
+            let probe_mm = s_lin.execute("solve.probe", &json!({"step": "Pull", "nodes": [2]})).unwrap();
+            assert!(probe_mm.get("k_unit").is_none());
+            assert!(probe_mm.get("fracture").is_none());
+            assert!(probe_mm["units"].get("stress_intensity").is_none());
+
+            // Switching units with model.units + undo preserves fracture_results via refresh_results().
+            s_lin.execute("model.units", &json!({"system": "m-kg-s-N-Pa"})).unwrap();
+            assert!(s_lin.fracture_results("Pull").is_some());
+            s_lin.execute("edit.undo", &json!({})).unwrap();
+            assert!(s_lin.fracture_results("Pull").is_some());
+
+            // 3. Editing the crack-front Set invalidates fracture_results; undoing restores it.
+            s_lin.execute("model.set.edit", &json!({"name": "front", "nodes": [2, 6]})).unwrap();
+            assert!(s_lin.fracture_results("Pull").is_none());
+            s_lin.execute("edit.undo", &json!({})).unwrap();
+            assert!(s_lin.fracture_results("Pull").is_some());
+
+            // General model edit invalidates both result and fracture_results; undoing restores them.
+            s_lin.execute("mesh.node.add", &json!({"label": 99, "xyz": [500, 500, 500]})).unwrap();
+            assert!(s_lin.fracture_results("Pull").is_none());
+            assert!(s_lin.execute("solve.probe", &json!({"step": "Pull", "nodes": [2]})).is_err());
+            s_lin.execute("edit.undo", &json!({})).unwrap();
+            assert!(s_lin.fracture_results("Pull").is_some());
+
+            // 4. Re-solving natively clears previous fracture_results for that step.
+            s_lin.execute("solve.static", &json!({"step": "Pull", "backend": "native"})).unwrap();
+            assert!(s_lin.fracture_results("Pull").is_none());
+            let probe_native = s_lin.execute("solve.probe", &json!({"step": "Pull", "nodes": [2]})).unwrap();
+            assert!(probe_native.get("fracture").is_none());
+            assert!(probe_native.get("k_unit").is_none());
+
+            // 5. solve.nonlinear with crack_front + file.new replace_with clearing.
+            let mut s_nl = hex8_crack_model(true);
+            let r_nl = s_nl
+                .execute(
+                    "solve.nonlinear",
+                    &json!({
+                        "step": "Pull",
+                        "backend": "warp3d",
+                        "crack_front": {"set": "front", "normal": [0, 1, 0], "rings": 2, "interaction_integral": true}
+                    }),
+                )
+                .unwrap();
+            assert!(r_nl.get("k_unit").is_none());
+            assert_eq!(r_nl["units"]["stress_intensity"], "MPa·√mm");
+            assert!((r_nl["fracture"][0]["j_mean"].as_f64().unwrap() - 12.0).abs() < 1e-12);
+            s_nl.execute("file.new", &json!({})).unwrap();
+            assert!(s_nl.fracture_results("Pull").is_none());
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("fieldcraft-solve-fracture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = write_mock_fracture_bin(&dir);
+        let test_name = format!(
+            "{}::solve_warp3d_fracture_integrals_probe_units_and_invalidation",
+            module_path!().strip_prefix("fieldcraft_engine::").unwrap_or(module_path!())
+        );
+
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg(&test_name)
+            .arg("--nocapture")
+            .env("FIELDCRAFT_WARP3D_FRAC_CHILD", "run")
+            .env("FIELDCRAFT_WARP3D_BIN", &bin)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "child failed:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(stdout.contains("1 passed"), "child did not match exact test `{test_name}`:\n{stdout}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn structural_backend_env_isolation_form_hint_and_solve_run_fallback() {
+        #[allow(clippy::unwrap_used)]
+        fn write_mock_ok_script(dir: &std::path::Path) -> std::path::PathBuf {
+            let stress_row = vec!["0.0"; 26].join(" ");
+            #[cfg(windows)]
+            {
+                let ps_ok = dir.join("mock_ok.ps1");
+                let body = format!(
+                    "$null = [Console]::In.ReadToEnd()\n\
+                     $wnd = (1..8 | ForEach-Object {{ '0.0 0.0 0.0' }}) -join \"`n\"\n\
+                     $wnr = $wnd\n\
+                     $wns = (1..8 | ForEach-Object {{ '{stress_row}' }}) -join \"`n\"\n\
+                     Set-Content -Path 'wnd0000001_text' -Value \"#`n$wnd\"\n\
+                     Set-Content -Path 'wnr0000001_text' -Value \"#`n$wnr\"\n\
+                     Set-Content -Path 'wns0000001_text' -Value \"#`n$wns\"\n\
+                     Set-Content -Path 'wes0000001_text' -Value \"#`n{stress_row}\"\n"
+                );
+                std::fs::write(&ps_ok, body).unwrap();
+                let ok_cmd = dir.join("mock_ok.cmd");
+                std::fs::write(&ok_cmd, format!("@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n", ps_ok.display()))
+                    .unwrap();
+                ok_cmd
+            }
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let ok_sh = dir.join("mock_ok.sh");
+                let ok_body = format!(
+                    "#!/bin/sh\nset -e\ncat >/dev/null\n\
+                     printf '#\\n0 0 0\\n0 0 0\\n0 0 0\\n0 0 0\\n0 0 0\\n0 0 0\\n0 0 0\\n0 0 0\\n' > wnd0000001_text\n\
+                     printf '#\\n0 0 0\\n0 0 0\\n0 0 0\\n0 0 0\\n0 0 0\\n0 0 0\\n0 0 0\\n0 0 0\\n' > wnr0000001_text\n\
+                     printf '#\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n{s}\\n' > wns0000001_text\n\
+                     printf '#\\n{s}\\n' > wes0000001_text\n",
+                    s = stress_row
+                );
+                std::fs::write(&ok_sh, ok_body).unwrap();
+                let mut perms = std::fs::metadata(&ok_sh).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&ok_sh, perms).unwrap();
+                ok_sh
+            }
+        }
+
+        if let Some(mode) = std::env::var_os("FIELDCRAFT_STRUCT_ISO_CHILD") {
+            let mode = mode.to_string_lossy();
+            let mut s = Session::default();
+            s.run_script(&json!([
+                {"command": "model.units", "params": {"system": "m-kg-s-N-Pa"}},
+                {"command": "mesh.node.add", "params": {"label": 1, "xyz": [0, 0, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 2, "xyz": [1, 0, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 3, "xyz": [1, 1, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 4, "xyz": [0, 1, 0]}},
+                {"command": "mesh.node.add", "params": {"label": 5, "xyz": [0, 0, 1]}},
+                {"command": "mesh.node.add", "params": {"label": 6, "xyz": [1, 0, 1]}},
+                {"command": "mesh.node.add", "params": {"label": 7, "xyz": [1, 1, 1]}},
+                {"command": "mesh.node.add", "params": {"label": 8, "xyz": [0, 1, 1]}},
+                {"command": "mesh.element.add", "params": {"label": 1, "kind": "hex8", "nodes": [1, 2, 3, 4, 5, 6, 7, 8]}},
+                {"command": "model.set.create", "params": {"name": "all", "elements": [1]}},
+                {"command": "model.set.create", "params": {"name": "fix", "nodes": [1, 4, 5, 8]}},
+                {"command": "model.set.create", "params": {"name": "tip", "nodes": [2, 3, 6, 7]}},
+                {
+                    "command": "model.material.create",
+                    "params": {
+                        "name": "Steel",
+                        "elastic": {"type": "isotropic", "young": 2.0e11, "poisson": 0.3},
+                        "thermal": {"conductivity": 50.0}
+                    }
+                },
+                {"command": "model.section.create", "params": {"name": "solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+                {"command": "model.boundary_condition.create", "params": {"name": "clamp", "type": "fixed", "target": {"set": "fix"}}},
+                {"command": "model.boundary_condition.create", "params": {"name": "held_t", "type": "temperature", "target": {"set": "fix"}, "value": 80.0}},
+                {"command": "model.load.create", "params": {"name": "pull", "type": "force", "target": {"set": "tip"}, "vector": [100.0, 0.0, 0.0]}},
+                {"command": "model.step.create", "params": {"name": "Mech", "procedure": {"type": "static"}, "boundary_conditions": ["clamp"], "loads": ["pull"]}},
+                {"command": "model.step.create", "params": {"name": "Coupled", "procedure": {"type": "coupled_temperature_displacement"}, "boundary_conditions": ["clamp", "held_t"], "loads": ["pull"]}}
+            ]))
+            .unwrap();
+
+            match mode.as_ref() {
+                "bogus_structural" => {
+                    let err = s.execute("solve.static", &json!({"step": "Mech"})).unwrap_err();
+                    assert!(matches!(&err, EngineError::Params(_)), "expected EngineError::Params, got {err}");
+                    assert!(err.to_string().contains("FIELDCRAFT_STRUCTURAL_BACKEND") && err.to_string().contains("bogus"), "{err}");
+                }
+                "fluid_env_ignored_by_structural" => {
+                    // FIELDCRAFT_SOLVE_BACKEND=warp3d must NOT steer solve.static away from native.
+                    let r = s.execute("solve.static", &json!({"step": "Mech"})).unwrap();
+                    assert!(r.get("backend").is_none(), "expected native solve without backend=\"warp3d\", got {r}");
+                }
+                "structural_env_ignored_by_fluid" => {
+                    // FIELDCRAFT_STRUCTURAL_BACKEND=warp3d must NOT affect solve.fluid.
+                    let mut sf = Session::default();
+                    sf.run_script(&json!([
+                        {"command": "model.units", "params": {"system": "m-kg-s-N-Pa"}},
+                        {"command": "model.material.create", "params": {"name": "Air", "density": 1.2, "fluid": {"type": "newtonian", "viscosity": 1.8e-5}}},
+                        {"command": "model.fluid_domain.create", "params": {"name": "Flow", "material": "Air", "min": [0, 0, 0], "max": [1, 1, 1], "spacing": 0.5}},
+                        {"command": "model.step.create", "params": {"name": "FlowStep", "procedure": {"type": "fluid", "domain": "Flow", "end_time": 0.01}}}
+                    ]))
+                    .unwrap();
+                    let est = sf.execute("solve.fluid", &json!({"step": "FlowStep", "estimate": true})).unwrap();
+                    assert_eq!(est["memory"]["backend"], "cpu", "{est}");
+                }
+                "mixed_solve_run" => {
+                    // FIELDCRAFT_STRUCTURAL_BACKEND=warp3d with mock bin: Static runs on WARP3D,
+                    // CoupledTemperatureDisplacement falls back to native with a notice.
+                    let r = s.execute("solve.run", &json!({})).unwrap();
+                    let steps = r["steps"].as_array().unwrap();
+                    assert_eq!(steps.len(), 2);
+                    assert_eq!(steps[0]["step"], "Mech");
+                    assert_eq!(steps[0]["summary"]["backend"], "warp3d");
+                    assert!(steps[0]["summary"].get("notice").is_none());
+                    assert_eq!(steps[1]["step"], "Coupled");
+                    assert!(steps[1]["summary"].get("backend").is_none());
+                    let notice = steps[1]["summary"]["notice"].as_str().unwrap();
+                    assert!(notice.contains("Coupled") && notice.contains("fell back to native solver"), "{notice}");
+                }
+                other => panic!("unknown child mode {other}"),
+            }
+            return;
+        }
+
+        // Verify form schema has no `.def("\"native\"")` and advertises FIELDCRAFT_STRUCTURAL_BACKEND.
+        for form in [crate::cmd::forms::SOLVE_STATIC, crate::cmd::forms::SOLVE_NONLINEAR] {
+            let f = form.iter().find(|f| f.key == "backend").unwrap();
+            assert!(f.default.is_none());
+            assert!(f.hint.contains("FIELDCRAFT_STRUCTURAL_BACKEND"));
+        }
+
+        let dir = std::env::temp_dir().join(format!("fieldcraft-struct-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok_bin = write_mock_ok_script(&dir);
+
+        let test_name = format!(
+            "{}::structural_backend_env_isolation_form_hint_and_solve_run_fallback",
+            module_path!().strip_prefix("fieldcraft_engine::").unwrap_or(module_path!())
+        );
+        let exe = std::env::current_exe().unwrap();
+
+        for (mode, envs) in [
+            ("bogus_structural", vec![("FIELDCRAFT_STRUCTURAL_BACKEND", "bogus")]),
+            ("fluid_env_ignored_by_structural", vec![("FIELDCRAFT_SOLVE_BACKEND", "warp3d")]),
+            ("structural_env_ignored_by_fluid", vec![("FIELDCRAFT_STRUCTURAL_BACKEND", "warp3d")]),
+            ("mixed_solve_run", vec![("FIELDCRAFT_STRUCTURAL_BACKEND", "warp3d")]),
+        ] {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.arg("--exact").arg(&test_name).arg("--nocapture").env("FIELDCRAFT_STRUCT_ISO_CHILD", mode).env("FIELDCRAFT_WARP3D_BIN", &ok_bin);
+            cmd.env_remove("FIELDCRAFT_SOLVE_BACKEND");
+            cmd.env_remove("FIELDCRAFT_STRUCTURAL_BACKEND");
+            for (k, v) in envs {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "mode `{mode}` failed:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            assert!(stdout.contains("1 passed"), "mode `{mode}` did not match exact test `{test_name}`:\n{stdout}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

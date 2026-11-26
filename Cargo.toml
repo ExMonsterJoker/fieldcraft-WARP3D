@@ -21,6 +21,7 @@ fieldcraft-io = { path = "crates/io" }
 fieldcraft-fem = { path = "crates/fem" }
 fieldcraft-solver = { path = "crates/solver" }
 fieldcraft-explicit = { path = "crates/explicit" }
+fieldcraft-warp3d = { path = "crates/warp3d" }
 fieldcraft-lbm = { path = "crates/lbm" }
 fieldcraft-engine = { path = "crates/engine" }
 fieldcraft-testkit = { path = "crates/testkit" }

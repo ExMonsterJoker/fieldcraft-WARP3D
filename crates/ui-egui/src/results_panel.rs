@@ -5,7 +5,7 @@
 //! frames). Numbers go through one formatter ([`crate::results::number`]), in the display
 //! units ([`Plot::units`]): the result is stored in SI and converted here as it is shown.
 
-use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, pos2, vec2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, pos2, vec2};
 use fieldcraft_engine::results::{ComponentCheck, Field, FluidResult, Kind, Quantity, shown as shown_in, true_scale, unit_of, with_unit as titled};
 use fieldcraft_explicit::{Energies, ExplicitResult};
 use serde_json::{Value, json};
@@ -536,6 +536,11 @@ fn rows(app: &mut ModelApp, plot: &Plot, ui: &mut egui::Ui, t: &Tokens) {
         });
         if let Some(r) = app.reactions.as_ref().filter(|r| r["step"] == plot.view.step.as_str()) {
             reactions_table(ui, r, plot);
+        }
+        if let Some(domains) = app.session.fracture_results(&plot.view.step).filter(|d| !d.is_empty())
+            && let Some(p) = fracture_section(ui, domains, &plot.units, &plot.view.step, t)
+        {
+            export = Some(p);
         }
     }
     let mut xy_export = None;
@@ -1274,6 +1279,99 @@ fn reactions_table(ui: &mut egui::Ui, r: &Value, plot: &Plot) {
             kit::check_status_line(ui, "fc_results_reactions:balance", &text, kit::CheckStatus::Warning);
         }
     }
+}
+
+/// Active-step WARP3D 3D fracture domain-integral summary converted into `units`, plus CSV export.
+fn fracture_section(
+    ui: &mut egui::Ui,
+    domains: &[fieldcraft_engine::results::DomainIntegralResult],
+    units: &fieldcraft_model::DisplaySystem,
+    step: &str,
+    t: &Tokens,
+) -> Option<Value> {
+    let j_unit = unit_of(Quantity::ForcePerLength, units);
+    let (k_scale, k_unit) = fieldcraft_engine::units::stress_sqrt_length_scale(fieldcraft_engine::units::si(), units);
+    let express_j = |j: f64| shown_in(Quantity::ForcePerLength, j, units);
+    let j_min = domains.iter().map(|d| express_j(d.j_mean)).filter(|v| v.is_finite()).fold(f64::INFINITY, f64::min);
+    let j_max = domains.iter().map(|d| express_j(d.j_mean)).filter(|v| v.is_finite()).fold(f64::NEG_INFINITY, f64::max);
+    let max_spread = domains.iter().map(|d| d.ring_spread).filter(|v| v.is_finite()).fold(0.0_f64, f64::max);
+    let has_ki = domains.iter().any(|d| d.k_i_mean.is_some_and(f64::is_finite));
+    let has_kj = !has_ki && domains.iter().any(|d| d.k_j_plane_strain.is_some_and(f64::is_finite));
+    let k_label = if has_ki {
+        Some("K_I")
+    } else if has_kj {
+        Some("K_J")
+    } else {
+        None
+    };
+    let k_of = |d: &fieldcraft_engine::results::DomainIntegralResult| {
+        if has_ki {
+            d.k_i_mean
+        } else if has_kj {
+            d.k_j_plane_strain
+        } else {
+            None
+        }
+    };
+    let k_range = k_label.and_then(|label| {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for v in domains.iter().filter_map(k_of).map(|v| v * k_scale).filter(|v| v.is_finite()) {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        (lo <= hi).then_some((label, lo, hi))
+    });
+
+    ui.separator();
+    let mut export = false;
+    egui::CollapsingHeader::new(RichText::new(format!("Fracture Integrals ({})", domains.len())).size(12.0))
+        .id_salt("fc_results_fracture")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new("fc_results_fracture_summary").num_columns(2).spacing(vec2(8.0, 2.0)).show(ui, |ui| {
+                ui.label(RichText::new("Stations").color(t.text_dim));
+                ui.label(count(domains.len() as u64));
+                ui.end_row();
+                if j_min <= j_max {
+                    ui.label(RichText::new("J range").color(t.text_dim));
+                    ui.label(with_unit(format!("{} – {}", number(j_min), number(j_max)), j_unit.as_deref()));
+                    ui.end_row();
+                }
+                if let Some((label, lo, hi)) = k_range {
+                    ui.label(RichText::new(format!("{label} range")).color(t.text_dim));
+                    ui.label(with_unit(format!("{} – {}", number(lo), number(hi)), Some(k_unit.as_str())));
+                    ui.end_row();
+                }
+                ui.label(RichText::new("Max spread").color(t.text_dim));
+                ui.label(number(max_spread));
+                ui.end_row();
+            });
+            egui::ScrollArea::horizontal().id_salt("fc_results_fracture_scroll").show(ui, |ui| {
+                egui::Grid::new("fc_results_fracture_grid").striped(true).spacing(vec2(8.0, 2.0)).show(ui, |ui| {
+                    ui.label(RichText::new("Domain").small().color(t.text_dim));
+                    ui.label(RichText::new("s").small().color(t.text_dim));
+                    ui.label(RichText::new(titled("J", j_unit.as_deref())).small().color(t.text_dim));
+                    if let Some(label) = k_label {
+                        ui.label(RichText::new(titled(label, Some(k_unit.as_str()))).small().color(t.text_dim));
+                    }
+                    ui.label(RichText::new("Spread").small().color(t.text_dim));
+                    ui.end_row();
+                    for d in domains.iter().take(200) {
+                        ui.label(d.domain_id.as_str());
+                        ui.label(d.s_position.filter(|v| v.is_finite()).map_or_else(|| "—".into(), number));
+                        ui.label(number(express_j(d.j_mean)));
+                        if k_label.is_some() {
+                            ui.label(k_of(d).map(|v| v * k_scale).filter(|v| v.is_finite()).map_or_else(|| "—".into(), number));
+                        }
+                        ui.label(if d.ring_spread.is_finite() { number(d.ring_spread) } else { "—".into() });
+                        ui.end_row();
+                    }
+                });
+            });
+            export = ui.button("Export CSV…").on_hover_text("Write the fracture domain integrals to a CSV file (results.export.csv)").clicked();
+        });
+    export.then(|| json!({"what": "fracture", "step": step}))
 }
 
 #[cfg(test)]

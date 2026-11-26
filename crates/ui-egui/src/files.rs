@@ -210,6 +210,7 @@ fn kind_of_command(command: &str) -> Option<Kind> {
 /// large), run as a job off the window thread.
 pub fn is_long(command: &str) -> bool {
     BACKGROUND.contains(&command)
+        || SOLVE_BACKGROUND.contains(&command)
         || opens(command)
         || matches!(
             command,
@@ -245,6 +246,10 @@ pub const BACKGROUND: &[&str] = &[
     "geometry.partition",
     "results.path",
 ];
+
+/// Structural solve and external result commands executed on a lightweight read-only model worker
+/// (`Product::SolvedStep`, avoiding `History`/`Design` clones and `Prebuilt` rebuilds).
+pub const SOLVE_BACKGROUND: &[&str] = &["solve.static", "solve.nonlinear", "results.read"];
 
 /// Most entries the recent-files list keeps, and the longest path it keeps.
 pub const MAX_RECENT: usize = 10;
@@ -431,6 +436,10 @@ pub struct Loading {
     recent: Option<String>,
     /// The command form that started it: closed when it succeeds, showing the error when not.
     form: Option<&'static str>,
+    /// The parameters submitted with the job (`apply_command_reply` / `params_with_units`).
+    params: Value,
+    /// True when `Use selection` created a pending set before launching this job.
+    pending_set_created: bool,
     /// The finished session copy and the command's reply.
     rx: Inbox<Finished>,
     /// The work, while it waits to run on the window thread (the web, which has no threads).
@@ -541,6 +550,7 @@ pub fn elapsed(seconds: f64) -> String {
 pub struct Opened {
     /// The command the job ran.
     command: &'static str,
+    params: Value,
     session: Box<Session>,
     /// The session's display data, built with it.
     prebuilt: Box<Prebuilt>,
@@ -582,6 +592,8 @@ impl Replace {
 pub enum Prompt {
     /// Opening a model or a sample discards the current one's unsaved changes.
     Unsaved(Replace),
+    /// Opening/restarting would discard session-only WARP3D fracture domain integrals not saved in `.fieldcraft`.
+    UnpersistedFracture(Replace),
     /// Autosaved models to recover (`file.recovery.list`).
     Recover,
     /// The samples to open (`file.sample`).
@@ -627,6 +639,14 @@ pub enum Answer {
     Cancel,
 }
 
+/// The answer to [`Prompt::UnpersistedFracture`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FracturePromptAnswer {
+    Export,
+    Discard,
+    Cancel,
+}
+
 /// The file name a model is saved under by default.
 /// The document's name: its file's, else the sample it was opened as ("Cantilever (sample)").
 fn model_name(session: &Session) -> String {
@@ -653,7 +673,7 @@ pub(crate) fn off_thread(name: String, work: impl FnOnce() + Send + 'static) {
 type Work = Box<dyn FnOnce() + Send>;
 
 /// What a background job sends back: the command's reply and what it made, or why it failed.
-type Finished = Result<(Value, Product), String>;
+type Finished = Result<(Value, Product), crate::Failure>;
 
 /// What a successful background job hands the window.
 enum Product {
@@ -662,6 +682,24 @@ enum Product {
     /// A read-only query ([`reads_only`]) leaves the model as it was: only the path plot and its
     /// search index come back, so the window keeps its session and its display.
     PathPlot(Option<Arc<fieldcraft_engine::path::Plot>>, fieldcraft_engine::path::Cache),
+    /// A lightweight structural solve or external result read (`SOLVE_BACKGROUND`) merges the
+    /// solved step and optional fracture data back into the live session in place.
+    SolvedStep {
+        result: Arc<fieldcraft_engine::StepResult>,
+        fracture: Option<(Vec<fieldcraft_engine::results::DomainIntegralResult>, Option<String>)>,
+        opened: u64,
+        revision: u64,
+    },
+}
+
+fn failure_from_engine(e: fieldcraft_engine::EngineError) -> crate::Failure {
+    match e {
+        fieldcraft_engine::EngineError::Param(p) => {
+            let shown = p.for_form();
+            crate::Failure { refused: Some((p.path, shown.clone())), message: shown }
+        }
+        other => crate::Failure { message: other.to_string(), refused: None },
+    }
 }
 
 /// Whether a background `command` only reads the model: its job returns the view state it made
@@ -704,7 +742,7 @@ fn spawn(
         Box::new(move || {
             let mut s = session;
             #[allow(clippy::disallowed_methods, reason = "the job's worker thread")]
-            let r = fieldcraft_model::progress::scoped(Some(progress), || s.execute(command, &params)).map_err(|e| e.to_string());
+            let r = fieldcraft_model::progress::scoped(Some(progress), || s.execute(command, &params)).map_err(failure_from_engine);
             let r = r.map(|v| {
                 if reads_only(command) {
                     // The session copy is dropped here, on the worker, not in a frame.
@@ -714,6 +752,31 @@ fn spawn(
                     let prebuilt = Box::new(Prebuilt::of(&s, &drawn));
                     (v, Product::Session(Box::new(s), prebuilt))
                 }
+            });
+            let _ = tx.send(r);
+        }),
+    );
+    (rx, work)
+}
+
+/// Run a `SOLVE_BACKGROUND` command on a lightweight snapshot without cloning `History` or `Design`.
+fn spawn_solve(session: &Session, command: &'static str, params: Value, progress: Arc<Progress>) -> (Inbox<Finished>, Option<Work>) {
+    let (tx, rx) = crate::inbox::channel();
+    let worker_session = session.lightweight_solve_session();
+    let (opened, revision) = (session.opened(), session.revision());
+    let work = start(
+        format!("fieldcraft {command}"),
+        Box::new(move || {
+            let mut s = worker_session;
+            #[allow(clippy::disallowed_methods, reason = "the job's worker thread")]
+            let r = fieldcraft_model::progress::scoped(Some(progress), || s.execute(command, &params)).map_err(failure_from_engine);
+            let r = r.and_then(|v| {
+                let step =
+                    v.get("step").and_then(Value::as_str).or_else(|| params.get("step").and_then(Value::as_str)).unwrap_or_default().to_string();
+                let (result, fracture) = s
+                    .take_solved_step(&step)
+                    .ok_or_else(|| crate::Failure { message: format!("worker did not produce a stored result for `{step}`"), refused: None })?;
+                Ok((v, Product::SolvedStep { result, fracture, opened, revision }))
             });
             let _ = tx.send(r);
         }),
@@ -808,7 +871,11 @@ impl ModelApp {
                 let saved = self.run("file.save_as", params).is_ok();
                 self.saved_to_recent(saved);
                 if saved && let Some(next) = next {
-                    self.replace_after_save(next);
+                    if self.session.has_unpersisted_fracture() {
+                        self.prompt = Some(Prompt::UnpersistedFracture(next));
+                    } else {
+                        self.replace_after_save(next);
+                    }
                 }
                 saved
             }
@@ -856,10 +923,22 @@ impl ModelApp {
         Err(e)
     }
 
-    /// Run `command` in the background; the session it ran on replaces this one when it
-    /// succeeds. A command that brings a whole model (`fresh`: opening a model, recovering one)
-    /// starts from an empty session, the others from a copy of this one. One at a time.
-    fn begin_job(&mut self, command: &'static str, mut params: Value, title: String, done: String, recent: Option<String>) -> bool {
+    /// Run `command` in the background; `SOLVE_BACKGROUND` runs on a lightweight snapshot without
+    /// cloning `History` or `Design` (`Product::SolvedStep`), while `BACKGROUND` / `opens` run on
+    /// a session copy replacing this one when they succeed.
+    fn begin_job(&mut self, command: &'static str, params: Value, title: String, done: String, recent: Option<String>) -> bool {
+        self.begin_job_inner(command, params, title, done, recent, false)
+    }
+
+    fn begin_job_inner(
+        &mut self,
+        command: &'static str,
+        mut params: Value,
+        title: String,
+        done: String,
+        recent: Option<String>,
+        pending_set_created: bool,
+    ) -> bool {
         if self.ensure_idle().is_err() {
             return false;
         }
@@ -867,24 +946,42 @@ impl ModelApp {
         // with the same work caps and file access, as the engine keeps them when a command
         // replaces the session, and the window's count of camera requests.
         self.freeze_deck_units(command, &mut params);
-        let base = if fresh(command) { self.session.empty_like() } else { self.session.clone() };
         let progress = Progress::new();
-        let (rx, pending) = spawn(base, command, params, progress.clone(), self.bodies.0.clone());
+        let (rx, pending) = if SOLVE_BACKGROUND.contains(&command) {
+            spawn_solve(&self.session, command, params.clone(), progress.clone())
+        } else {
+            let base = if fresh(command) { self.session.empty_like() } else { self.session.clone() };
+            spawn(base, command, params.clone(), progress.clone(), self.bodies.0.clone())
+        };
         self.set_status(format!("{title}…"), false);
         let started = web_time::Instant::now();
-        self.loading = Some(Loading { title, done, recent, form: None, rx, pending, shown: false, command, progress, started, waiters: Vec::new() });
+        self.loading = Some(Loading {
+            title,
+            done,
+            recent,
+            form: None,
+            params,
+            pending_set_created,
+            rx,
+            pending,
+            shown: false,
+            command,
+            progress,
+            started,
+            waiters: Vec::new(),
+        });
         true
     }
 
-    /// The form's OK: run its command, in the background for meshers and deck imports
-    /// ([`BACKGROUND`]) so the window keeps drawing with Cancel; the form closes when the
-    /// command succeeds and shows the error when it fails.
-    /// A mesher that would replace a body's mesh asks first ([`Prompt::ReplaceMesh`]).
+    /// The form's OK: run its command, in the background for meshers, deck imports
+    /// ([`BACKGROUND`]), and structural solves/reads ([`SOLVE_BACKGROUND`]) so the window keeps
+    /// drawing with Cancel; the form closes when the command succeeds and shows the error when it
+    /// fails. A mesher that would replace a body's mesh asks first ([`Prompt::ReplaceMesh`]).
     pub fn submit_dialog(&mut self) {
         let Ok((command, mut params)) = self.dialog_params() else { return };
         if command == "deck.read" && self.has_unsaved_work() {
             self.freeze_deck_units(command, &mut params);
-            self.prompt = Some(Prompt::Unsaved(Replace::Deck(params)));
+            self.prompt_unsaved_or_fracture(Replace::Deck(params));
             return;
         }
         if let Some(r) = fieldcraft_engine::replacement(&self.session, command, &params) {
@@ -908,12 +1005,13 @@ impl ModelApp {
     /// The form's OK once confirmed.
     fn submit_now(&mut self) {
         let Some(command) = self.dialog.as_ref().map(|d| d.command) else { return };
-        if !BACKGROUND.contains(&command) {
+        if !BACKGROUND.contains(&command) && !SOLVE_BACKGROUND.contains(&command) {
             let _ = self.run_dialog();
             return;
         }
         let Ok((command, params)) = self.dialog_params() else { return };
-        self.submit_background(command, params);
+        let Ok(pending_set_created) = self.create_pending_set(&params) else { return };
+        self.submit_background_inner(command, params, pending_set_created);
     }
 
     /// Preserve the input preset before a fresh job drops the current model. Display overrides
@@ -927,7 +1025,11 @@ impl ModelApp {
         }
     }
 
-    fn submit_background(&mut self, command: &'static str, params: Value) {
+    pub(crate) fn submit_background(&mut self, command: &'static str, params: Value) {
+        self.submit_background_inner(command, params, false);
+    }
+
+    fn submit_background_inner(&mut self, command: &'static str, params: Value, pending_set_created: bool) {
         let label = crate::command_label(command).to_string();
         // A file opened from its form says so as a dropped one does ("Opened box.fieldcraft"),
         // and is a recent file too (A4-6).
@@ -939,10 +1041,12 @@ impl ModelApp {
             }
             _ => (label.clone(), format!("{label} done")),
         };
-        if self.begin_job(command, params, title, done, path)
+        if self.begin_job_inner(command, params, title, done, path, pending_set_created)
             && let Some(l) = self.loading.as_mut()
         {
             l.form = Some(command);
+        } else if pending_set_created {
+            self.rollback_pending_set();
         }
     }
 
@@ -984,10 +1088,26 @@ impl ModelApp {
         }
     }
 
-    /// Whether replacing the model would lose work: edits, or a still-unsaved imported deck
-    /// whose history was intentionally cleared. A different document cannot inherit the marker.
-    pub(crate) fn has_unsaved_work(&self) -> bool {
+    fn has_dirty_unsaved_work(&self) -> bool {
         self.session.is_dirty() && (!self.session.journal.is_empty() || self.imported_document == Some(self.session.opened()))
+    }
+
+    /// Whether replacing the model would lose work: edits, a still-unsaved imported deck, or
+    /// session-only WARP3D fracture results not persisted in `.fieldcraft` files.
+    pub(crate) fn has_unsaved_work(&self) -> bool {
+        self.has_dirty_unsaved_work() || self.session.has_unpersisted_fracture()
+    }
+
+    pub(crate) fn prompt_unsaved_or_fracture(&mut self, next: Replace) -> bool {
+        if self.has_dirty_unsaved_work() {
+            self.prompt = Some(Prompt::Unsaved(next));
+            return true;
+        }
+        if self.session.has_unpersisted_fracture() {
+            self.prompt = Some(Prompt::UnpersistedFracture(next));
+            return true;
+        }
+        false
     }
 
     /// Open a file the user chose (picked, dropped or from the recent list) by its type. A model
@@ -1002,8 +1122,7 @@ impl ModelApp {
             );
             return;
         };
-        if kind == Kind::Model && self.has_unsaved_work() {
-            self.prompt = Some(Prompt::Unsaved(Replace::File(path.to_string())));
+        if kind == Kind::Model && self.prompt_unsaved_or_fracture(Replace::File(path.to_string())) {
             return;
         }
         self.load(kind, path.to_string());
@@ -1029,8 +1148,7 @@ impl ModelApp {
             self.prompt = Some(Prompt::Samples);
             return;
         };
-        if self.has_unsaved_work() {
-            self.prompt = Some(Prompt::Unsaved(Replace::Sample(sample.name)));
+        if self.prompt_unsaved_or_fracture(Replace::Sample(sample.name)) {
             return;
         }
         self.load_sample(sample.name);
@@ -1039,8 +1157,7 @@ impl ModelApp {
     /// File › New (`file.new`): start an empty model, asking first when that would discard
     /// unsaved changes.
     pub fn new_model(&mut self) {
-        if self.has_unsaved_work() {
-            self.prompt = Some(Prompt::Unsaved(Replace::New));
+        if self.prompt_unsaved_or_fracture(Replace::New) {
             return;
         }
         self.load_new();
@@ -1107,6 +1224,9 @@ impl ModelApp {
         if let Some(l) = self.loading.take() {
             l.progress.cancel();
             self.queued.clear();
+            if l.pending_set_created {
+                self.rollback_pending_set();
+            }
             for w in &l.waiters {
                 let _ = w.send(json!({"ok": false, "error": format!("cancelled: {}", l.title), "cancelled": true}));
             }
@@ -1132,7 +1252,7 @@ impl ModelApp {
         let Some(l) = self.loading.take() else { return false };
         let reply = match &outcome {
             Some(Ok((v, _))) => json!({"ok": true, "result": v}),
-            Some(Err(e)) => json!({"ok": false, "error": e}),
+            Some(Err(e)) => json!({"ok": false, "error": e.message}),
             None => json!({"ok": false, "error": format!("{}: stopped unexpectedly", l.title)}),
         };
         for w in &l.waiters {
@@ -1151,8 +1271,24 @@ impl ModelApp {
                 let done = reply.get("path").and_then(Value::as_str).map_or(l.done, |p| format!("Wrote {}", file_name(p)));
                 self.set_status(done, false);
             }
+            Some(Ok((reply, Product::SolvedStep { result, fracture, opened, revision }))) => {
+                if (self.session.opened(), self.session.revision()) != (opened, revision) {
+                    if l.pending_set_created {
+                        self.rollback_pending_set();
+                    }
+                    self.set_status(format!("{}: the model changed while running; result discarded", l.title), true);
+                } else {
+                    self.session.store_solved_step(result, fracture);
+                    if self.dialog.as_ref().is_some_and(|d| l.form == Some(d.command)) {
+                        self.form_done();
+                    }
+                    let label = crate::command_label(l.command);
+                    self.follow_stage(l.command);
+                    self.apply_command_reply(l.command, label, &l.params, &reply, false, false);
+                }
+            }
             Some(Ok((reply, Product::Session(session, prebuilt)))) => {
-                let opened = Opened { command: l.command, session, prebuilt, reply, done: l.done, recent: l.recent, form: l.form };
+                let opened = Opened { command: l.command, params: l.params, session, prebuilt, reply, done: l.done, recent: l.recent, form: l.form };
                 // A design of another part over a meshed or defined model: ask what to do with
                 // the model before it changes (the job ran with the default, keep).
                 let unrelated = opened.reply.get("related").and_then(Value::as_bool) == Some(false)
@@ -1168,13 +1304,22 @@ impl ModelApp {
                 }
             }
             Some(Err(e)) => {
+                if l.pending_set_created {
+                    self.rollback_pending_set();
+                }
                 let what = l.recent.as_deref().map_or_else(|| l.title.clone(), file_name);
-                self.set_status(format!("{what}: {e}"), true);
+                self.set_status(format!("{what}: {}", e.message), true);
                 if let Some(d) = self.dialog.as_mut().filter(|d| l.form == Some(d.command)) {
-                    d.error = Some(e);
+                    d.error = Some(e.message);
+                    d.refused = e.refused;
                 }
             }
-            None => self.set_status(format!("{}: stopped unexpectedly", l.title), true),
+            None => {
+                if l.pending_set_created {
+                    self.rollback_pending_set();
+                }
+                self.set_status(format!("{}: stopped unexpectedly", l.title), true);
+            }
         }
         self.open_queued();
         self.loading.is_some()
@@ -1204,6 +1349,7 @@ impl ModelApp {
         if self.dialog.as_ref().is_some_and(|d| o.form == Some(d.command)) {
             self.form_done();
         }
+        let _ = &o.params;
         let warnings: Vec<&str> = o.reply.get("warnings").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
         let mut done = o.done;
         if o.command == "deck.read" {
@@ -1314,7 +1460,7 @@ impl ModelApp {
     /// Write Deck: pick where to write the model as a `format` deck. Without a picker the
     /// command's form opens with the format filled in.
     pub fn write_deck(&mut self, format: &str) {
-        let Some(f) = fieldcraft_decks::format(format) else {
+        let Some(f) = fieldcraft_engine::deck_format_info(format) else {
             self.set_status(format!("no {format} deck writer yet"), true);
             return;
         };
@@ -1331,7 +1477,12 @@ impl ModelApp {
         let filter = Filter::new("Solver deck", exts);
         self.pick_file(
             FilePicker::Save { name: format!("{}.{}", self.model_name(), f.extension), filters: vec![filter] },
-            PickerAction::Export { command: "deck.write".into(), params: json!({"format": format}), extension: f.extension, alternatives: exts },
+            PickerAction::Export {
+                command: "deck.write".into(),
+                params: json!({"format": format}),
+                extension: f.extension,
+                alternatives: f.alternatives,
+            },
         );
     }
 
@@ -1385,7 +1536,27 @@ impl ModelApp {
         if !go {
             return;
         }
+        if answer == Answer::Save && self.session.has_unpersisted_fracture() {
+            self.prompt = Some(Prompt::UnpersistedFracture(next));
+            return;
+        }
         self.replace_after_save(next);
+    }
+
+    /// Answer [`Prompt::UnpersistedFracture`]: export fracture CSV, discard & continue, or cancel.
+    pub fn answer_unpersisted_fracture(&mut self, answer: FracturePromptAnswer) {
+        let Some(Prompt::UnpersistedFracture(next)) = self.prompt.clone() else { return };
+        self.prompt = None;
+        match answer {
+            FracturePromptAnswer::Export => {
+                if let Some(step) = self.session.unpersisted_fracture_steps().first().copied() {
+                    let step = step.to_string();
+                    self.export_csv(json!({"what": "fracture", "step": step}));
+                }
+            }
+            FracturePromptAnswer::Discard => self.replace_after_save(next),
+            FracturePromptAnswer::Cancel => {}
+        }
     }
 
     fn replace_after_save(&mut self, next: Replace) {
@@ -1565,6 +1736,29 @@ pub fn show(app: &mut ModelApp, ctx: &egui::Context) {
                 });
             if let Some(a) = answer(closed, action, Answer::Save, Answer::Discard, Answer::Cancel) {
                 app.answer_unsaved(a);
+            }
+        }
+        Some(Prompt::UnpersistedFracture(next)) => {
+            let steps = app.session.unpersisted_fracture_steps().join(", ");
+            let question = match next {
+                Replace::Update => format!(
+                    "WARP3D fracture results ({steps}) are session-only and not saved in .fieldcraft files. Export them before restarting to update?",
+                ),
+                _ => format!(
+                    "WARP3D fracture results ({steps}) are session-only and not saved in .fieldcraft files. Export them before opening {}?",
+                    next.name(),
+                ),
+            };
+            let (closed, action) = kit::Confirm::new(egui::Id::unique("fc_unpersisted_fracture"), "results.export.csv", "Unpersisted fracture results")
+                .tone(kit::Tone::Warning)
+                .actions("Export Fracture CSV…", "Cancel", Some("Discard & Continue"))
+                .secondary_left()
+                .show(ctx, true, |ui| {
+                    message(ui, &question);
+                    note(ui, "Discarding continues without saving these domain integrals.");
+                });
+            if let Some(a) = answer(closed, action, FracturePromptAnswer::Export, FracturePromptAnswer::Discard, FracturePromptAnswer::Cancel) {
+                app.answer_unpersisted_fracture(a);
             }
         }
         Some(Prompt::Design(path)) => {
@@ -1767,6 +1961,12 @@ pub fn file_menu(app: &mut ModelApp, ui: &mut egui::Ui) {
         {
             act = Some(Box::new(move |app| app.write_deck(&f)));
         }
+    }
+    if crate::frame::menu_row(ui, "deck.write.warp3d", "WARP3D Deck…", None, true)
+        .backing_on_hover_text("Write a WARP3D input file (.inp); use the deck.write command form to include crack_front options")
+        .clicked()
+    {
+        act = Some(Box::new(|app| app.write_deck("warp3d")));
     }
     crate::frame::menu_separator(ui);
     if crate::frame::menu_row(ui, "file.recover", "Recover…", None, true)
@@ -3000,6 +3200,325 @@ pub(crate) mod tests {
         let path = dir.join("model.fieldcraft");
         app.run("file.save_as", json!({"path": path})).unwrap();
         assert!(path.exists() && app.picker.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn setup_hex_with_warp3d_dir(app: &mut ModelApp, dir: &Path) {
+        let script = json!([
+            {"command": "model.units", "params": {"system": "mm-t-s-N-MPa"}},
+            {"command": "mesh.node.add", "params": {"label": 1, "xyz": [0, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 2, "xyz": [1000, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 3, "xyz": [1000, 1000, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 4, "xyz": [0, 1000, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 5, "xyz": [0, 0, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 6, "xyz": [1000, 0, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 7, "xyz": [1000, 1000, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 8, "xyz": [0, 1000, 1000]}},
+            {"command": "mesh.element.add", "params": {"label": 1, "kind": "hex8", "nodes": [1, 2, 3, 4, 5, 6, 7, 8]}},
+            {"command": "model.set.create", "params": {"name": "all", "elements": [1]}},
+            {"command": "model.set.create", "params": {"name": "fix", "nodes": [1, 4, 5, 8]}},
+            {"command": "model.set.create", "params": {"name": "tip", "nodes": [2, 3, 6, 7]}},
+            {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": 210000, "poisson": 0.3}}},
+            {"command": "model.section.create", "params": {"name": "solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+            {"command": "model.boundary_condition.create", "params": {"name": "clamp", "type": "fixed", "target": {"set": "fix"}}},
+            {"command": "model.load.create", "params": {"name": "pull", "type": "force", "target": {"set": "tip"}, "vector": [20000, 0, 0]}},
+            {"command": "model.step.create", "params": {"name": "Pull", "procedure": {"type": "static"}, "boundary_conditions": ["clamp"], "loads": ["pull"]}}
+        ]);
+        app.run_script(&script).unwrap();
+
+        std::fs::write(dir.join("model.inp"), "! fieldcraft-units: mm-t-s-N-MPa\n").unwrap();
+        let row26 = vec!["0.0"; 26].join(" ");
+        std::fs::write(dir.join("wnd0000001_text"), format!("#\n{}", "0.1 0.0 0.0\n".repeat(8))).unwrap();
+        std::fs::write(dir.join("wnr0000001_text"), format!("#\n{}", "0.0 0.0 0.0\n".repeat(8))).unwrap();
+        std::fs::write(dir.join("wns0000001_text"), format!("#\n{}", [row26.as_str(); 8].join("\n"))).unwrap();
+        std::fs::write(dir.join("wes0000001_text"), format!("#\n{row26}\n")).unwrap();
+        let stdout_table = "\
+     Domain definition:  cf_0001
+
+        Number of front nodes:    2 Nodes on front:
+              2      3
+        Direction cosines:   0.000000  1.000000  0.000000
+        Tangent vector direction cosines:   0.000000  0.000000  1.000000
+        Front order:  1     Verify front: T Domain type:  4
+     ** end of domain definition **
+
+                         domain-integral post-processing
+                         -------------------------------
+ step:     1
+ domain id: cf_0001
+ area under q along front:        2.500000E+01
+
+                                             J-integral components
+                                          ===========================
+ domain        dm1          dm2          dm3          dm4          dm5          dm6          dm7          dm8       total J   killed ele
+     1     1.1500E+01   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   1.1500E+01   (  0)
+     2     1.2500E+01   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   1.2500E+01   (  0)
+
+    average:  1.2000E+01   minimum:  1.1500E+01   maximum: 1.2500E+01     (cf_0001)
+  1.2000E+01  1.1500E+01  1.2500E+01
+
+               Static I-values
+                          -- KI = 1, KII = 0, KIII = 0, plane strain --
+ domain        II1          II2          II3          II4          II5          II6          II7          II8       total I     KI (pstrn) killed ele
+     1     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   5.1000E+01   (  0)
+     2     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   5.5000E+01   (  0)
+    average:  5.3000E+01   minimum:  5.1000E+01   maximum: 5.5000E+01     (cf_0001)
+  5.3000E+01  5.1000E+01  5.5000E+01
+";
+        std::fs::write(dir.join("warp3d.out"), stdout_table).unwrap();
+    }
+
+    fn text_center(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == needle => Some(t.pos + t.galley.size() * 0.5),
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    fn collect_shapes_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for cs in shapes {
+            walk(&cs.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn solve_background_uses_lightweight_worker_preserves_refused_and_pending_set_undo() {
+        assert_eq!(SOLVE_BACKGROUND, ["solve.static", "solve.nonlinear", "results.read"]);
+        for cmd in SOLVE_BACKGROUND {
+            assert!(is_long(cmd), "{cmd} should run as a background job");
+        }
+
+        let dir = temp("solve-background");
+        let mut app = ModelApp::new(Session::default());
+        setup_hex_with_warp3d_dir(&mut app, &dir);
+        let opened_before = app.session.opened();
+        let cam_before = app.cam;
+        let rev_before = app.revision;
+
+        // 1. solve.static via submit_dialog runs in background with Product::SolvedStep.
+        app.open_form("solve.static", json!({"step": "Pull"}));
+        app.submit_dialog();
+        assert!(app.busy().is_some(), "solve.static started in background");
+        app.wait_loaded();
+        assert!(app.dialog.is_none());
+        assert_eq!(app.session.opened(), opened_before);
+        assert_eq!(app.cam, cam_before);
+        assert_eq!(app.revision, rev_before);
+        assert!(app.session.result("Pull").is_some());
+        assert_eq!(app.reply.as_ref().map(|r| r.command.as_str()), Some("solve.static"));
+
+        // 2. solve.nonlinear via submit_dialog also merges via Product::SolvedStep.
+        app.run(
+            "model.step.create",
+            json!({
+                "name": "PullNL",
+                "procedure": {"type": "nonlinear_static", "initial_increment": 0.5, "max_increments": 4},
+                "boundary_conditions": ["clamp"],
+                "loads": ["pull"]
+            }),
+        )
+        .unwrap();
+        app.open_form("solve.nonlinear", json!({"step": "PullNL"}));
+        app.submit_dialog();
+        assert!(app.busy().is_some());
+        app.wait_loaded();
+        assert!(app.dialog.is_none());
+        assert!(app.session.result("PullNL").is_some());
+
+        // 3. results.read runs in background and preserves app.reply for fracture rendering.
+        app.open_form("results.read", json!({"format": "warp3d", "path": dir.to_string_lossy(), "step": "Pull"}));
+        app.submit_dialog();
+        assert!(app.busy().is_some());
+        app.wait_loaded();
+        assert!(app.dialog.is_none());
+        assert_eq!(app.reply.as_ref().map(|r| r.command.as_str()), Some("results.read"));
+        assert!(app.session.fracture_results("Pull").is_some_and(|f| f.len() == 1));
+
+        // 4. Act::Rerun on results.read / solve.static dispatches asynchronously via submit_background.
+        let ctx = egui::Context::default();
+        let t = crate::theme::Tokens::get(false);
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 900.0)));
+        let mut out = ctx.run_ui(egui::RawInput { screen_rect: screen, ..Default::default() }, |ui| {
+            crate::reply::show(&mut app, ui, &t);
+        });
+        out.textures_delta.clear();
+        let rerun_pos = text_center(&out.shapes, "Run again").expect("Run again button rendered");
+        let click = egui::RawInput {
+            screen_rect: screen,
+            events: vec![
+                egui::Event::PointerMoved(rerun_pos),
+                egui::Event::PointerButton { pos: rerun_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                egui::Event::PointerButton { pos: rerun_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ],
+            ..Default::default()
+        };
+        let mut out2 = ctx.run_ui(click, |ui| crate::reply::show(&mut app, ui, &t));
+        out2.textures_delta.clear();
+        assert!(app.busy().is_some(), "Act::Rerun dispatches SOLVE_BACKGROUND asynchronously");
+        app.wait_loaded();
+        assert_eq!(app.reply.as_ref().map(|r| r.command.as_str()), Some("results.read"));
+
+        // 5. Refused parameter preserves d.refused and rolls back pending_set created for crack_front.set.
+        app.open_form("solve.static", json!({"step": "Pull", "backend": "native", "crack_front": {"set": "TempFront"}}));
+        app.dialog.as_mut().unwrap().pending_set = Some(json!({"name": "TempFront", "nodes": [2, 3]}));
+        app.submit_dialog();
+        app.wait_loaded();
+        let d = app.dialog.as_ref().expect("form stays open on worker error");
+        assert!(d.error.is_some());
+        assert_eq!(d.refused.as_ref().map(|(p, _)| p.as_str()), Some("crack_front"));
+        assert!(app.session.model.set("TempFront").is_none(), "pending set undone on worker error");
+
+        app.open_form("results.read", json!({"format": "abaqus", "path": dir.to_string_lossy(), "step": "Pull"}));
+        app.submit_dialog();
+        app.wait_loaded();
+        let d = app.dialog.as_ref().expect("form stays open on format error");
+        assert!(d.error.is_some());
+        assert_eq!(d.refused.as_ref().map(|(p, _)| p.as_str()), Some("format"));
+
+        app.open_form("solve.static", json!({"step": "Pull", "backend": "native", "threads": 0}));
+        app.submit_dialog();
+        app.wait_loaded();
+        let d = app.dialog.as_ref().expect("form stays open on threads error");
+        assert!(d.error.is_some() && d.refused.is_none());
+        app.dialog = None;
+
+        // 6. Cancelling a solve background job preserves prior result and rolls back pending_set.
+        let before_ptr = Arc::as_ptr(app.session.result("Pull").unwrap());
+        let journal_len = app.session.journal.len();
+        app.open_form("solve.static", json!({"step": "Pull", "crack_front": {"set": "CancelFront"}}));
+        app.dialog.as_mut().unwrap().pending_set = Some(json!({"name": "CancelFront", "nodes": [2, 3]}));
+        app.submit_dialog();
+        assert!(app.busy().is_some());
+        app.cancel_loading();
+        assert!(app.busy().is_none());
+        assert!(app.session.model.set("CancelFront").is_none(), "pending set undone on cancel");
+        assert_eq!(app.session.journal.len(), journal_len);
+        assert_eq!(Arc::as_ptr(app.session.result("Pull").unwrap()), before_ptr);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unpersisted_fracture_prompts_and_write_deck_warp3d_menu_works() {
+        let dir = temp("unpersisted-fracture");
+        let mut app = ModelApp::new(Session::default());
+        setup_hex_with_warp3d_dir(&mut app, &dir);
+        app.run("results.read", json!({"format": "warp3d", "path": dir.to_string_lossy(), "step": "Pull"})).unwrap();
+        assert!(app.session.is_dirty() && app.session.has_unpersisted_fracture());
+        assert!(app.has_unsaved_work());
+
+        // 1. Dirty + fracture -> Prompt::Unsaved -> Answer::Save saves file & transitions to Prompt::UnpersistedFracture.
+        let saved_fc = dir.join("saved.fieldcraft").to_string_lossy().into_owned();
+        let saved_fc_clone = saved_fc.clone();
+        app.services.pick_save = Some(Box::new(move |_, _| Some(saved_fc_clone.clone())));
+        app.new_model();
+        assert_eq!(app.prompt, Some(Prompt::Unsaved(Replace::New)));
+        app.answer_unsaved(Answer::Save);
+        assert_eq!(app.session.path.as_deref(), Some(saved_fc.as_str()));
+        assert!(!app.session.is_dirty(), "save cleared dirty state");
+        assert!(app.session.has_unpersisted_fracture());
+        assert_eq!(app.prompt, Some(Prompt::UnpersistedFracture(Replace::New)));
+
+        // Cancel keeps clean model + fracture intact, and has_unsaved_work() remains true.
+        app.answer_unpersisted_fracture(FracturePromptAnswer::Cancel);
+        assert!(app.prompt.is_none());
+        assert!(app.has_unsaved_work());
+
+        // 2. Named dirty model (journal non-empty + view change) also transitions through Save -> UnpersistedFracture.
+        app.run("view.hide", json!({"items": [{"kind": "load", "name": "pull"}]})).unwrap();
+        assert!(app.has_dirty_unsaved_work());
+        app.new_model();
+        assert_eq!(app.prompt, Some(Prompt::Unsaved(Replace::New)));
+        app.answer_unsaved(Answer::Save);
+        assert_eq!(app.prompt, Some(Prompt::UnpersistedFracture(Replace::New)));
+        app.answer_unpersisted_fracture(FracturePromptAnswer::Cancel);
+
+        // 3. Clean model with unpersisted fracture opens Prompt::UnpersistedFracture directly, renders modal, and exports CSV.
+        app.new_model();
+        assert_eq!(app.prompt, Some(Prompt::UnpersistedFracture(Replace::New)));
+        let ctx = egui::Context::default();
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)));
+        let mut texts = Vec::new();
+        for frame in 0..2 {
+            let mut out =
+                ctx.run_ui(egui::RawInput { time: Some(f64::from(frame)), screen_rect: screen, ..Default::default() }, |ui| show(&mut app, ui.ctx()));
+            out.textures_delta.clear();
+            if frame == 1 {
+                texts = collect_shapes_text(&out.shapes);
+            }
+        }
+        assert!(texts.iter().any(|s| s.contains("WARP3D fracture results (Pull)")), "{texts:?}");
+        assert!(texts.iter().any(|s| s == "Export Fracture CSV…"), "{texts:?}");
+
+        let csv_path = dir.join("frac_export.csv").to_string_lossy().into_owned();
+        let csv_clone = csv_path.clone();
+        app.services.pick_save = Some(Box::new(move |_, _| Some(csv_clone.clone())));
+        app.answer_unpersisted_fracture(FracturePromptAnswer::Export);
+        let csv_text = std::fs::read_to_string(&csv_path).expect("Export Fracture CSV wrote file");
+        assert!(csv_text.contains("domain_id") && csv_text.contains("j_mean"), "{csv_text}");
+        assert!(app.session.has_unpersisted_fracture(), "export keeps model until discarded");
+
+        // 4. control.rs ui.inspect & ui.prompt work cleanly on Prompt::UnpersistedFracture.
+        let call_ctrl = |app: &mut ModelApp, method: &str, params: Value| -> Value {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let req = crate::control::ControlRequest::new(method, params, tx);
+            match crate::control::handle(app, &ctx, &req) {
+                crate::control::Outcome::Done(v) => v,
+                _ => json!({}),
+            }
+        };
+        app.new_model();
+        let inspected = call_ctrl(&mut app, "ui.inspect", json!({}));
+        assert_eq!(inspected["result"]["prompt"]["unpersisted_fracture"], "new");
+        let cancelled = call_ctrl(&mut app, "ui.prompt", json!({"answer": "cancel"}));
+        assert_eq!(cancelled["ok"], true);
+        assert!(app.prompt.is_none() && app.session.has_unpersisted_fracture());
+
+        // 5. write_deck("warp3d") without and with picker + File > Write Deck menu entry.
+        app.services.pick_save = None;
+        app.write_deck("warp3d");
+        assert_eq!(app.dialog.as_ref().map(|d| d.command), Some("deck.write"));
+        assert_eq!(serde_json::from_str::<Value>(&app.dialog.as_ref().unwrap().text).unwrap()["format"], "warp3d");
+        app.dialog = None;
+
+        let deck_path = dir.join("exported.inp").to_string_lossy().into_owned();
+        let deck_clone = deck_path.clone();
+        app.services.pick_save = Some(Box::new(move |_, _| Some(deck_clone.clone())));
+        app.write_deck("warp3d");
+        let deck_text = std::fs::read_to_string(&deck_path).expect("WARP3D deck written");
+        assert!(deck_text.contains("structure"), "{deck_text}");
+
+        let mut menu_out = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 700.0))), ..Default::default() },
+            |ui| file_menu(&mut app, ui),
+        );
+        menu_out.textures_delta.clear();
+        let menu_texts = collect_shapes_text(&menu_out.shapes);
+        assert!(menu_texts.iter().any(|s| s == "WARP3D Deck…"), "{menu_texts:?}");
+
+        // Discard through ui.prompt clears the model.
+        app.new_model();
+        let discarded = call_ctrl(&mut app, "ui.prompt", json!({"answer": "discard"}));
+        assert_eq!(discarded["ok"], true);
+        assert!(!app.session.has_unpersisted_fracture() && app.session.model.node(1).is_none());
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

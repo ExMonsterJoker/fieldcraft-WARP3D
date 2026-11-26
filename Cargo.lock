@@ -1925,6 +1925,7 @@ dependencies = [
  "fieldcraft-render",
  "fieldcraft-solver",
  "fieldcraft-update",
+ "fieldcraft-warp3d",
  "libm",
  "log",
  "png",
@@ -2162,6 +2163,17 @@ dependencies = [
  "thiserror 2.0.21",
  "ureq",
  "zip",
+]
+
+[[package]]
+name = "fieldcraft-warp3d"
+version = "0.8.1"
+dependencies = [
+ "fieldcraft-model",
+ "fieldcraft-solver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

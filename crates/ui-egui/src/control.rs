@@ -290,14 +290,17 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
             "browser": crate::browser::describe(app),
             "nav": app.nav,
             "layout": app.layout.iter().map(|(k, r)| (k.to_string(), json!([r.left(), r.top(), r.width(), r.height()]))).collect::<serde_json::Map<String, Value>>(),
-            "prompt": app.prompt.as_ref().map(|p| match p {
-                crate::files::Prompt::Unsaved(next) => json!({"unsaved": match next {
+            "prompt": app.prompt.as_ref().map(|p| {
+                let replace_target = |next: &crate::files::Replace| match next {
                     crate::files::Replace::File(p) => p.clone(),
                     crate::files::Replace::Deck(p) => p.get("path").and_then(Value::as_str).unwrap_or("Abaqus deck").to_string(),
                     crate::files::Replace::Sample(n) => format!("sample {n}"),
                     crate::files::Replace::Update => "update".to_string(),
                     crate::files::Replace::New => "new".to_string(),
-                }}),
+                };
+                match p {
+                    crate::files::Prompt::Unsaved(next) => json!({"unsaved": replace_target(next)}),
+                    crate::files::Prompt::UnpersistedFracture(next) => json!({"unpersisted_fracture": replace_target(next)}),
                 crate::files::Prompt::Recover => json!("recover"),
                 crate::files::Prompt::Samples => json!("samples"),
                 crate::files::Prompt::Design(p) => json!({"design": p}),
@@ -310,6 +313,7 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
                 crate::files::Prompt::ReportBug => json!({"report_bug": app.report.as_ref().and_then(|f| f.drafted_json())}),
                 crate::files::Prompt::Consent => json!({"consent": crate::privacy::QUESTION}),
                 crate::files::Prompt::Update => json!({"update": app.update_json()}),
+                }
             }),
             "privacy": privacy_json(app),
             "settings": crate::settings::describe(app),
@@ -469,6 +473,12 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
                     app.answer_unsaved(answer);
                     ok(json!({"busy": app.busy()}))
                 }
+                (crate::files::Prompt::UnpersistedFracture(_), Some(a @ ("discard" | "cancel"))) => {
+                    let answer =
+                        if a == "discard" { crate::files::FracturePromptAnswer::Discard } else { crate::files::FracturePromptAnswer::Cancel };
+                    app.answer_unpersisted_fracture(answer);
+                    ok(json!({"busy": app.busy()}))
+                }
                 (crate::files::Prompt::Design(_), Some(a @ ("new" | "keep" | "cancel"))) => {
                     let answer = match a {
                         "new" => crate::files::DesignAnswer::New,
@@ -550,7 +560,7 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
                     None => err("missing `id` (from file.recovery.list)"),
                 },
                 (_, a) => err(format!(
-                    "`answer` {a:?} does not answer this prompt (unsaved: save, discard, cancel; design: new, keep, cancel; replace_mesh: replace, cancel; delete: delete, cancel; recover: recover with id, close; samples: open with name, close; crashed: report, close; report_bug: set with title/observed/share_session/include_model, close; consent: share, decline; update: restart, later)"
+                    "`answer` {a:?} does not answer this prompt (unsaved: save, discard, cancel; unpersisted_fracture: discard, cancel; design: new, keep, cancel; replace_mesh: replace, cancel; delete: delete, cancel; recover: recover with id, close; samples: open with name, close; crashed: report, close; report_bug: set with title/observed/share_session/include_model, close; consent: share, decline; update: restart, later)"
                 )),
             }
         }

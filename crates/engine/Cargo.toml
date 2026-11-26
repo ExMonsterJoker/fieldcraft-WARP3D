@@ -16,6 +16,7 @@ fieldcraft-mesh = { workspace = true }
 fieldcraft-io = { workspace = true }
 fieldcraft-decks = { workspace = true }
 fieldcraft-solver = { workspace = true }
+fieldcraft-warp3d = { workspace = true }
 fieldcraft-explicit = { workspace = true }
 fieldcraft-fem = { workspace = true }
 fieldcraft-lbm = { workspace = true }

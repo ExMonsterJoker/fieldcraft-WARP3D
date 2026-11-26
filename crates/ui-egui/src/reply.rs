@@ -26,7 +26,7 @@ pub struct Reply {
 }
 
 /// The solvers whose reply is a step's summary ([`solve_summary`]).
-const SOLVES: [&str; 6] = ["solve.static", "solve.nonlinear", "solve.heat", "solve.frequency", "solve.buckle", "solve.explicit"];
+const SOLVES: [&str; 7] = ["solve.static", "solve.nonlinear", "solve.heat", "solve.frequency", "solve.buckle", "solve.explicit", "results.read"];
 
 /// Replies that only read the model, refreshed when it changes; any other reply closes then.
 pub const LIVE: [&str; 3] = ["model.check", "model.activity", "geometry.defeature.propose"];
@@ -184,6 +184,10 @@ pub fn done(command: &str, label: &str, params: &Value, v: &Value) -> String {
             let label = v.get("sample").and_then(Value::as_str).and_then(fieldcraft_engine::sample::find).map(|s| s.label);
             label.map(|l| format!("Opened the {l} sample"))
         }
+        "results.read" => Some(format!(
+            "Read WARP3D results for {step}",
+            step = v.get("step").and_then(Value::as_str).or_else(|| params.get("step").and_then(Value::as_str)).unwrap_or("the step"),
+        )),
         "solve.run" => v.get("steps").and_then(Value::as_array).map(|s| format!("Solved {}", plural(s.len() as u64, "step"))),
         "edit.undo" | "edit.redo" => sentence(command, v),
         c if c.starts_with("solve.") => Some(format!("Solved {step}", step = params["step"].as_str().unwrap_or("the step"))),
@@ -337,7 +341,11 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, t: &Tokens) {
                 app.submit_dialog();
             }
             Act::Rerun => {
-                let _ = app.run(&reply.command, reply.params.clone());
+                if let Some(&cmd) = crate::files::BACKGROUND.iter().chain(crate::files::SOLVE_BACKGROUND.iter()).find(|&&c| c == reply.command) {
+                    app.submit_background(cmd, reply.params.clone());
+                } else {
+                    let _ = app.run(&reply.command, reply.params.clone());
+                }
             }
             Act::Pick(g) => app.select([crate::selection::Item::Geometry(g)], crate::selection::Mode::Replace),
             Act::Open(key) => {
@@ -993,6 +1001,10 @@ fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&Displa
             more(ui, t, modes.len());
         });
     }
+    shown.push("fracture");
+    if let Some(domains) = m.get("fracture").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+        fracture_summary(ui, t, domains, m, units);
+    }
     if let Some(w) = m.get("warnings").and_then(Value::as_array) {
         shown.push("warnings");
         for (i, x) in w.iter().enumerate() {
@@ -1012,6 +1024,165 @@ fn solve_summary(ui: &mut egui::Ui, t: &Tokens, v: &Value, units: Option<&Displa
             value(ui, t, egui::Id::unique("fc_reply_solve_details"), &rest, 1);
         });
     }
+}
+
+fn fracture_unit_header(base: &str, u: Option<&str>) -> String {
+    match u {
+        Some(u) if !u.is_empty() => format!("{base} [{u}]"),
+        _ => base.to_string(),
+    }
+}
+
+fn fracture_opt_number(obj: &Value, key: &str) -> String {
+    obj.get(key).and_then(Value::as_f64).map_or_else(|| "—".to_string(), number)
+}
+
+fn fracture_summary(ui: &mut egui::Ui, t: &Tokens, domains: &[Value], root: &Map<String, Value>, units: Option<&DisplaySystem>) {
+    let k_unit = root.get("units").and_then(|u| u.get("stress_intensity")).and_then(Value::as_str);
+    let j_unit = root
+        .get("units")
+        .and_then(|u| u.get("force_per_length"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| unit(Quantity::ForcePerLength, units));
+    let p_unit =
+        root.get("units").and_then(|u| u.get("pressure")).and_then(Value::as_str).map(str::to_string).or_else(|| unit(Quantity::Pressure, units));
+    let area_unit = root.get("units").and_then(|u| u.get("area")).and_then(Value::as_str).map(str::to_string).or_else(|| unit(Quantity::Area, units));
+
+    let any_dom = |key: &str| domains.iter().any(|d| d.get(key).and_then(Value::as_f64).is_some());
+    let has_ki = any_dom("k_i_mean");
+    let has_kj = !has_ki && any_dom("k_j_plane_strain");
+    let mut opt_cols: Vec<(&'static str, String)> = Vec::new();
+    if has_ki {
+        opt_cols.push(("k_i_mean", fracture_unit_header("K_I", k_unit)));
+    } else if has_kj {
+        opt_cols.push(("k_j_plane_strain", fracture_unit_header("K_J", k_unit)));
+    }
+    if any_dom("k_ii_mean") {
+        opt_cols.push(("k_ii_mean", fracture_unit_header("K_II", k_unit)));
+    }
+    if any_dom("k_iii_mean") {
+        opt_cols.push(("k_iii_mean", fracture_unit_header("K_III", k_unit)));
+    }
+    if any_dom("t_11_mean") {
+        opt_cols.push(("t_11_mean", fracture_unit_header("T_11", p_unit.as_deref())));
+    }
+
+    egui::CollapsingHeader::new(RichText::new(format!("Fracture Integrals ({})", domains.len())).size(12.0))
+        .id_salt("fc_reply_solve_fracture")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::ScrollArea::horizontal().id_salt("fc_reply_solve_fracture_scroll").show(ui, |ui| {
+                egui::Grid::new("fc_reply_solve_fracture_grid").striped(true).spacing(vec2(10.0, 2.0)).show(ui, |ui| {
+                    for hdr in ["Domain".to_string(), "s".to_string(), fracture_unit_header("J", j_unit.as_deref()), "Spread".to_string()]
+                        .into_iter()
+                        .chain(opt_cols.iter().map(|(_, h)| h.clone()))
+                    {
+                        ui.label(RichText::new(hdr).small().color(t.text_dim));
+                    }
+                    ui.end_row();
+                    for d in domains.iter().take(MAX_ROWS) {
+                        ui.label(d.get("domain_id").and_then(Value::as_str).unwrap_or("—"));
+                        ui.label(fracture_opt_number(d, "s_position"));
+                        ui.label(fracture_opt_number(d, "j_mean"));
+                        ui.label(fracture_opt_number(d, "ring_spread"));
+                        for (key, _) in &opt_cols {
+                            ui.label(fracture_opt_number(d, key));
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+            more(ui, t, domains.len());
+            for (i, d) in domains.iter().take(MAX_ROWS).enumerate() {
+                fracture_domain_details(ui, t, i, d, j_unit.as_deref(), k_unit, p_unit.as_deref(), area_unit.as_deref());
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fracture_domain_details(
+    ui: &mut egui::Ui,
+    t: &Tokens,
+    idx: usize,
+    d: &Value,
+    j_unit: Option<&str>,
+    k_unit: Option<&str>,
+    p_unit: Option<&str>,
+    area_unit: Option<&str>,
+) {
+    let dom_id = d.get("domain_id").and_then(Value::as_str).unwrap_or("domain");
+    egui::CollapsingHeader::new(RichText::new(format!("{dom_id} details")).small())
+        .id_salt(("fc_reply_solve_fracture_dom", idx))
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::Grid::new(("fc_reply_solve_fracture_dom_meta", idx)).num_columns(2).spacing(vec2(10.0, 2.0)).show(ui, |ui| {
+                if let Some(nodes) = d.get("front_nodes").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+                    let joined: Vec<String> = nodes.iter().filter_map(|n| n.as_u64().map(|u| u.to_string())).collect();
+                    if !joined.is_empty() {
+                        ui.label(RichText::new("Front nodes").color(t.text_dim));
+                        ui.add(egui::Label::new(joined.join(", ")).wrap());
+                        ui.end_row();
+                    }
+                }
+                if let Some(area) = d.get("area_aq").and_then(Value::as_f64) {
+                    ui.label(RichText::new("Area A_q").color(t.text_dim));
+                    ui.label(with_unit(number(area), area_unit));
+                    ui.end_row();
+                }
+                for (key, label) in [("normal", "Normal (x2)"), ("tangent", "Tangent (x3)"), ("advance", "Advance (x1)")] {
+                    if let Some(vec_text) = d.get(key).and_then(inline) {
+                        ui.label(RichText::new(label).color(t.text_dim));
+                        ui.label(vec_text);
+                        ui.end_row();
+                    }
+                }
+                for (key, label, u) in [
+                    ("j_total", "J total", j_unit),
+                    ("k_j_plane_strain", "K_J (plane strain)", k_unit),
+                    ("k_j_plane_stress", "K_J (plane stress)", k_unit),
+                    ("t_33_mean", "T_33", p_unit),
+                ] {
+                    if let Some(val) = d.get(key).and_then(Value::as_f64) {
+                        ui.label(RichText::new(label).color(t.text_dim));
+                        ui.label(with_unit(number(val), u));
+                        ui.end_row();
+                    }
+                }
+            });
+            if let Some(rings) = d.get("rings").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+                let ring_cols: Vec<(&'static str, String)> = [
+                    ("k_i", "K_I", k_unit),
+                    ("k_ii", "K_II", k_unit),
+                    ("k_iii", "K_III", k_unit),
+                    ("t_11", "T_11", p_unit),
+                    ("t_33", "T_33", p_unit),
+                ]
+                .into_iter()
+                .filter(|(key, _, _)| rings.iter().any(|r| r.get(*key).and_then(Value::as_f64).is_some()))
+                .map(|(key, label, u)| (key, fracture_unit_header(label, u)))
+                .collect();
+                egui::ScrollArea::horizontal().id_salt(("fc_reply_solve_fracture_rings_scroll", idx)).show(ui, |ui| {
+                    egui::Grid::new(("fc_reply_solve_fracture_rings", idx)).striped(true).spacing(vec2(8.0, 2.0)).show(ui, |ui| {
+                        ui.label(RichText::new("Ring").small().color(t.text_dim));
+                        ui.label(RichText::new(fracture_unit_header("J", j_unit)).small().color(t.text_dim));
+                        for (_, hdr) in &ring_cols {
+                            ui.label(RichText::new(hdr).small().color(t.text_dim));
+                        }
+                        ui.end_row();
+                        for r in rings.iter().take(MAX_ROWS) {
+                            ui.label(r.get("ring").and_then(Value::as_u64).map_or_else(|| "—".into(), |n| n.to_string()));
+                            ui.label(fracture_opt_number(r, "j"));
+                            for (key, _) in &ring_cols {
+                                ui.label(fracture_opt_number(r, key));
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+                more(ui, t, rings.len());
+            }
+        });
 }
 
 /// Any reply: objects as labelled rows, lists of objects as tables, nested parts folded.
@@ -1312,5 +1483,271 @@ mod tests {
         for m in messages {
             assert!(model_fix(m).is_some(), "no fix for `{m}`");
         }
+    }
+
+    fn collect_texts(shapes: &[egui::epaint::ClippedShape], out: &mut Vec<String>) {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for cs in shapes {
+            walk(&cs.shape, out);
+        }
+    }
+
+    #[test]
+    fn solve_summary_and_results_panel_render_fracture_without_truncation() {
+        assert!(SOLVES.contains(&"results.read"));
+        assert_eq!(done("results.read", "Read External Results", &json!({}), &json!({"step": "Pull"})), "Read WARP3D results for Pull");
+
+        let mm = DisplaySystem::new(fieldcraft_model::units::Preset::MmTonneS);
+        let dir = std::env::temp_dir().join(format!("fieldcraft-ui-fracture-reply-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = ModelApp::new(fieldcraft_engine::Session::default());
+        app.run_script(&json!([
+            {"command": "model.units", "params": {"system": "mm-t-s-N-MPa"}},
+            {"command": "mesh.node.add", "params": {"label": 1, "xyz": [0, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 2, "xyz": [1000, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 3, "xyz": [1000, 1000, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 4, "xyz": [0, 1000, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 5, "xyz": [0, 0, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 6, "xyz": [1000, 0, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 7, "xyz": [1000, 1000, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 8, "xyz": [0, 1000, 1000]}},
+            {"command": "mesh.element.add", "params": {"label": 1, "kind": "hex8", "nodes": [1, 2, 3, 4, 5, 6, 7, 8]}},
+            {"command": "model.set.create", "params": {"name": "all", "elements": [1]}},
+            {"command": "model.set.create", "params": {"name": "fix", "nodes": [1, 4, 5, 8]}},
+            {"command": "model.set.create", "params": {"name": "tip", "nodes": [2, 3, 6, 7]}},
+            {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": 210000, "poisson": 0.3}}},
+            {"command": "model.section.create", "params": {"name": "solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+            {"command": "model.boundary_condition.create", "params": {"name": "clamp", "type": "fixed", "target": {"set": "fix"}}},
+            {"command": "model.load.create", "params": {"name": "pull", "type": "force", "target": {"set": "tip"}, "vector": [20000, 0, 0]}},
+            {"command": "model.step.create", "params": {"name": "Pull", "procedure": {"type": "static"}, "boundary_conditions": ["clamp"], "loads": ["pull"]}}
+        ]))
+        .unwrap();
+
+        std::fs::write(dir.join("model.inp"), "! fieldcraft-units: mm-t-s-N-MPa\n").unwrap();
+        let row26 = vec!["0.0"; 26].join(" ");
+        std::fs::write(dir.join("wnd0000001_text"), format!("#\n{}", "0.1 0.0 0.0\n".repeat(8))).unwrap();
+        std::fs::write(dir.join("wnr0000001_text"), format!("#\n{}", "0.0 0.0 0.0\n".repeat(8))).unwrap();
+        std::fs::write(dir.join("wns0000001_text"), format!("#\n{}", [row26.as_str(); 8].join("\n"))).unwrap();
+        std::fs::write(dir.join("wes0000001_text"), format!("#\n{row26}\n")).unwrap();
+        let stdout_table = "\
+     Domain definition:  cf_0001
+
+        Number of front nodes:    2 Nodes on front:
+              2      3
+        Direction cosines:   0.000000  1.000000  0.000000
+        Tangent vector direction cosines:   0.000000  0.000000  1.000000
+        Front order:  1     Verify front: T Domain type:  4
+     ** end of domain definition **
+
+                         domain-integral post-processing
+                         -------------------------------
+ step:     1
+ domain id: cf_0001
+ area under q along front:        2.500000E+01
+
+                                             J-integral components
+                                          ===========================
+ domain        dm1          dm2          dm3          dm4          dm5          dm6          dm7          dm8       total J   killed ele
+     1     1.1500E+01   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   1.1500E+01   (  0)
+     2     1.2500E+01   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   1.2500E+01   (  0)
+
+    average:  1.2000E+01   minimum:  1.1500E+01   maximum: 1.2500E+01     (cf_0001)
+  1.2000E+01  1.1500E+01  1.2500E+01
+
+               Static I-values
+                          -- KI = 1, KII = 0, KIII = 0, plane strain --
+ domain        II1          II2          II3          II4          II5          II6          II7          II8       total I     KI (pstrn) killed ele
+     1     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   5.1000E+01   (  0)
+     2     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   5.5000E+01   (  0)
+    average:  5.3000E+01   minimum:  5.1000E+01   maximum: 5.5000E+01     (cf_0001)
+  5.3000E+01  5.1000E+01  5.5000E+01
+
+                          --T-stress (\"plane strain\" auxiliary fields)--
+ domain        II1          II2          II3          II4          II5          II6          II7          II8       total I     T11 (pstrn)      T33     killed ele
+     1     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00  -1.4000E+01  -4.0000E+00   (  0)
+     2     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00  -1.6000E+01  -5.0000E+00   (  0)
+    average:     minimum:     maximum:     (cf_0001)
+ -1.5000E+01 -1.4000E+01 -1.6000E+01
+ -4.5000E+00 -4.0000E+00 -5.0000E+00
+";
+        std::fs::write(dir.join("warp3d.out"), stdout_table).unwrap();
+
+        // 1. results.read keeps app.reply populated and formats via summary_in(SOLVES).
+        app.run("results.read", json!({"format": "warp3d", "path": dir.to_string_lossy(), "step": "Pull"})).unwrap();
+        let r = app.reply.clone().expect("results.read preserves app.reply");
+        assert_eq!(r.command, "results.read");
+        assert!(summary_in("results.read", &r.value, Some(&mm)).contains("max |U|"));
+
+        // 2. Render reply::show (interaction_integral: true case with K_I and T_11).
+        let ctx = egui::Context::default();
+        let t = Tokens::get(false);
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 900.0)));
+        let mut out = ctx.run_ui(egui::RawInput { screen_rect: screen, ..Default::default() }, |ui| {
+            show(&mut app, ui, &t);
+        });
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        collect_texts(&out.shapes, &mut texts);
+        assert!(texts.iter().any(|s| s == "Fracture Integrals (1)"), "{texts:?}");
+        for expected in ["Domain", "cf_0001", "J [N/mm]", "Spread", "K_I [MPa·√mm]", "T_11 [MPa]", "cf_0001 details"] {
+            assert!(texts.iter().any(|s| s == expected), "missing `{expected}` in {texts:?}");
+        }
+
+        // Open per-domain details to verify triad and ring table render cleanly.
+        let det_pos = {
+            fn find(shape: &egui::Shape) -> Option<egui::Pos2> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == "cf_0001 details" => Some(t.pos + t.galley.size() * 0.5),
+                    egui::Shape::Vec(v) => v.iter().find_map(find),
+                    _ => None,
+                }
+            }
+            out.shapes.iter().find_map(|cs| find(&cs.shape)).expect("domain details header")
+        };
+        let mut out_click = ctx.run_ui(
+            egui::RawInput {
+                time: Some(1.0),
+                screen_rect: screen,
+                events: vec![
+                    egui::Event::PointerMoved(det_pos),
+                    egui::Event::PointerButton { pos: det_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                    egui::Event::PointerButton { pos: det_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+                ],
+                ..Default::default()
+            },
+            |ui| show(&mut app, ui, &t),
+        );
+        out_click.textures_delta.clear();
+        let mut out_det = ctx.run_ui(egui::RawInput { time: Some(3.0), screen_rect: screen, ..Default::default() }, |ui| show(&mut app, ui, &t));
+        out_det.textures_delta.clear();
+        let mut det_texts = Vec::new();
+        collect_texts(&out_det.shapes, &mut det_texts);
+        for expected in ["Normal (x2)", "Tangent (x3)", "Advance (x1)", "Ring", "T_33 [MPa]"] {
+            assert!(det_texts.iter().any(|s| s == expected), "missing `{expected}` in {det_texts:?}");
+        }
+
+        // Open "Details" to verify `fracture` stays out of generic collapsed fallback.
+        let details_pos = {
+            fn find(shape: &egui::Shape) -> Option<egui::Pos2> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == "Details" => Some(t.pos + t.galley.size() * 0.5),
+                    egui::Shape::Vec(v) => v.iter().find_map(find),
+                    _ => None,
+                }
+            }
+            out_det.shapes.iter().find_map(|cs| find(&cs.shape)).expect("Details header")
+        };
+        let mut out_det_click = ctx.run_ui(
+            egui::RawInput {
+                time: Some(4.0),
+                screen_rect: screen,
+                events: vec![
+                    egui::Event::PointerMoved(details_pos),
+                    egui::Event::PointerButton {
+                        pos: details_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos: details_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| show(&mut app, ui, &t),
+        );
+        out_det_click.textures_delta.clear();
+        let mut out_expanded = ctx.run_ui(egui::RawInput { time: Some(6.0), screen_rect: screen, ..Default::default() }, |ui| show(&mut app, ui, &t));
+        out_expanded.textures_delta.clear();
+        let mut exp_texts = Vec::new();
+        collect_texts(&out_expanded.shapes, &mut exp_texts);
+        assert!(exp_texts.iter().any(|s| s == "format") && !exp_texts.iter().any(|s| s == "fracture"), "{exp_texts:?}");
+
+        // 3. Render results_panel::controls with the stored SI fracture results.
+        let plot = app.plot().expect("static plot available");
+        let mut rp_out = ctx.run_ui(egui::RawInput { screen_rect: screen, ..Default::default() }, |ui| {
+            crate::results_panel::controls(&mut app, &plot, ui, &t);
+        });
+        rp_out.textures_delta.clear();
+        let mut rp_texts = Vec::new();
+        collect_texts(&rp_out.shapes, &mut rp_texts);
+        for expected in ["Fracture Integrals (1)", "Stations", "J range", "K_I range", "Max spread", "cf_0001", "Export CSV…"] {
+            assert!(rp_texts.iter().any(|s| s == expected), "missing `{expected}` in {rp_texts:?}");
+        }
+
+        // 4. Interaction_integral: false cases (K_J fallback, and all-null k_* without units.stress_intensity).
+        let kj_only = json!({
+            "step": "Pull",
+            "dofs": 12,
+            "units": {"force_per_length": "N/mm", "stress_intensity": "MPa·√mm", "area": "mm²"},
+            "fracture": [{
+                "domain_id": "cf_0001",
+                "step": 1,
+                "s_position": 0.0,
+                "normal": [0, 1, 0],
+                "tangent": [0, 0, 1],
+                "advance": [1, 0, 0],
+                "area_aq": 25.0,
+                "rings": [{"ring": 1, "j": 12.0}],
+                "j_mean": 12.0,
+                "j_min": 12.0,
+                "j_max": 12.0,
+                "ring_spread": 0.0,
+                "k_j_plane_strain": 52.0
+            }]
+        });
+        let mut kj_out = ctx.run_ui(egui::RawInput { screen_rect: screen, ..Default::default() }, |ui| {
+            solve_summary(ui, &t, &kj_only, Some(&mm));
+        });
+        kj_out.textures_delta.clear();
+        let mut kj_texts = Vec::new();
+        collect_texts(&kj_out.shapes, &mut kj_texts);
+        assert!(kj_texts.iter().any(|s| s == "K_J [MPa·√mm]"), "{kj_texts:?}");
+        assert!(!kj_texts.iter().any(|s| s.starts_with("K_I ")), "{kj_texts:?}");
+
+        let no_k = json!({
+            "step": "Pull",
+            "dofs": 12,
+            "units": {"force_per_length": "N/mm"},
+            "fracture": [{
+                "domain_id": "cf_0001",
+                "step": 1,
+                "s_position": null,
+                "normal": [0, 1, 0],
+                "tangent": [0, 0, 1],
+                "advance": [1, 0, 0],
+                "area_aq": 25.0,
+                "rings": [{"ring": 1, "j": 12.0}],
+                "j_mean": 12.0,
+                "j_min": 12.0,
+                "j_max": 12.0,
+                "ring_spread": 0.0
+            }]
+        });
+        let mut no_k_out = ctx.run_ui(egui::RawInput { screen_rect: screen, ..Default::default() }, |ui| {
+            solve_summary(ui, &t, &no_k, Some(&mm));
+        });
+        no_k_out.textures_delta.clear();
+        let mut no_k_texts = Vec::new();
+        collect_texts(&no_k_out.shapes, &mut no_k_texts);
+        assert!(no_k_texts.iter().any(|s| s == "J [N/mm]") && !no_k_texts.iter().any(|s| s.contains("K_")), "{no_k_texts:?}");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

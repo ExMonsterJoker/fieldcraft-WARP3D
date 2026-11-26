@@ -25,6 +25,7 @@ pub use cmd::analytic_surfaces;
 pub use cmd::file::OpenFileKind;
 pub use cmd::replace::{MESHERS, Replacement, replacement, thousands};
 pub use cmd::update::enable_checks as enable_update_checks;
+pub use cmd::{DeckFormatInfo, deck_format_info};
 /// Write an output (a picture, an export) where a user named, never over a model or design.
 pub use fieldcraft_io::fs::write_output;
 pub use fieldcraft_io::{Item as ViewItem, ItemKind};
@@ -325,6 +326,13 @@ impl Default for Limits {
     }
 }
 
+/// Fracture invalidation fingerprint: step physics/mesh hash plus optional crack-front set snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FractureInputKey {
+    pub definition: [u8; 32],
+    pub crack_set: Option<(String, Option<fieldcraft_model::Set>)>,
+}
+
 /// The model being edited, the geometry it is built on and the commands that built it.
 #[derive(Debug, Clone, Default)]
 pub struct Session {
@@ -375,6 +383,12 @@ pub struct Session {
     /// The latest result of each solved step, by step name, with the revision it was solved at;
     /// [`Session::result`] hands out only those that describe the current state.
     results: BTreeMap<String, (u64, Arc<StepResult>)>,
+    /// WARP3D 3D fracture domain-integral results by step name, tagged with the revision they
+    /// were solved or imported at (stored in SI). Not persisted in `.fieldcraft` files.
+    pub(crate) fracture_results: BTreeMap<String, (u64, Vec<fieldcraft_warp3d::DomainIntegralResult>)>,
+    /// Invalidation fingerprints for [`Session::fracture_results`] (`definition_hash` plus
+    /// optional crack-front `Set` snapshot).
+    pub(crate) fracture_inputs: BTreeMap<String, FractureInputKey>,
     /// The definition each solved step was solved from ([`fieldcraft_io::results::definition_hash`]): an edit
     /// that leaves it the same keeps the step's result current. Files keep it with the result.
     result_inputs: BTreeMap<String, [u8; 32]>,
@@ -788,6 +802,47 @@ impl Session {
         self.results.get(step).filter(|(revision, _)| *revision == self.revision).map(|(_, r)| r)
     }
 
+    /// Stored WARP3D domain-integral fracture results for `step` (in SI), if solved or imported
+    /// at the current session revision. Returns `None` after model edits or if the step was
+    /// re-solved without fracture output.
+    pub fn fracture_results(&self, step: &str) -> Option<&[fieldcraft_warp3d::DomainIntegralResult]> {
+        self.fracture_results.get(step).filter(|(revision, _)| *revision == self.revision).map(|(_, results)| results.as_slice())
+    }
+
+    /// True when any step has non-empty WARP3D fracture results at the current session revision
+    /// (session-only data that `.fieldcraft` files do not save).
+    pub fn has_unpersisted_fracture(&self) -> bool {
+        self.fracture_results.values().any(|(rev, domains)| *rev == self.revision && !domains.is_empty())
+    }
+
+    /// Sorted step names that currently hold unpersisted WARP3D fracture results at `self.revision`.
+    pub fn unpersisted_fracture_steps(&self) -> Vec<&str> {
+        self.fracture_results
+            .iter()
+            .filter(|(_, (rev, domains))| *rev == self.revision && !domains.is_empty())
+            .map(|(step, _)| step.as_str())
+            .collect()
+    }
+
+    /// Keep WARP3D fracture domain-integral results (in SI) for `step` at the current revision.
+    /// An empty vector clears any prior fracture results and input key for `step`.
+    pub(crate) fn store_fracture_results(
+        &mut self,
+        step: String,
+        fracture: Vec<fieldcraft_warp3d::DomainIntegralResult>,
+        crack_set_name: Option<&str>,
+    ) {
+        if fracture.is_empty() {
+            self.fracture_results.remove(&step);
+            self.fracture_inputs.remove(&step);
+        } else {
+            let definition = fieldcraft_io::results::definition_hash(&self.model, &step, &self.sources).unwrap_or([0; 32]);
+            let crack_set = crack_set_name.map(|name| (name.to_string(), self.model.set(name).cloned()));
+            self.fracture_inputs.insert(step.clone(), FractureInputKey { definition, crack_set });
+            self.fracture_results.insert(step, (self.revision, fracture));
+        }
+    }
+
     /// The steps with a current result.
     pub fn solved_steps(&self) -> impl Iterator<Item = &str> {
         self.results.iter().filter(|(_, (revision, _))| *revision == self.revision).map(|(name, _)| name.as_str())
@@ -796,6 +851,10 @@ impl Session {
     /// Keep a step's result for the current state. With no results shown, the display shows it;
     /// a view of the same step stays as it is (on mode 1 and the last frame if its own are gone).
     pub(crate) fn store_result(&mut self, result: StepResult) {
+        self.store_result_arc(Arc::new(result));
+    }
+
+    pub(crate) fn store_result_arc(&mut self, result: Arc<StepResult>) {
         match &mut self.results_view {
             None => self.results_view = Some(results::ResultsView::for_result(&result, &self.model)),
             Some(v) if v.step == result.step() && results::displacements(&result, v.pick()).is_err() => {
@@ -809,7 +868,9 @@ impl Session {
             Some(f) => self.result_inputs.insert(step.clone(), f),
             None => self.result_inputs.remove(&step),
         };
-        self.results.insert(step.clone(), (self.revision, Arc::new(result)));
+        self.fracture_results.remove(&step);
+        self.fracture_inputs.remove(&step);
+        self.results.insert(step.clone(), (self.revision, result));
         self.results_stored = self.results_stored.wrapping_add(1);
         cmd::views::show_pending(self, &step);
     }
@@ -822,6 +883,8 @@ impl Session {
         let current = fieldcraft_io::results::definition_hash(&self.model, &step, &self.sources) == Some(definition);
         let revision = if current { self.revision } else { next_revision() };
         self.result_inputs.insert(step.clone(), definition);
+        self.fracture_results.remove(&step);
+        self.fracture_inputs.remove(&step);
         self.results.insert(step, (revision, Arc::new(result)));
         current
     }
@@ -848,6 +911,69 @@ impl Session {
             if read.is_some() && read == fieldcraft_io::results::definition_hash(&self.model, step, &self.sources) {
                 *solved = revision;
             }
+        }
+        for (step, (solved, domains)) in self.fracture_results.iter_mut().filter(|(_, (r, _))| *r != revision) {
+            if domains.is_empty() {
+                continue;
+            }
+            let Some(key) = self.fracture_inputs.get(step) else {
+                continue;
+            };
+            let def_matches = fieldcraft_io::results::definition_hash(&self.model, step, &self.sources) == Some(key.definition);
+            let set_matches = match &key.crack_set {
+                None => true,
+                Some((name, snap)) => self.model.set(name) == snap.as_ref(),
+            };
+            if def_matches && set_matches {
+                *solved = revision;
+            }
+        }
+    }
+
+    /// Build a lightweight solve-worker session cloning only the inputs needed by
+    /// `solve.static`, `solve.nonlinear`, and `results.read` (no undo `History`, no
+    /// `Design` / `Surfaces` geometry, and no prior step `results`).
+    pub fn lightweight_solve_session(&self) -> Session {
+        Session {
+            model: self.model.clone(),
+            sources: self.sources.clone(),
+            default_units: self.default_units.clone(),
+            revision: self.revision,
+            results_view: self.results_view.clone(),
+            limits: self.limits,
+            file_access: self.file_access.clone(),
+            opened: self.opened,
+            run: self.run.clone(),
+            solver_diagnostics: self.solver_diagnostics.clone(),
+            origin: self.origin,
+            ..Session::default()
+        }
+    }
+
+    /// Extract the newly solved/imported step result and optional WARP3D fracture data from a
+    /// [`Session::lightweight_solve_session`] worker after `execute(...)` succeeded.
+    pub fn take_solved_step(
+        &mut self,
+        step: &str,
+    ) -> Option<(Arc<StepResult>, Option<(Vec<fieldcraft_warp3d::DomainIntegralResult>, Option<String>)>)> {
+        let (_, result) = self.results.remove(step)?;
+        self.result_inputs.remove(step);
+        let fracture = self.fracture_results.remove(step).map(|(_, domains)| {
+            let crack_set = self.fracture_inputs.remove(step).and_then(|k| k.crack_set.map(|(name, _)| name));
+            (domains, crack_set)
+        });
+        if fracture.is_none() {
+            self.fracture_inputs.remove(step);
+        }
+        Some((result, fracture))
+    }
+
+    /// Merge a step solved/imported on a background worker into this session at `self.revision`.
+    pub fn store_solved_step(&mut self, result: Arc<StepResult>, fracture: Option<(Vec<fieldcraft_warp3d::DomainIntegralResult>, Option<String>)>) {
+        let step = result.step().to_string();
+        self.store_result_arc(result);
+        if let Some((domains, crack_set_name)) = fracture {
+            self.store_fracture_results(step, domains, crack_set_name.as_deref());
         }
     }
 

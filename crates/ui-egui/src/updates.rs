@@ -183,8 +183,7 @@ impl ModelApp {
             }
             return;
         }
-        if self.has_unsaved_work() {
-            self.prompt = Some(Prompt::Unsaved(Replace::Update));
+        if self.prompt_unsaved_or_fracture(Replace::Update) {
             return;
         }
         self.close_to_update();

@@ -50,6 +50,7 @@ pub const TABLE: &[(&str, Class)] = &[
     // L2: solvers.
     ("solver", Class::Layer(2)),
     ("explicit", Class::Layer(2)),
+    ("warp3d", Class::Layer(2)),
     ("lbm", Class::Layer(2)),
     // L3: coupling between solvers (`fsi`, later).
     // L4 and up: the document, files, commands, UI.
@@ -79,6 +80,8 @@ pub const INTRA_LAYER_ORDER: &[&[&str]] = &[
     &["gpu", "lbm-gpu"],
     // So does the projection smoothing GPU device.
     &["gpu", "mesh-gpu"],
+    // The WARP3D adapter converts flat-file results into the solver crate's StaticResult.
+    &["solver", "warp3d"],
 ];
 
 fn intra_layer_allowed(from: &str, to: &str) -> bool {

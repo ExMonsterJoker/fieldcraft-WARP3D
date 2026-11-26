@@ -244,9 +244,9 @@ pub struct ParamsDialog {
 }
 
 /// A command that failed: its message, and the parameter it refused (path, form message).
-struct Failure {
-    message: String,
-    refused: Option<(String, String)>,
+pub(crate) struct Failure {
+    pub(crate) message: String,
+    pub(crate) refused: Option<(String, String)>,
 }
 
 /// The form a "Create …" button left, and where the item made goes in it.
@@ -771,7 +771,7 @@ impl ModelApp {
             self.model_changed();
         }
         // The results display commands reply with what is shown, which the viewport shows.
-        let display = (id.starts_with("results.") && id != "results.reactions") || id == "solve.run";
+        let display = (id.starts_with("results.") && !matches!(id, "results.reactions" | "results.read")) || id == "solve.run";
         // The reaction sums show in the results panel, however they were asked for.
         if id == "results.reactions"
             && let Ok(v) = &r
@@ -809,25 +809,33 @@ impl ModelApp {
             self.follow_stage(id);
         }
         match &r {
-            Ok(v) if v.is_null() || (changed && id != "deck.read") || display => self.set_status(reply::done(id, label, &params, v), false),
-            // Saving and writing a deck say what they wrote, in a sentence (A4-6).
-            Ok(v) if let Some(line) = reply::sentence(id, v) => self.set_status(line, false),
-            // A reply reads as one line; the whole of a rich one shows in the context panel (the
-            // reaction sums have their own place in the results panel).
-            Ok(v) => {
-                let mut line = format!("{label}: {}", reply::summary_in(id, v, Some(self.session.units())));
-                if reply::is_rich(v) && !(id == "results.reactions" && self.plot().is_some()) {
-                    line.push_str(" (details in the panel)");
-                    // Kept with their units: a live reply runs again in whatever units are shown then.
-                    let params = self.session.params_with_units(id, &params);
-                    crate::context::opened(self, crate::context::Opened::Reply);
-                    self.reply = Some(reply::Reply { command: id.to_string(), label: label.to_string(), params, value: v.clone() });
-                }
-                self.set_status(line, false)
-            }
+            Ok(v) => self.apply_command_reply(id, label, &params, v, changed, display),
             Err(e) => self.set_status(format!("{label}: {}", e.message), true),
         }
         r
+    }
+
+    pub(crate) fn apply_command_reply(&mut self, id: &str, label: &str, params: &Value, v: &Value, changed: bool, display: bool) {
+        if v.is_null() || (changed && id != "deck.read") || display {
+            self.set_status(reply::done(id, label, params, v), false);
+            return;
+        }
+        // Saving and writing a deck say what they wrote, in a sentence (A4-6).
+        if let Some(line) = reply::sentence(id, v) {
+            self.set_status(line, false);
+            return;
+        }
+        // A reply reads as one line; the whole of a rich one shows in the context panel (the
+        // reaction sums have their own place in the results panel).
+        let mut line = format!("{label}: {}", reply::summary_in(id, v, Some(self.session.units())));
+        if reply::is_rich(v) && !(id == "results.reactions" && self.plot().is_some()) {
+            line.push_str(" (details in the panel)");
+            // Kept with their units: a live reply runs again in whatever units are shown then.
+            let params = self.session.params_with_units(id, params);
+            crate::context::opened(self, crate::context::Opened::Reply);
+            self.reply = Some(reply::Reply { command: id.to_string(), label: label.to_string(), params, value: v.clone() });
+        }
+        self.set_status(line, false);
     }
 
     /// Run a script (a JSON array of `{command, params}`), stopping at the first error. The
@@ -856,7 +864,7 @@ impl ModelApp {
     /// there would, so commands run by scripts, the control channel and MCP show their stage.
     /// Called after a command changed the model or the results display, and when a form opens;
     /// queries leave the ribbon alone, and a ribbon click never moves it.
-    fn follow_stage(&mut self, id: &str) {
+    pub(crate) fn follow_stage(&mut self, id: &str) {
         if let Some(tab) = catalogue::stage_tab(id) {
             self.ui.select_tab(tab);
         }
@@ -1072,34 +1080,50 @@ impl ModelApp {
         self.dialog_done();
     }
 
-    /// Run the open parameter form; it closes when the command succeeds.
-    #[allow(clippy::disallowed_methods, reason = "creates the form's new set, and takes it back when the form's command fails")]
-    pub fn run_dialog(&mut self) -> Result<Value, String> {
-        let (command, params) = self.dialog_params()?;
-        // The set Use selection made, when the form still names it: created first, and taken back
-        // if the command then fails.
+    /// Create the form's pending `Use selection` set if the submitted parameters still reference it.
+    /// Returns `Ok(true)` if `model.set.create` was executed (so [`rollback_pending_set`] must undo it on failure/cancel).
+    #[allow(clippy::disallowed_methods, reason = "creates the form's new set right before command dispatch")]
+    pub(crate) fn create_pending_set(&mut self, params: &Value) -> Result<bool, String> {
         let pending = self.dialog.as_ref().and_then(|d| d.pending_set.clone()).filter(|set| {
             let name = set.get("name").and_then(Value::as_str);
-            name.is_some() && [params.pointer("/target/set"), params.get("set")].into_iter().flatten().any(|v| v.as_str() == name)
+            name.is_some()
+                && [params.pointer("/target/set"), params.get("set"), params.pointer("/crack_front/set")]
+                    .into_iter()
+                    .flatten()
+                    .any(|v| v.as_str() == name)
         });
-        if let Some(set) = &pending
-            && let Err(e) = self.session.execute("model.set.create", set)
-        {
-            let message = format!("the selection's set: {e}");
-            if let Some(open) = self.dialog.as_mut() {
-                open.error = Some(message.clone());
+        if let Some(set) = &pending {
+            if let Err(e) = self.session.execute("model.set.create", set) {
+                let message = format!("the selection's set: {e}");
+                if let Some(open) = self.dialog.as_mut() {
+                    open.error = Some(message.clone());
+                }
+                return Err(message);
             }
-            return Err(message);
+            self.model_changed();
+            return Ok(true);
         }
+        Ok(false)
+    }
+
+    #[allow(clippy::disallowed_methods, reason = "takes back the temporary pending Use selection set when its command fails or cancels")]
+    pub(crate) fn rollback_pending_set(&mut self) {
+        let _ = self.session.execute("edit.undo", &json!({}));
+        self.model_changed();
+    }
+
+    /// Run the open parameter form; it closes when the command succeeds.
+    pub fn run_dialog(&mut self) -> Result<Value, String> {
+        let (command, params) = self.dialog_params()?;
+        let pending_created = self.create_pending_set(&params)?;
         match self.run_form(command, params, true) {
             Ok(v) => {
                 self.form_done();
                 Ok(v)
             }
             Err(Failure { message, refused }) => {
-                if pending.is_some() {
-                    let _ = self.session.execute("edit.undo", &json!({}));
-                    self.model_changed();
+                if pending_created {
+                    self.rollback_pending_set();
                 }
                 if let Some(open) = self.dialog.as_mut() {
                     open.error = Some(message.clone());

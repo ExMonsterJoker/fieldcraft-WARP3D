@@ -84,7 +84,7 @@ pub const EXPORT_VTU: CommandSpec = CommandSpec {
 pub const EXPORT_CSV: CommandSpec = CommandSpec {
     id: "results.export.csv",
     label: "Export Results (CSV)",
-    params: r#"{"what": "probe" | "reactions", "path": "tip.csv", "step": "Load", …} — writes probe or reaction results as a CSV file (RFC 4180, a header line, numbers in shortest round-trip form); the other parameters are solve.probe's (`nodes`, `at` or `set`, `mode`, `frame`) or results.reactions' (`sets`, `about`). Probe: a row per node with node, x, y, z and the quantities the step has; reactions: a row per set, a total row and an applied row. Replies with the path, rows, columns, step and units"#,
+    params: r#"{"what": "probe" | "reactions" | "fracture", "path": "tip.csv", "step": "Load", …} — writes probe, reaction, or WARP3D fracture domain-integral results as a CSV file (RFC 4180, a header line, numbers in shortest round-trip form); the other parameters are solve.probe's (`nodes`, `at` or `set`, `mode`, `frame`) or results.reactions' (`sets`, `about`). Probe: a row per node with node, x, y, z and the quantities the step has; reactions: a row per set, a total row and an applied row; fracture: a row per crack-front domain with domain_id, step, s_position, front_nodes, area_aq, J, K, T-stress, and normal/tangent/advance directions in display units. Replies with the path, rows, columns, step and units"#,
     form: Some(super::forms::EXPORT_CSV),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
@@ -129,6 +129,16 @@ pub const CLEAR: CommandSpec = CommandSpec {
     kind: CommandKind::Session,
     requires: &[Requirement::ResultsShown],
     run: clear,
+};
+
+pub const READ: CommandSpec = CommandSpec {
+    id: "results.read",
+    label: "Read External Results",
+    params: r#"{"format": "warp3d", "path": "run_dir", "step": "Load", "units": "mm-t-s-N-MPa|m-kg-s-N-Pa|mm-kg-ms-kN-GPa|mm-g-ms-N-MPa|in-lbf-s-psi"} — reads external solver results (WARP3D flat text files `wnd*_text`, `wns*_text`, `wes*_text`, `wnr*_text`, and optional `.out`/`.log` 3D fracture domain/interaction integral tables) for a step of the current model, converts them to SI, and keeps them in the session for contours, deformed view, reactions, XY plots, fracture CSV export (`results.export.csv`) and saving (session-only fracture tables are not persisted in `.fieldcraft` files)"#,
+    form: Some(super::forms::RESULTS_READ),
+    kind: CommandKind::Session,
+    requires: &[Requirement::Analysable, Requirement::ElementMaterial, Requirement::ElementSection, Requirement::Step],
+    run: read,
 };
 
 /// Most sets one reaction sum lists.
@@ -1054,7 +1064,36 @@ fn export_csv(s: &mut Session, p: &Value) -> Result<Value> {
             crate::units::convert_reply("results.reactions", &mut r, crate::units::si(), &display)?;
             (r.get("step").cloned().unwrap_or(Value::Null), reactions_table(&r, &display))
         }
-        _ => return Err(EngineError::Params("`what` must be \"probe\" or \"reactions\"".into())),
+        "fracture" => {
+            let step = if let Some(step) = opt::<String>(p, "step")? {
+                step
+            } else if let Some(v) = &s.results_view
+                && s.fracture_results.contains_key(&v.step)
+            {
+                v.step.clone()
+            } else {
+                let mut steps: Vec<&str> = s.unpersisted_fracture_steps();
+                if steps.is_empty() {
+                    steps = s.fracture_results.keys().map(String::as_str).collect();
+                }
+                match steps.as_slice() {
+                    [only] => (*only).to_string(),
+                    [] => return Err(EngineError::Params("no step has WARP3D fracture results to export".into())),
+                    _ => return Err(EngineError::Params("multiple steps have fracture results; specify `step`".into())),
+                }
+            };
+            let domains = match s.fracture_results(&step) {
+                Some(d) if !d.is_empty() => d,
+                _ if s.fracture_results.contains_key(&step) => {
+                    return Err(EngineError::Params(format!(
+                        "the fracture result of step `{step}` is stale (the model changed since it was solved); solve it again"
+                    )));
+                }
+                _ => return Err(EngineError::Params(format!("step `{step}` has no WARP3D fracture results to export"))),
+            };
+            (json!(step), fracture_table(&step, domains, &display)?)
+        }
+        _ => return Err(EngineError::Params("`what` must be \"probe\", \"reactions\", or \"fracture\"".into())),
     };
     let text = table.csv();
     fieldcraft_io::fs::write_output(std::path::Path::new(&path), text.as_bytes())?;
@@ -1215,6 +1254,100 @@ fn reactions_table(r: &Value, display: &fieldcraft_model::DisplaySystem) -> Tabl
         rows.push(row("applied", &json!({"force": applied})));
     }
     Table::from_named(rows)
+}
+
+fn fracture_table(step: &str, domains: &[crate::results::DomainIntegralResult], display: &fieldcraft_model::DisplaySystem) -> Result<Table> {
+    use fieldcraft_model::units::Quantity;
+    let area_unit = display.symbol(Quantity::Area);
+    let j_unit = display.symbol(Quantity::ForcePerLength);
+    let p_unit = display.symbol(Quantity::Pressure);
+    let (k_scale, k_unit) = crate::units::stress_sqrt_length_scale(crate::units::si(), display);
+
+    let express = |q: Quantity, v: f64| -> Result<Cell> {
+        let shown = display.express(q, v).map_err(|e| EngineError::Params(format!("unit conversion error: {e}")))?;
+        Ok(if shown.is_finite() { Cell::Number(shown) } else { Cell::Empty })
+    };
+    let opt_express = |q: Quantity, v: Option<f64>| -> Result<Cell> {
+        match v {
+            Some(x) => express(q, x),
+            None => Ok(Cell::Empty),
+        }
+    };
+    let opt_k = |v: Option<f64>| -> Cell {
+        match v.map(|x| x * k_scale) {
+            Some(x) if x.is_finite() => Cell::Number(x),
+            _ => Cell::Empty,
+        }
+    };
+
+    let mut rows = Vec::with_capacity(domains.len());
+    for d in domains {
+        let nodes_str = d.front_nodes.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+        rows.push(vec![
+            ("domain_id".into(), Cell::Text(d.domain_id.clone())),
+            ("step".into(), Cell::Text(step.to_string())),
+            ("s_position".into(), d.s_position.filter(|v| v.is_finite()).map_or(Cell::Empty, Cell::Number)),
+            ("front_nodes".into(), if nodes_str.is_empty() { Cell::Empty } else { Cell::Text(nodes_str) }),
+            (titled("area_aq", Some(area_unit)), express(Quantity::Area, d.area_aq)?),
+            (titled("j_mean", Some(j_unit)), express(Quantity::ForcePerLength, d.j_mean)?),
+            (titled("j_min", Some(j_unit)), express(Quantity::ForcePerLength, d.j_min)?),
+            (titled("j_max", Some(j_unit)), express(Quantity::ForcePerLength, d.j_max)?),
+            ("ring_spread".into(), if d.ring_spread.is_finite() { Cell::Number(d.ring_spread) } else { Cell::Empty }),
+            (titled("j_total", Some(j_unit)), opt_express(Quantity::ForcePerLength, d.j_total)?),
+            (titled("k_j_plane_strain", Some(&k_unit)), opt_k(d.k_j_plane_strain)),
+            (titled("k_j_plane_stress", Some(&k_unit)), opt_k(d.k_j_plane_stress)),
+            (titled("k_i_mean", Some(&k_unit)), opt_k(d.k_i_mean)),
+            (titled("k_ii_mean", Some(&k_unit)), opt_k(d.k_ii_mean)),
+            (titled("k_iii_mean", Some(&k_unit)), opt_k(d.k_iii_mean)),
+            (titled("t_11_mean", Some(p_unit)), opt_express(Quantity::Pressure, d.t_11_mean)?),
+            (titled("t_33_mean", Some(p_unit)), opt_express(Quantity::Pressure, d.t_33_mean)?),
+            ("normal_x".into(), Cell::Number(d.normal[0])),
+            ("normal_y".into(), Cell::Number(d.normal[1])),
+            ("normal_z".into(), Cell::Number(d.normal[2])),
+            ("tangent_x".into(), Cell::Number(d.tangent[0])),
+            ("tangent_y".into(), Cell::Number(d.tangent[1])),
+            ("tangent_z".into(), Cell::Number(d.tangent[2])),
+            ("advance_x".into(), Cell::Number(d.advance[0])),
+            ("advance_y".into(), Cell::Number(d.advance[1])),
+            ("advance_z".into(), Cell::Number(d.advance[2])),
+        ]);
+    }
+    Ok(Table::from_named(rows))
+}
+
+fn read(s: &mut Session, p: &Value) -> Result<Value> {
+    let format: &str = super::req(p, "format")?;
+    if format != "warp3d" {
+        return Err(EngineError::invalid("format", "only `warp3d` is supported by results.read"));
+    }
+    let path = super::file_param(s, p, "path", fieldcraft_io::roots::Access::Read)?;
+    let step = opt::<String>(p, "step")?;
+    let units = match opt::<String>(p, "units")? {
+        Some(label) => Some(
+            fieldcraft_model::units::Preset::from_label(&label)
+                .ok_or_else(|| EngineError::invalid("units", "choose a known consistent unit preset"))?,
+        ),
+        None => None,
+    };
+    let sol =
+        fieldcraft_warp3d::read_results_dir(&s.model, step.as_deref().unwrap_or(""), std::path::Path::new(&path), units).map_err(|e| match e {
+            fieldcraft_warp3d::Warp3dError::Model(m) => EngineError::Model(m),
+            other => EngineError::Params(format!("cannot read WARP3D results: {other}")),
+        })?;
+    let step_name = sol.static_result.step.clone();
+    let mut summary = if sol.static_result.nonlinear.is_some() {
+        super::solve::nonlinear_summary(&sol.static_result, s.units())
+    } else {
+        super::solve::static_summary(&sol.static_result, s.units())
+    };
+    summary["format"] = json!("warp3d");
+    summary["path"] = json!(path);
+    if !sol.fracture.is_empty() {
+        summary["fracture"] = json!(&sol.fracture);
+    }
+    s.store_result(crate::StepResult::Implicit(fieldcraft_solver::StepResult::Static(sol.static_result)));
+    s.store_fracture_results(step_name, sol.fracture, None);
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -1811,5 +1944,266 @@ mod tests {
             let e = empty.execute(id, &json!({"field": "displacement"})).unwrap_err().to_string();
             assert!(e.contains("solve"), "{id}: {e}");
         }
+    }
+
+    #[test]
+    fn results_read_imports_warp3d_flat_files_and_round_trips_mcrslt05() {
+        let dir = scratch("warp3d-read");
+        let mut s = Session::default();
+        let script = json!([
+            {"command": "model.units", "params": {"system": "mm-t-s-N-MPa"}},
+            {"command": "mesh.node.add", "params": {"label": 1, "xyz": [0, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 2, "xyz": [1000, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 3, "xyz": [1000, 1000, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 4, "xyz": [0, 1000, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 5, "xyz": [0, 0, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 6, "xyz": [1000, 0, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 7, "xyz": [1000, 1000, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 8, "xyz": [0, 1000, 1000]}},
+            {"command": "mesh.element.add", "params": {"label": 1, "kind": "hex8", "nodes": [1, 2, 3, 4, 5, 6, 7, 8]}},
+            {"command": "model.set.create", "params": {"name": "all", "elements": [1]}},
+            {"command": "model.set.create", "params": {"name": "fix", "nodes": [1, 4, 5, 8]}},
+            {"command": "model.set.create", "params": {"name": "tip", "nodes": [2, 3, 6, 7]}},
+            {
+                "command": "model.material.create",
+                "params": {
+                    "name": "Steel",
+                    "elastic": {"type": "isotropic", "young": 210000, "poisson": 0.3},
+                    "plastic": {"type": "bilinear", "yield_stress": 250, "hardening_modulus": 1000, "hardening": "isotropic"}
+                }
+            },
+            {"command": "model.section.create", "params": {"name": "solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+            {"command": "model.boundary_condition.create", "params": {"name": "clamp", "type": "fixed", "target": {"set": "fix"}}},
+            {"command": "model.load.create", "params": {"name": "pull", "type": "force", "target": {"set": "tip"}, "vector": [20000, 0, 0]}},
+            {
+                "command": "model.step.create",
+                "params": {
+                    "name": "Pull",
+                    "procedure": {"type": "nonlinear_static", "initial_increment": 0.5, "max_increments": 10},
+                    "boundary_conditions": ["clamp"],
+                    "loads": ["pull"],
+                    "output": ["displacement", "stress", "reaction_force"]
+                }
+            }
+        ]);
+        s.run_script(&script).unwrap();
+
+        let err_fmt = s.execute("results.read", &json!({"format": "abaqus", "path": dir.to_string_lossy()})).unwrap_err();
+        assert!(matches!(&err_fmt, EngineError::Param(p) if p.path == "format"), "{err_fmt}");
+        let err_missing = s.execute("results.read", &json!({"format": "warp3d"})).unwrap_err();
+        assert!(matches!(&err_missing, EngineError::Param(p) if p.path == "path"), "{err_missing}");
+        let err_no_dir =
+            s.execute("results.read", &json!({"format": "warp3d", "path": dir.join("missing").to_string_lossy()})).unwrap_err().to_string();
+        assert!(err_no_dir.contains("does not exist"), "{err_no_dir}");
+
+        // Write header declaring mm-t-s-N-MPa + two increment flat-file sets (0000001 and 0000002).
+        std::fs::write(dir.join("model.inp"), "! fieldcraft-units: mm-t-s-N-MPa\n").unwrap();
+        let row26 = |sxx: f64, sxy: f64, syz: f64, sxz: f64, vm: f64, eps: f64| -> String {
+            let mut cols = [0.0f64; 26];
+            cols[0] = sxx;
+            cols[3] = sxy;
+            cols[4] = syz;
+            cols[5] = sxz;
+            cols[7] = vm;
+            cols[8] = eps;
+            cols.iter().map(|v| format!("{v:.8e}")).collect::<Vec<_>>().join(" ")
+        };
+
+        for (step_tag, u_tip, rx_fix, sxx, vm, eps) in
+            [("0000001", 0.25, -2500.0, 100.0, 150.0, 0.0025), ("0000002", 1.5, -5000.0, 200.0, 250.0, 0.012)]
+        {
+            let wnd = (1..=8)
+                .map(|n| if [2, 3, 6, 7].contains(&n) { format!("{u_tip} 0.0 0.0") } else { "0.0 0.0 0.0".into() })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let wnr = (1..=8)
+                .map(|n| if [1, 4, 5, 8].contains(&n) { format!("{rx_fix} 0.0 0.0") } else { "999.0 0.0 0.0".into() })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let srow = row26(sxx, 10.0, 20.0, 30.0, vm, 0.0);
+            let wns = vec![srow; 8].join("\n");
+            let wes = row26(sxx, 0.0, 0.0, 0.0, vm, eps);
+            std::fs::write(dir.join(format!("wnd{step_tag}_text")), format!("#\n{wnd}\n")).unwrap();
+            std::fs::write(dir.join(format!("wnr{step_tag}_text")), format!("#\n{wnr}\n")).unwrap();
+            std::fs::write(dir.join(format!("wns{step_tag}_text")), format!("#\n{wns}\n")).unwrap();
+            std::fs::write(dir.join(format!("wes{step_tag}_text")), format!("#\n{wes}\n")).unwrap();
+        }
+
+        let reply = s.execute("results.read", &json!({"format": "warp3d", "path": dir.to_string_lossy()})).unwrap();
+        assert_eq!(reply["format"], "warp3d");
+        assert_eq!(reply["step"], "Pull");
+        // Display units are mm-t-s-N-MPa, so reply matches input mm / MPa / N numbers!
+        assert!((reply["max_displacement"]["value"].as_f64().unwrap() - 1.5).abs() < 1e-12, "{reply}");
+        assert!((reply["max_von_mises"]["value"].as_f64().unwrap() - 250.0).abs() < 1e-9, "{reply}");
+        assert!((reply["max_plastic_strain"]["value"].as_f64().unwrap() - 0.012).abs() < 1e-12, "{reply}");
+        assert!((reply["reaction_total"][0].as_f64().unwrap() - (-20000.0)).abs() < 1e-9, "{reply}");
+
+        // Stored SI values in session match SI conversion (mm -> m, MPa -> Pa) and Voigt 4<->5 swap.
+        let stored = s.result("Pull").unwrap().clone();
+        let Kind::Static(st) = stored.kind() else { panic!() };
+        assert!((st.displacement[1][0] - 0.0015).abs() < 1e-12);
+        assert!((st.stress[1][0] - 200.0e6).abs() < 1e-3);
+        assert!((st.stress[1][4] - 30.0e6).abs() < 1e-3, "sxz mapped to index 4");
+        assert!((st.stress[1][5] - 20.0e6).abs() < 1e-3, "syz mapped to index 5");
+        assert_eq!(st.elements[0].plastic_strain, vec![0.012]);
+        assert_eq!(st.reaction[1], [0.0, 0.0, 0.0], "free node residual masked to zero");
+
+        // Downstream visualization, query, and .fieldcraft persistence all work.
+        s.execute("results.contour", &json!({"step": "Pull", "field": "von_mises"})).unwrap();
+        s.execute("results.deformed", &json!({"step": "Pull", "show": true, "scale": 10.0})).unwrap();
+        let rx = s.execute("results.reactions", &json!({"step": "Pull", "sets": ["fix"]})).unwrap();
+        assert!((rx["total"]["force"][0].as_f64().unwrap() - (-20000.0)).abs() < 1e-9, "{rx}");
+        let xy = s.execute("results.xy", &json!({"step": "Pull", "y": {"field": "displacement_x", "node": 2}})).unwrap();
+        assert_eq!(xy["points"], 3, "Frame 0 + 2 increments");
+        let probe = s.execute("solve.probe", &json!({"step": "Pull", "nodes": [2], "elements": [1]})).unwrap();
+        assert!((probe["nodes"][0]["displacement"][0].as_f64().unwrap() - 1.5).abs() < 1e-12, "{probe}");
+        assert!((probe["elements"][0]["plastic_strain"][0].as_f64().unwrap() - 0.012).abs() < 1e-12, "{probe}");
+
+        let fc_path = dir.join("roundtrip.fieldcraft");
+        s.execute("file.save_as", &json!({"path": fc_path.to_string_lossy()})).unwrap();
+        let mut reopened = Session::default();
+        reopened.execute("file.open", &json!({"path": fc_path.to_string_lossy()})).unwrap();
+        assert_eq!(reopened.result("Pull").unwrap(), s.result("Pull").unwrap(), "MCRSLT05 round-trip preserves stored WARP3D result");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn results_read_imports_warp3d_fracture_stdout_and_surfaces_in_probe() {
+        let dir = scratch("warp3d-fracture-read");
+        let mut s = Session::default();
+        let script = json!([
+            {"command": "model.units", "params": {"system": "mm-t-s-N-MPa"}},
+            {"command": "mesh.node.add", "params": {"label": 1, "xyz": [0, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 2, "xyz": [1000, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 3, "xyz": [1000, 1000, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 4, "xyz": [0, 1000, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 5, "xyz": [0, 0, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 6, "xyz": [1000, 0, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 7, "xyz": [1000, 1000, 1000]}},
+            {"command": "mesh.node.add", "params": {"label": 8, "xyz": [0, 1000, 1000]}},
+            {"command": "mesh.element.add", "params": {"label": 1, "kind": "hex8", "nodes": [1, 2, 3, 4, 5, 6, 7, 8]}},
+            {"command": "model.set.create", "params": {"name": "all", "elements": [1]}},
+            {"command": "model.set.create", "params": {"name": "fix", "nodes": [1, 4, 5, 8]}},
+            {"command": "model.set.create", "params": {"name": "tip", "nodes": [2, 3, 6, 7]}},
+            {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": 210000, "poisson": 0.3}}},
+            {"command": "model.section.create", "params": {"name": "solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+            {"command": "model.boundary_condition.create", "params": {"name": "clamp", "type": "fixed", "target": {"set": "fix"}}},
+            {"command": "model.load.create", "params": {"name": "pull", "type": "force", "target": {"set": "tip"}, "vector": [20000, 0, 0]}},
+            {"command": "model.step.create", "params": {"name": "Pull", "procedure": {"type": "static"}, "boundary_conditions": ["clamp"], "loads": ["pull"]}}
+        ]);
+        s.run_script(&script).unwrap();
+
+        std::fs::write(dir.join("model.inp"), "! fieldcraft-units: mm-t-s-N-MPa\n").unwrap();
+        let row26 = vec!["0.0"; 26].join(" ");
+        std::fs::write(dir.join("wnd0000001_text"), format!("#\n{}", "0.1 0.0 0.0\n".repeat(8))).unwrap();
+        std::fs::write(dir.join("wnr0000001_text"), format!("#\n{}", "0.0 0.0 0.0\n".repeat(8))).unwrap();
+        std::fs::write(dir.join("wns0000001_text"), format!("#\n{}", [row26.as_str(); 8].join("\n"))).unwrap();
+        std::fs::write(dir.join("wes0000001_text"), format!("#\n{row26}\n")).unwrap();
+        // Values below are in mm-t-s-N-MPa (N/mm for J, MPa·√mm for K, MPa for T, mm^2 for A_q).
+        let stdout_table = "\
+     Domain definition:  cf_0001
+
+        Number of front nodes:    2 Nodes on front:
+              2      3
+        Direction cosines:   0.000000  1.000000  0.000000
+        Tangent vector direction cosines:   0.000000  0.000000  1.000000
+        Front order:  1     Verify front: T Domain type:  4
+     ** end of domain definition **
+
+                         domain-integral post-processing
+                         -------------------------------
+ step:     1
+ domain id: cf_0001
+ area under q along front:        2.500000E+01
+
+                                             J-integral components
+                                          ===========================
+ domain        dm1          dm2          dm3          dm4          dm5          dm6          dm7          dm8       total J   killed ele
+     1     1.1500E+01   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   1.1500E+01   (  0)
+     2     1.2500E+01   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   1.2500E+01   (  0)
+
+    average:  1.2000E+01   minimum:  1.1500E+01   maximum: 1.2500E+01     (cf_0001)
+  1.2000E+01  1.1500E+01  1.2500E+01
+
+          Stress intensity factors obtained from J-values assuming pure mode I, mode II or mode III loading
+ domain   KI plane stress   KI plane strain   KII plane stress   KII plane strain   KIII anti-plane shear
+     1     5.0000E+01       5.2000E+01        0.0000E+00        0.0000E+00          0.0000E+00
+     2     5.4000E+01       5.6000E+01        0.0000E+00        0.0000E+00          0.0000E+00
+
+               Static I-values
+                          -- KI = 1, KII = 0, KIII = 0, plane strain --
+ domain        II1          II2          II3          II4          II5          II6          II7          II8       total I     KI (pstrn) killed ele
+     1     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   5.1000E+01   (  0)
+     2     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   5.5000E+01   (  0)
+    average:  5.3000E+01   minimum:  5.1000E+01   maximum: 5.5000E+01     (cf_0001)
+  5.3000E+01  5.1000E+01  5.5000E+01
+
+                          --T-stress (\"plane strain\" auxiliary fields)--
+ domain        II1          II2          II3          II4          II5          II6          II7          II8       total I     T11 (pstrn)      T33     killed ele
+     1     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00  -1.4000E+01  -4.0000E+00   (  0)
+     2     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00  -1.6000E+01  -5.0000E+00   (  0)
+    average:     minimum:     maximum:     (cf_0001)
+ -1.5000E+01 -1.4000E+01 -1.6000E+01
+ -4.5000E+00 -4.0000E+00 -5.0000E+00
+";
+        std::fs::write(dir.join("warp3d.out"), stdout_table).unwrap();
+
+        let reply = s.execute("results.read", &json!({"format": "warp3d", "path": dir.to_string_lossy()})).unwrap();
+        assert!(reply.get("k_unit").is_none());
+        assert_eq!(reply["units"]["stress_intensity"], "MPa·√mm");
+        assert_eq!(reply["units"]["force_per_length"], "N/mm");
+        assert_eq!(reply["units"]["area"], "mm²");
+        let f = &reply["fracture"][0];
+        assert_eq!(f["domain_id"], "cf_0001");
+        assert_eq!(f["front_nodes"], json!([2, 3]));
+        assert!((f["area_aq"].as_f64().unwrap() - 25.0).abs() < 1e-12);
+        assert!((f["j_mean"].as_f64().unwrap() - 12.0).abs() < 1e-12);
+        assert!((f["k_i_mean"].as_f64().unwrap() - 53.0).abs() < 1e-9);
+        assert!((f["t_11_mean"].as_f64().unwrap() - (-15.0)).abs() < 1e-9);
+        assert!((f["t_33_mean"].as_f64().unwrap() - (-4.5)).abs() < 1e-9);
+
+        // Session stores exact SI values.
+        let stored = s.fracture_results("Pull").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!((stored[0].j_mean - 12_000.0).abs() < 1e-6);
+        assert!((stored[0].area_aq - 2.5e-5).abs() < 1e-12);
+
+        // solve.probe no longer attaches fracture data or k_unit.
+        let probe = s.execute("solve.probe", &json!({"step": "Pull", "nodes": [2]})).unwrap();
+        assert!(probe.get("k_unit").is_none());
+        assert!(probe.get("fracture").is_none());
+        assert!(probe["units"].get("stress_intensity").is_none());
+
+        // results.export.csv with what: "fracture" writes display-unit domain rows.
+        let frac_csv_mm = dir.join("fracture_mm.csv");
+        let csv_reply_mm =
+            s.execute("results.export.csv", &json!({"what": "fracture", "step": "Pull", "path": frac_csv_mm.to_string_lossy()})).unwrap();
+        assert_eq!(csv_reply_mm["rows"], 1);
+        let csv_text_mm = std::fs::read_to_string(&frac_csv_mm).unwrap();
+        assert!(csv_text_mm.contains("j_mean [N/mm]"), "{csv_text_mm}");
+        assert!(csv_text_mm.contains("k_i_mean [MPa·√mm]"), "{csv_text_mm}");
+        assert!(csv_text_mm.contains("cf_0001") && csv_text_mm.contains("2 3"), "{csv_text_mm}");
+
+        // Switching display units preserves fracture results via refresh_results() and re-exports in SI.
+        s.execute("model.units", &json!({"system": "m-kg-s-N-Pa"})).unwrap();
+        assert!(s.fracture_results("Pull").is_some());
+        let frac_csv_si = dir.join("fracture_si.csv");
+        s.execute("results.export.csv", &json!({"what": "fracture", "step": "Pull", "path": frac_csv_si.to_string_lossy()})).unwrap();
+        let csv_text_si = std::fs::read_to_string(&frac_csv_si).unwrap();
+        assert!(csv_text_si.contains("j_mean [N/m]"), "{csv_text_si}");
+        assert!(csv_text_si.contains("k_i_mean [Pa·√m]"), "{csv_text_si}");
+        assert!(csv_text_si.contains("12000"), "{csv_text_si}");
+
+        // A model edit invalidates stored fracture results and CSV export refuses stale data.
+        s.execute("mesh.node.add", &json!({"label": 99, "xyz": [500, 500, 500]})).unwrap();
+        assert!(s.fracture_results("Pull").is_none());
+        let stale_err = s
+            .execute("results.export.csv", &json!({"what": "fracture", "step": "Pull", "path": frac_csv_si.to_string_lossy()}))
+            .unwrap_err()
+            .to_string();
+        assert!(stale_err.contains("stale"), "{stale_err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

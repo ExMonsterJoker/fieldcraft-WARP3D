@@ -493,7 +493,9 @@ pub const REPLIES: &[(&str, &[(&str, Dim)])] = &[
         ],
     ),
     ("solve.static", STATIC),
+    ("solve.static", FRACTURE),
     ("solve.nonlinear", NONLINEAR),
+    ("solve.nonlinear", FRACTURE),
     (
         "solve.heat",
         &[
@@ -627,6 +629,8 @@ pub const REPLIES: &[(&str, &[(&str, Dim)])] = &[
             ("/samples/*/stress", Dim::Stress),
         ],
     ),
+    ("results.read", NONLINEAR),
+    ("results.read", FRACTURE),
 ];
 
 /// The lengths of a mesh plan ([`fieldcraft_model::MeshPlan`]) as JSON: `mesh.plan`'s reply and
@@ -790,6 +794,90 @@ const NONLINEAR: &[(&str, Dim)] = &[
     ("/contacts/*/penetration", Dim::Length),
 ];
 
+/// WARP3D 3D fracture domain-integral quantities attached under `/fracture/*`.
+const FRACTURE: &[(&str, Dim)] = &[
+    ("/fracture/*/area_aq", Dim::Area),
+    ("/fracture/*/j_mean", Dim::Of(Quantity::ForcePerLength)),
+    ("/fracture/*/j_min", Dim::Of(Quantity::ForcePerLength)),
+    ("/fracture/*/j_max", Dim::Of(Quantity::ForcePerLength)),
+    ("/fracture/*/j_total", Dim::Of(Quantity::ForcePerLength)),
+    ("/fracture/*/rings/*/j", Dim::Of(Quantity::ForcePerLength)),
+    ("/fracture/*/t_11_mean", Dim::Stress),
+    ("/fracture/*/t_33_mean", Dim::Stress),
+    ("/fracture/*/rings/*/t_11", Dim::Stress),
+    ("/fracture/*/rings/*/t_33", Dim::Stress),
+];
+
+/// Scale factor and formatted unit label (`<stress>·√<length>`) for stress-intensity factors
+/// ($K_I$, $K_{II}$, $K_{III}$, $K_J$) converted from `from` to `to`, derived solely from
+/// [`Quantity::Pressure`] and [`Quantity::Length`].
+pub fn stress_sqrt_length_scale(from: &DisplaySystem, to: &DisplaySystem) -> (f64, String) {
+    let ratio = |q: Quantity| -> f64 {
+        let (a, b) = (from.unit_ref(q), to.unit_ref(q));
+        if same_unit(a, b) {
+            return 1.0;
+        }
+        q.to_si(1.0, a).and_then(|si| q.express(si, b)).unwrap_or(1.0)
+    };
+    let p_ratio = ratio(Quantity::Pressure);
+    let l_ratio = ratio(Quantity::Length);
+    let scale = if p_ratio.is_finite() && l_ratio.is_finite() && l_ratio > 0.0 { p_ratio * l_ratio.sqrt() } else { 1.0 };
+    let unit = format!("{}·√{}", to.symbol(Quantity::Pressure), to.symbol(Quantity::Length));
+    (scale, unit)
+}
+
+fn scale_k_field(obj: &mut Map<String, Value>, key: &str, scale: f64) -> bool {
+    let Some(val) = obj.get_mut(key) else {
+        return false;
+    };
+    let Some(x) = val.as_f64() else {
+        return false;
+    };
+    if scale != 1.0
+        && let Some(n) = serde_json::Number::from_f64(x * scale)
+    {
+        *val = Value::Number(n);
+    }
+    true
+}
+
+/// Scale all numeric stress-intensity fields (`k_*`) inside a non-empty `"fracture"` array from
+/// `from` to `to`, recording `"stress_intensity"` inside `units` only when at least one numeric `k_*`
+/// field is present.
+pub fn convert_fracture_k(reply: &mut Value, from: &DisplaySystem, to: &DisplaySystem, units: &mut Map<String, Value>) {
+    let Some(root) = reply.as_object_mut() else {
+        return;
+    };
+    let Some(fracture) = root.get_mut("fracture").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if fracture.is_empty() {
+        return;
+    }
+    let (scale, k_unit) = stress_sqrt_length_scale(from, to);
+    let mut any_k = false;
+    for domain in fracture.iter_mut() {
+        let Some(dom_obj) = domain.as_object_mut() else {
+            continue;
+        };
+        for key in ["k_j_plane_strain", "k_j_plane_stress", "k_i_mean", "k_ii_mean", "k_iii_mean"] {
+            any_k |= scale_k_field(dom_obj, key, scale);
+        }
+        if let Some(rings) = dom_obj.get_mut("rings").and_then(Value::as_array_mut) {
+            for ring in rings.iter_mut() {
+                if let Some(ring_obj) = ring.as_object_mut() {
+                    for key in ["k_i", "k_ii", "k_iii"] {
+                        any_k |= scale_k_field(ring_obj, key, scale);
+                    }
+                }
+            }
+        }
+    }
+    if any_k {
+        units.insert("stress_intensity".into(), json!(k_unit));
+    }
+}
+
 /// Whether JSON pointer `pattern` (`*` for any segment, empty for the root) names `path`.
 fn matches(pattern: &str, path: &[String]) -> bool {
     let mut segments = pattern.split('/').filter(|s| !s.is_empty());
@@ -818,11 +906,17 @@ pub fn convert_reply(id: &str, reply: &mut Value, from: &DisplaySystem, to: &Dis
     let mut units = Map::new();
     let mut path = Vec::new();
     reply_values(reply, None, &mut path, &rules, from, to, &mut units)?;
+    convert_fracture_k(reply, from, to, &mut units);
     if let Value::Object(o) = reply
         && !units.is_empty()
-        && !o.contains_key("units")
     {
-        o.insert("units".into(), Value::Object(units));
+        if !o.contains_key("units") {
+            o.insert("units".into(), Value::Object(units));
+        } else if let Some(Value::Object(existing)) = o.get_mut("units")
+            && let Some(k_unit) = units.get("stress_intensity")
+        {
+            existing.insert("stress_intensity".into(), k_unit.clone());
+        }
     }
     Ok(())
 }
@@ -1125,5 +1219,173 @@ mod tests {
         );
         // Read in any other system, it is what was typed.
         assert_eq!(convert_params(FORM, &annotated, &DisplaySystem::default(), si()).unwrap(), convert_params(FORM, &p, &m, si()).unwrap());
+    }
+
+    #[test]
+    fn stress_sqrt_length_scale_and_fracture_reply_conversion() {
+        let (id_scale, id_unit) = stress_sqrt_length_scale(si(), si());
+        assert_eq!(id_scale, 1.0);
+        assert_eq!(id_unit, "Pa·√m");
+
+        for preset in Preset::ALL {
+            let display = DisplaySystem::new(preset);
+            let (scale, k_unit) = stress_sqrt_length_scale(si(), &display);
+            let (back, back_unit) = stress_sqrt_length_scale(&display, si());
+            let expected = display.express(Quantity::Pressure, 1.0).unwrap() * display.express(Quantity::Length, 1.0).unwrap().sqrt();
+            assert!((scale - expected).abs() <= 1e-12 * expected.abs().max(1.0), "{preset:?}: {scale} != {expected}");
+            assert!((scale * back - 1.0).abs() <= 1e-12, "{preset:?}: round-trip {scale} * {back}");
+            assert_eq!(k_unit, format!("{}·√{}", display.symbol(Quantity::Pressure), display.symbol(Quantity::Length)));
+            assert_eq!(back_unit, "Pa·√m");
+        }
+        assert_eq!(stress_sqrt_length_scale(si(), &DisplaySystem::new(Preset::MmTonneS)).1, "MPa·√mm");
+        assert_eq!(stress_sqrt_length_scale(si(), &DisplaySystem::new(Preset::InLbfS)).1, "psi·√in");
+
+        let mm = DisplaySystem::new(Preset::MmTonneS);
+        let original = json!({
+            "step": "Load",
+            "max_displacement": {"node": 2, "value": 0.002},
+            "max_von_mises": {"node": 1, "value": 100.0e6},
+            "fracture": [{
+                "domain_id": "cf_0001",
+                "step": 1,
+                "front_nodes": [1, 2],
+                "s_position": 0.5,
+                "normal": [0.0, 1.0, 0.0],
+                "tangent": [0.0, 0.0, 1.0],
+                "advance": [1.0, 0.0, 0.0],
+                "area_aq": 2.5e-5,
+                "rings": [
+                    {"ring": 1, "j": 11500.0, "k_i": 50.0e6, "k_ii": null, "k_iii": 2.0e6, "t_11": -14.0e6, "t_33": -4.0e6},
+                    {"ring": 2, "j": 12500.0, "k_i": 52.0e6, "k_ii": null, "k_iii": 2.2e6, "t_11": -16.0e6, "t_33": -5.0e6}
+                ],
+                "j_mean": 12000.0,
+                "j_min": 11500.0,
+                "j_max": 12500.0,
+                "ring_spread": 0.08333333333333333,
+                "j_total": 24000.0,
+                "k_j_plane_strain": 52.0e6,
+                "k_j_plane_stress": 50.0e6,
+                "k_i_mean": 51.0e6,
+                "k_ii_mean": null,
+                "k_iii_mean": 2.1e6,
+                "t_11_mean": -15.0e6,
+                "t_33_mean": -4.5e6
+            }]
+        });
+
+        let expected_k_scale = stress_sqrt_length_scale(si(), &mm).0;
+        for cmd_id in ["solve.static", "results.read"] {
+            let mut reply = original.clone();
+            convert_reply(cmd_id, &mut reply, si(), &mm).unwrap();
+            assert!(reply.get("k_unit").is_none());
+            assert_eq!(reply["units"]["stress_intensity"], "MPa·√mm");
+            assert_eq!(reply["units"]["area"], "mm²");
+            assert_eq!(reply["units"]["force_per_length"], "N/mm");
+            assert_eq!(reply["units"]["pressure"], "MPa");
+            let d = &reply["fracture"][0];
+            assert!((d["area_aq"].as_f64().unwrap() - 25.0).abs() < 1e-12);
+            assert!((d["j_mean"].as_f64().unwrap() - 12.0).abs() < 1e-12);
+            assert!((d["j_min"].as_f64().unwrap() - 11.5).abs() < 1e-12);
+            assert!((d["j_max"].as_f64().unwrap() - 12.5).abs() < 1e-12);
+            assert!((d["j_total"].as_f64().unwrap() - 24.0).abs() < 1e-12);
+            assert!((d["t_11_mean"].as_f64().unwrap() - (-15.0)).abs() < 1e-12);
+            assert!((d["t_33_mean"].as_f64().unwrap() - (-4.5)).abs() < 1e-12);
+            assert!((d["k_j_plane_strain"].as_f64().unwrap() - 52.0e6 * expected_k_scale).abs() < 1e-9);
+            assert!((d["k_j_plane_stress"].as_f64().unwrap() - 50.0e6 * expected_k_scale).abs() < 1e-9);
+            assert!((d["k_i_mean"].as_f64().unwrap() - 51.0e6 * expected_k_scale).abs() < 1e-9);
+            assert!(d["k_ii_mean"].is_null());
+            assert!((d["k_iii_mean"].as_f64().unwrap() - 2.1e6 * expected_k_scale).abs() < 1e-9);
+            assert!((d["rings"][0]["j"].as_f64().unwrap() - 11.5).abs() < 1e-12);
+            assert!((d["rings"][0]["k_i"].as_f64().unwrap() - 50.0e6 * expected_k_scale).abs() < 1e-9);
+            assert!(d["rings"][0]["k_ii"].is_null());
+            assert!((d["rings"][1]["t_11"].as_f64().unwrap() - (-16.0)).abs() < 1e-12);
+            assert!((d["ring_spread"].as_f64().unwrap() - (1.0 / 12.0)).abs() < 1e-12);
+            assert_eq!(d["s_position"], 0.5);
+        }
+
+        // interaction_integral: false (all k_* fields null) omits units.stress_intensity while still
+        // converting J and area.
+        let mut null_k = json!({
+            "step": "Load",
+            "fracture": [{
+                "domain_id": "cf_0001",
+                "step": 1,
+                "front_nodes": [1, 2],
+                "s_position": 0.5,
+                "normal": [0.0, 1.0, 0.0],
+                "tangent": [0.0, 0.0, 1.0],
+                "advance": [1.0, 0.0, 0.0],
+                "area_aq": 2.5e-5,
+                "rings": [
+                    {"ring": 1, "j": 11500.0, "k_i": null, "k_ii": null, "k_iii": null, "t_11": null, "t_33": null}
+                ],
+                "j_mean": 12000.0,
+                "j_min": 11500.0,
+                "j_max": 12500.0,
+                "ring_spread": 0.08333333333333333,
+                "j_total": null,
+                "k_j_plane_strain": null,
+                "k_j_plane_stress": null,
+                "k_i_mean": null,
+                "k_ii_mean": null,
+                "k_iii_mean": null,
+                "t_11_mean": null,
+                "t_33_mean": null
+            }]
+        });
+        convert_reply("solve.static", &mut null_k, si(), &mm).unwrap();
+        assert!(null_k.get("k_unit").is_none());
+        assert!(null_k["units"].get("stress_intensity").is_none());
+        assert_eq!(null_k["units"]["force_per_length"], "N/mm");
+        assert!((null_k["fracture"][0]["j_mean"].as_f64().unwrap() - 12.0).abs() < 1e-12);
+
+        let mut no_fracture = json!({"step": "Load", "max_displacement": {"node": 2, "value": 0.002}});
+        convert_reply("solve.static", &mut no_fracture, si(), &mm).unwrap();
+        assert!(no_fracture.get("k_unit").is_none());
+        assert!(no_fracture["units"].get("stress_intensity").is_none());
+
+        // Cross-crate parity check: L2 fieldcraft_warp3d::read_results_dir Preset -> SI vs L6 SI -> Preset across Preset::ALL.
+        let mut s = crate::Session::default();
+        s.run_script(&json!([
+            {"command": "model.units", "params": {"system": "m-kg-s-N-Pa"}},
+            {"command": "mesh.node.add", "params": {"label": 1, "xyz": [0, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 2, "xyz": [1, 0, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 3, "xyz": [1, 1, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 4, "xyz": [0, 1, 0]}},
+            {"command": "mesh.node.add", "params": {"label": 5, "xyz": [0, 0, 1]}},
+            {"command": "mesh.node.add", "params": {"label": 6, "xyz": [1, 0, 1]}},
+            {"command": "mesh.node.add", "params": {"label": 7, "xyz": [1, 1, 1]}},
+            {"command": "mesh.node.add", "params": {"label": 8, "xyz": [0, 1, 1]}},
+            {"command": "mesh.element.add", "params": {"label": 1, "kind": "hex8", "nodes": [1, 2, 3, 4, 5, 6, 7, 8]}},
+            {"command": "model.set.create", "params": {"name": "all", "elements": [1]}},
+            {"command": "model.set.create", "params": {"name": "fix", "nodes": [1, 2, 3, 4]}},
+            {"command": "model.set.create", "params": {"name": "top", "nodes": [5, 6, 7, 8]}},
+            {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": 2.0e11, "poisson": 0.3}}},
+            {"command": "model.section.create", "params": {"name": "solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+            {"command": "model.boundary_condition.create", "params": {"name": "clamp", "type": "fixed", "target": {"set": "fix"}}},
+            {"command": "model.load.create", "params": {"name": "pull", "type": "force", "target": {"set": "top"}, "vector": [0, 0, 100]}},
+            {"command": "model.step.create", "params": {"name": "Load", "procedure": {"type": "static"}, "boundary_conditions": ["clamp"], "loads": ["pull"]}}
+        ])).unwrap();
+        let parity_dir = std::env::temp_dir().join(format!("fieldcraft-units-k-parity-{}", std::process::id()));
+        std::fs::create_dir_all(&parity_dir).unwrap();
+        std::fs::write(parity_dir.join("wnd00001_text"), "0 0 0\n".repeat(8)).unwrap();
+        std::fs::write(parity_dir.join("wnr00001_text"), "0 0 0\n".repeat(8)).unwrap();
+        let row26 = vec!["0.0"; 26].join(" ");
+        std::fs::write(parity_dir.join("wns00001_text"), format!("{row26}\n").repeat(8)).unwrap();
+        std::fs::write(parity_dir.join("wes00001_text"), format!("{row26}\n")).unwrap();
+        std::fs::write(
+            parity_dir.join("job.out"),
+            "Domain: cf_0001 (step 1)\n  Area under q along front: 10.0\n  J_mean: 25.0 J_min: 24.0 J_max: 26.0\n  Ring J\n    1 24.0\n    2 26.0\nDomain: cf_0001 (interaction integral, step 1)\n  Ring K_I K_II K_III T_11 T_33\n    1 100.0 0.0 0.0 -5.0 -1.0\n    2 100.0 0.0 0.0 -5.0 -1.0\n",
+        )
+        .unwrap();
+        for preset in Preset::ALL {
+            let sol = fieldcraft_warp3d::read_results_dir(&s.model, "Load", &parity_dir, Some(preset)).unwrap();
+            let mut reply = json!({ "step": "Load", "fracture": sol.fracture });
+            let display = DisplaySystem::new(preset);
+            convert_reply("results.read", &mut reply, si(), &display).unwrap();
+            let round_tripped = reply["fracture"][0]["k_i_mean"].as_f64().unwrap();
+            assert!((round_tripped - 100.0).abs() <= 1e-9, "{preset:?}: expected 100.0, got {round_tripped}");
+        }
+        let _ = std::fs::remove_dir_all(&parity_dir);
     }
 }

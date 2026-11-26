@@ -21,6 +21,7 @@ pub(crate) mod mesh;
 
 pub use datum::edit_params as datum_edit_params;
 pub use datum::preview as datum_preview;
+pub use deck::{DeckFormatInfo, deck_format_info};
 pub use fieldcraft_mesh::relax::{ElementChange, Moved as NodeMoved};
 pub use mesh::analytic_surfaces;
 pub use node_move::{
@@ -253,6 +254,7 @@ pub static ALL: &[CommandSpec] = &[
     fluid_measure::MEASURE,
     results::EXPORT_CSV,
     results::EXPORT_VTU,
+    results::READ,
     render::SAVE,
     render::DELETE,
     render::EXPORT,

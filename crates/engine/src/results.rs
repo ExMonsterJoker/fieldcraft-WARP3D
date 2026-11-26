@@ -21,6 +21,7 @@ use crate::{EngineError, Result, Session, StepResult};
 /// Loads and reactions balance when they differ by less than this fraction of the largest.
 pub use fieldcraft_lbm::{ComponentCheck, FluidResult, Peak};
 pub use fieldcraft_solver::system::BALANCE_TOLERANCE;
+pub use fieldcraft_warp3d::{DomainIntegralResult, RingIntegral};
 
 /// The largest deformation scale factor.
 pub const MAX_DEFORMATION_SCALE: f64 = 1e12; // unit-factors: a cap on a scale factor
