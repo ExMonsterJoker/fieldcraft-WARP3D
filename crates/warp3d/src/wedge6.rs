@@ -6,8 +6,6 @@
 //! left cyclic prism rotation so the crack-front edge lands on the collapsed `(c, f)` edge and
 //! map quadrilateral faces across WARP3D's non-collapsed hex faces `{3, 5, 6}`.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::BTreeSet;
 
 /// Non-collapsed WARP3D `l3disop` quadrilateral faces corresponding to Wedge6 faces `3..=5`.

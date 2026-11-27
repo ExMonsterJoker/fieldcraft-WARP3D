@@ -44,6 +44,8 @@ fn warp3d_ident(raw: &str, prefix: &str, used: &mut BTreeSet<String>) -> String 
 /// Map FieldCraft / Abaqus solid face numbers (1-based) to WARP3D face numbers.
 ///
 /// FieldCraft Hex faces 4 (`+xi`) and 5 (`+eta`) are swapped relative to WARP3D `l3disop`/`q3disop`.
+/// For [`ElementKind::Wedge6`], use [`warp3d_face_for_elem`] so the crack-front collapse rotation
+/// is taken into account.
 pub fn warp3d_face(kind: ElementKind, face: u8) -> Option<u8> {
     match kind {
         ElementKind::Hex8 | ElementKind::Hex20 => match face {
@@ -55,8 +57,21 @@ pub fn warp3d_face(kind: ElementKind, face: u8) -> Option<u8> {
             6 => Some(6),
             _ => None,
         },
+        ElementKind::Wedge6 => crate::wedge6::wedge6_warp3d_face(face, 0),
         ElementKind::Tet4 | ElementKind::Tet10 if (1..=4).contains(&face) => Some(face),
         _ => None,
+    }
+}
+
+/// Map a 1-based FieldCraft face on `elem` to the corresponding 1-based WARP3D face, accounting
+/// for crack-front-aligned cyclic rotation on [`ElementKind::Wedge6`].
+pub(crate) fn warp3d_face_for_elem(elem: &fieldcraft_model::Element, face: u8, front_nodes: &BTreeSet<u32>) -> Option<u8> {
+    match elem.kind {
+        ElementKind::Wedge6 => {
+            let rot = crate::wedge6::wedge6_collapse_rotation(&elem.nodes, front_nodes);
+            crate::wedge6::wedge6_warp3d_face(face, rot)
+        }
+        _ => warp3d_face(elem.kind, face),
     }
 }
 
@@ -95,7 +110,7 @@ pub(crate) fn select_step<'a>(model: &'a Model, requested: Option<&str>) -> std:
 fn format_element_spec(kind: ElementKind, nlgeom: bool, integration: Integration, mat_ident: &str) -> (&'static str, String) {
     let nl_kw = if nlgeom { "nonlinear" } else { "linear" };
     match kind {
-        ElementKind::Hex8 => {
+        ElementKind::Hex8 | ElementKind::Wedge6 => {
             let order = match integration {
                 Integration::Full => "order 2x2x2 bbar",
                 Integration::Reduced => "order 1x1x1",
@@ -251,9 +266,15 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
         }
     }
 
-    // Collect nodal loads, pressures, and body forces.
+    // Resolve crack-front node set before load/incidence export so Wedge6 collapse rotation aligns
+    // collapsed l3disop edges and quad face mappings consistently.
+    let crack_front_nodes: BTreeSet<u32> =
+        crack.and_then(|spec| resolved.sets.get(&spec.set)).map(|rset| rset.nodes.iter().copied().collect()).unwrap_or_default();
+
+    // Collect nodal loads, pressures, tractions, and body forces.
     let mut nodal_forces: BTreeMap<u32, [f64; 3]> = BTreeMap::new();
     let mut pressure_loads: Vec<(u32, u8, f64)> = Vec::new();
+    let mut traction_loads: Vec<(u32, u8, [f64; 3])> = Vec::new();
     let mut body_forces: BTreeMap<u32, [f64; 3]> = BTreeMap::new();
 
     for load_name in &step_ref.loads {
@@ -261,7 +282,7 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
             continue;
         };
         match load {
-            Load::Force { .. } | Load::Traction { .. } => {
+            Load::Force { .. } => {
                 if let Some(items) = resolved.nodal_loads.get(load_name) {
                     for (fc_node, vec) in items {
                         if let Some(&wn) = label_map.fc_node_to_warp.get(fc_node) {
@@ -273,6 +294,29 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
                     }
                 }
             }
+            Load::Traction { set, vector } => {
+                let rset = resolved
+                    .sets
+                    .get(set)
+                    .ok_or_else(|| Warp3dError::Unsupported(format!("surface traction load `{load_name}` references missing face set `{set}`")))?;
+                if rset.faces.is_empty() {
+                    return Err(Warp3dError::Unsupported(format!(
+                        "surface traction load `{load_name}` requires non-empty element faces on set `{set}`"
+                    )));
+                }
+                for face in &rset.faces {
+                    let Some(elem) = expressed.element(face.element) else {
+                        continue;
+                    };
+                    let Some(&we) = label_map.fc_elem_to_warp.get(&face.element) else {
+                        continue;
+                    };
+                    let wface = warp3d_face_for_elem(elem, face.face, &crack_front_nodes).ok_or_else(|| {
+                        Warp3dError::Unsupported(format!("invalid face {} on element {} ({})", face.face, face.element, elem.kind.name()))
+                    })?;
+                    traction_loads.push((we, wface, *vector));
+                }
+            }
             Load::Pressure { set, magnitude } => {
                 if let Some(rset) = resolved.sets.get(set) {
                     for face in &rset.faces {
@@ -282,7 +326,7 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
                         let Some(&we) = label_map.fc_elem_to_warp.get(&face.element) else {
                             continue;
                         };
-                        let wface = warp3d_face(elem.kind, face.face).ok_or_else(|| {
+                        let wface = warp3d_face_for_elem(elem, face.face, &crack_front_nodes).ok_or_else(|| {
                             Warp3dError::Unsupported(format!("invalid face {} on element {} ({})", face.face, face.element, elem.kind.name()))
                         })?;
                         pressure_loads.push((we, wface, *magnitude));
@@ -324,7 +368,7 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
         }
     }
 
-    let has_loads = !nodal_forces.is_empty() || !pressure_loads.is_empty() || !body_forces.is_empty();
+    let has_loads = !nodal_forces.is_empty() || !pressure_loads.is_empty() || !traction_loads.is_empty() || !body_forces.is_empty();
     let has_constraints = !nodal_bcs.is_empty() || !mpc_lines.is_empty();
 
     // 3. Emit WARP3D deck sections.
@@ -439,13 +483,22 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
         }
     }
 
-    // Element incidences (FieldCraft solid node order matches WARP3D directly).
+    // Element incidences (FieldCraft solid node order matches WARP3D directly; Wedge6 expands to collapsed l3disop).
     push_wrapped(&mut out, "incidences");
     for (idx, &fc_elem_id) in label_map.warp_elem_to_fc.iter().enumerate() {
         let w_id = idx + 1;
         if let Some(elem) = expressed.element(fc_elem_id) {
-            let mut node_strs = Vec::with_capacity(elem.nodes.len());
-            for fc_node in &elem.nodes {
+            let expanded_wedge;
+            let fc_nodes: &[u32] = if elem.kind == ElementKind::Wedge6 {
+                let rot = crate::wedge6::wedge6_collapse_rotation(&elem.nodes, &crack_front_nodes);
+                expanded_wedge = crate::wedge6::expand_wedge6_to_l3disop(&elem.nodes, rot)
+                    .ok_or_else(|| Warp3dError::Unsupported(format!("wedge6 element {fc_elem_id} requires 6 nodes")))?;
+                &expanded_wedge
+            } else {
+                &elem.nodes
+            };
+            let mut node_strs = Vec::with_capacity(fc_nodes.len());
+            for fc_node in fc_nodes {
                 let wn = label_map
                     .fc_node_to_warp
                     .get(fc_node)
@@ -501,10 +554,13 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
                 push_wrapped(&mut out, &format!("    {w_node} {}", comps.join(" ")));
             }
         }
-        if !pressure_loads.is_empty() || !body_forces.is_empty() {
+        if !pressure_loads.is_empty() || !traction_loads.is_empty() || !body_forces.is_empty() {
             push_wrapped(&mut out, "  element loads");
             for &(w_elem, w_face, mag) in &pressure_loads {
                 push_wrapped(&mut out, &format!("    {w_elem} face {w_face} pressure {mag:.8e}"));
+            }
+            for &(w_elem, w_face, t) in &traction_loads {
+                push_wrapped(&mut out, &format!("    {w_elem} face {w_face} tractions tx {:.8e} ty {:.8e} tz {:.8e}", t[0], t[1], t[2]));
             }
             for (w_elem, b) in &body_forces {
                 push_wrapped(&mut out, &format!("    {w_elem} body forces bx {:.8e} by {:.8e} bz {:.8e}", b[0], b[1], b[2]));
@@ -860,14 +916,14 @@ mod tests {
         unresolved.remove_section("solid").unwrap();
         assert!(matches!(write_deck(&unresolved, None, None, Preset::MKgS), Err(Warp3dError::Model(_))));
 
-        // 2. Hard rejection parity (`Wedge6`) with validate_resolved.
-        let mut wedge_model = unit_hex8_model();
-        wedge_model.set_element(2, ElementKind::Wedge6, vec![1, 2, 3, 5, 6, 7]).unwrap();
-        wedge_model.replace_set("all", Set { elements: vec![1, 2], ..Set::default() }).unwrap();
-        let resolved = wedge_model.resolve().unwrap();
-        let report = crate::check::validate_resolved(&wedge_model, &resolved, None, None, None, crate::check::CheckScope::Export);
+        // 2. Hard rejection parity (`Pyramid5`) with validate_resolved.
+        let mut pyr_model = unit_hex8_model();
+        pyr_model.set_element(2, ElementKind::Pyramid5, vec![1, 2, 3, 4, 5]).unwrap();
+        pyr_model.replace_set("all", Set { elements: vec![1, 2], ..Set::default() }).unwrap();
+        let resolved = pyr_model.resolve().unwrap();
+        let report = crate::check::validate_resolved(&pyr_model, &resolved, None, None, None, crate::check::CheckScope::Export);
         assert!(!report.ready);
-        assert!(matches!(write_deck(&wedge_model, None, None, Preset::MKgS), Err(Warp3dError::Unsupported(_))));
+        assert!(matches!(write_deck(&pyr_model, None, None, Preset::MKgS), Err(Warp3dError::Unsupported(_))));
 
         // 3. Warning parity (incompatible modes + rotational DOF + plasticity in Static step).
         let mut warn_model = unit_hex8_model();
@@ -954,6 +1010,377 @@ mod tests {
             };
             let slice = &per_step.text[s_pos..next_pos];
             assert_eq!(slice.matches("compute domain integral").count(), 1, "step {k} slice: {slice}");
+        }
+    }
+
+    #[test]
+    fn write_deck_wedge6_collapsed_l3disop_rotations_and_face_loads() {
+        let mut model = Model::default();
+        // Two wedges along Z (0..1) and one Hex8 sharing nodes 2, 3, 5, 6.
+        // Wedge 1: nodes [1, 2, 3, 4, 5, 6], Wedge 2: nodes [1, 3, 7, 4, 6, 8].
+        // With front on (1, 4): Wedge 1 axial edge (0, 3) -> rot 1; Wedge 2 axial edge (0, 3) -> rot 1.
+        // With Wedge 3 using [7, 1, 8_?]: let's test rot=0, rot=1, rot=2 explicitly on 3 wedges.
+        let coords = [
+            (1, [0.0, 0.0, 0.0]),
+            (2, [1.0, 0.0, 0.0]),
+            (3, [1.0, 1.0, 0.0]),
+            (4, [0.0, 0.0, 1.0]),
+            (5, [1.0, 0.0, 1.0]),
+            (6, [1.0, 1.0, 1.0]),
+            (7, [0.0, 1.0, 0.0]),
+            (8, [0.0, 1.0, 1.0]),
+        ];
+        for (id, xyz) in coords {
+            model.set_node(id, xyz).unwrap();
+        }
+        // Wedge 10: axial edge (0,3)=(1,4) -> rot=1
+        model.set_element(10, ElementKind::Wedge6, vec![1, 2, 3, 4, 5, 6]).unwrap();
+        // Wedge 20: axial edge (1,4)=(1,4) -> rot=2
+        model.set_element(20, ElementKind::Wedge6, vec![3, 1, 7, 6, 4, 8]).unwrap();
+        // Hex 30 outside
+        model.set_element(30, ElementKind::Hex8, vec![1, 2, 3, 7, 4, 5, 6, 8]).unwrap();
+
+        model.add_material("Steel", Material { elastic: Some(Elastic::Isotropic { young: 2.1e11, poisson: 0.3 }), ..Default::default() }).unwrap();
+        model.add_set("all", Set { elements: vec![10, 20, 30], ..Set::default() }).unwrap();
+        model.add_set("fix", Set { nodes: vec![2, 3, 5, 6], ..Set::default() }).unwrap();
+        model.add_set("front", Set { nodes: vec![1, 4], ..Set::default() }).unwrap();
+        model
+            .add_set(
+                "w1_quads",
+                Set {
+                    faces: vec![
+                        fieldcraft_model::ElementFace { element: 10, face: 3 },
+                        fieldcraft_model::ElementFace { element: 10, face: 4 },
+                        fieldcraft_model::ElementFace { element: 10, face: 5 },
+                    ],
+                    ..Set::default()
+                },
+            )
+            .unwrap();
+        model
+            .add_set(
+                "w2_cap_and_quad",
+                Set {
+                    faces: vec![fieldcraft_model::ElementFace { element: 20, face: 1 }, fieldcraft_model::ElementFace { element: 20, face: 3 }],
+                    ..Set::default()
+                },
+            )
+            .unwrap();
+        model
+            .add_section(
+                "solid",
+                Section { set: "all".into(), material: "Steel".into(), kind: SectionKind::Solid {}, formulation: Default::default() },
+            )
+            .unwrap();
+        model.add_boundary_condition("clamp", BoundaryCondition::Fixed { target: Target::Set("fix".into()) }).unwrap();
+        model.add_load("p1", Load::Pressure { set: "w1_quads".into(), magnitude: 1.0e5 }).unwrap();
+        model.add_load("t2", Load::Traction { set: "w2_cap_and_quad".into(), vector: [0.0, 2.0e5, 0.0] }).unwrap();
+        let mut step = Step::new("Load", Procedure::Static {});
+        step.boundary_conditions.insert("clamp".into());
+        step.loads.insert("p1".into());
+        step.loads.insert("t2".into());
+        model.add_step(step, None).unwrap();
+
+        // Without crack_front: default rot=0 collapses (w2, w5) = (3, 6) on Wedge 10 and (7, 8) on Wedge 20.
+        let no_crack = write_deck(&model, None, None, Preset::MKgS).unwrap();
+        assert!(no_crack.text.contains("type l3disop linear material Steel"));
+        assert!(no_crack.text.contains("  2 1 2 3 3 4 5 6 6\n"));
+        assert!(no_crack.text.contains("  3 3 1 7 7 6 4 8 8\n"));
+        // rot=0 maps Wedge 10 faces 3,4,5 -> WARP3D 3,5,6; Wedge 20 face 1 -> 1, face 3 -> 3.
+        assert!(no_crack.text.contains("2 face 3 pressure"));
+        assert!(no_crack.text.contains("2 face 5 pressure"));
+        assert!(no_crack.text.contains("2 face 6 pressure"));
+        assert!(!no_crack.text.contains("2 face 4 pressure"));
+        assert!(no_crack.text.contains("3 face 1 tractions"));
+        assert!(no_crack.text.contains("3 face 3 tractions"));
+
+        // With crack_front on (1, 4): Wedge 10 uses rot=1 (collapsing 1,4), Wedge 20 uses rot=2 (collapsing 1,4).
+        let crack = CrackFrontSpec {
+            set: "front".into(),
+            normal: Some([0.0, 1.0, 0.0]),
+            symmetric: Some(false),
+            rings: Some(2),
+            interaction_integral: Some(false),
+            function_type: CrackFunctionType::FrontAverage,
+            every_step: None,
+        };
+        let with_crack = write_deck(&model, None, Some(&crack), Preset::MKgS).unwrap();
+        assert!(with_crack.text.contains("  2 2 3 1 1 5 6 4 4\n"));
+        assert!(with_crack.text.contains("  3 7 3 1 1 8 6 4 4\n"));
+        // Wedge 10 (rot=1) faces 3,4,5 -> WARP3D 6,3,5.
+        assert!(with_crack.text.contains("2 face 6 pressure"));
+        assert!(with_crack.text.contains("2 face 3 pressure"));
+        assert!(with_crack.text.contains("2 face 5 pressure"));
+        // Wedge 20 (rot=2) face 1 -> 1, face 3 -> 5.
+        assert!(with_crack.text.contains("3 face 1 tractions"));
+        assert!(with_crack.text.contains("3 face 5 tractions"));
+        for line in with_crack.text.lines() {
+            if !line.starts_with("! ") && line != "!" {
+                assert!(line.len() <= 72, "line exceeded 72 chars ({}): {line}", line.len());
+            }
+        }
+    }
+
+    #[test]
+    fn write_deck_load_traction_element_loads_and_single_unit_conversion() {
+        let mut model = Model::default();
+        for (id, xyz) in
+            [(1, [0.0, 0.0, 0.0]), (2, [1.0, 0.0, 0.0]), (3, [1.0, 1.0, 0.0]), (4, [0.0, 0.0, 1.0]), (5, [1.0, 0.0, 1.0]), (6, [1.0, 1.0, 1.0])]
+        {
+            model.set_node(id, xyz).unwrap();
+        }
+        model.set_element(1, ElementKind::Wedge6, vec![1, 2, 3, 4, 5, 6]).unwrap();
+        model.add_material("Steel", Material { elastic: Some(Elastic::Isotropic { young: 2.1e11, poisson: 0.3 }), ..Default::default() }).unwrap();
+        model.add_set("all", Set { elements: vec![1], ..Set::default() }).unwrap();
+        model.add_set("fix", Set { nodes: vec![2, 3, 5, 6], ..Set::default() }).unwrap();
+        model.add_set("loaded_face", Set { faces: vec![fieldcraft_model::ElementFace { element: 1, face: 3 }], ..Set::default() }).unwrap();
+        model
+            .add_section(
+                "solid",
+                Section { set: "all".into(), material: "Steel".into(), kind: SectionKind::Solid {}, formulation: Default::default() },
+            )
+            .unwrap();
+        model.add_boundary_condition("clamp", BoundaryCondition::Fixed { target: Target::Set("fix".into()) }).unwrap();
+        // Traction-only step: 100 MPa in Y (1.0e8 Pa SI -> 100.0 MPa in MmTonneS).
+        model.add_load("trac", Load::Traction { set: "loaded_face".into(), vector: [0.0, 1.0e8, 0.0] }).unwrap();
+        let mut step = Step::new("TracOnly", Procedure::Static {});
+        step.boundary_conditions.insert("clamp".into());
+        step.loads.insert("trac".into());
+        model.add_step(step, None).unwrap();
+
+        let written = write_deck(&model, None, None, Preset::MmTonneS).unwrap();
+        assert!(written.text.contains("loading TracOnly_l\n"), "traction-only step must emit loading block");
+        assert!(written.text.contains("  element loads\n"));
+        assert!(!written.text.contains("  nodal loads\n"), "face traction must not lower to nodal loads");
+        // Verify single conversion: 1.0e8 Pa -> 100 MPa (1.00000000e2), NOT double-converted 1.0e-4.
+        assert!(written.text.contains("    1 face 3 tractions tx 0.00000000e0 ty 1.00000000e2 tz 0.00000000e0\n"), "{}", written.text);
+
+        // Round-trip back through reader::read_limited preserves Wedge6 and SI traction vector.
+        let rt =
+            crate::reader::read_limited("trac_rt.inp", written.text.as_bytes(), None, Preset::MKgS, crate::reader::ReadLimits::default()).unwrap();
+        let elem = rt.model.element(1).unwrap();
+        assert_eq!(elem.kind, ElementKind::Wedge6);
+        assert_eq!(elem.nodes, vec![1, 2, 3, 4, 5, 6]);
+        let has_traction = rt.model.loads().values().any(|l| matches!(l, Load::Traction { vector, .. } if (vector[1] - 1.0e8).abs() < 1.0));
+        assert!(has_traction, "round-trip lost traction load: {:?}", rt.model.loads());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+    fn load_traction_live_warp3d_smoke() {
+        use std::path::PathBuf;
+        use std::sync::atomic::AtomicBool;
+
+        // Build a conforming 3D SENT half-plate with 8 Wedge6 tip elements (testing rot 0, 1, 2)
+        // and 12 outer Hex8 elements (x in [0, 1.0], y in [0, 1.0], z in [0, 0.5], crack y=0, x in [0, 0.5]).
+        let build_sent_model = |use_traction: bool| -> Model {
+            let mut model = Model::default();
+            let layers = [0.0_f64, 0.25, 0.5];
+            // Per Z layer k, 13 nodes:
+            // 1: tip (0.5, 0.0)
+            // 2..=6: rosette ring at x in {0.25, 0.5, 0.75}, y in {0.0, 0.25}:
+            //   2:(0.75, 0.0), 3:(0.75, 0.25), 4:(0.5, 0.25), 5:(0.25, 0.25), 6:(0.25, 0.0)
+            // 7..=13: outer boundary:
+            //   7:(0.0, 0.0), 8:(0.0, 0.25), 9:(1.0, 0.0), 10:(1.0, 0.25),
+            //   11:(0.0, 1.0), 12:(0.25, 1.0), 13:(0.5, 1.0), 14:(0.75, 1.0), 15:(1.0, 1.0)
+            let xy = [
+                (1u32, [0.5, 0.0]),
+                (2, [0.75, 0.0]),
+                (3, [0.75, 0.25]),
+                (4, [0.5, 0.25]),
+                (5, [0.25, 0.25]),
+                (6, [0.25, 0.0]),
+                (7, [0.0, 0.0]),
+                (8, [0.0, 0.25]),
+                (9, [1.0, 0.0]),
+                (10, [1.0, 0.25]),
+                (11, [0.0, 1.0]),
+                (12, [0.25, 1.0]),
+                (13, [0.5, 1.0]),
+                (14, [0.75, 1.0]),
+                (15, [1.0, 1.0]),
+            ];
+            let nid = |k: usize, local: u32| -> u32 { (k as u32) * 100 + local };
+            for (k, &z) in layers.iter().enumerate() {
+                for &(local, [x, y]) in &xy {
+                    model.set_node(nid(k, local), [x, y, z]).unwrap();
+                }
+            }
+
+            let mut all_elems = Vec::new();
+            let mut crack_faces = Vec::new();
+            let mut eid = 1u32;
+            for k in 0..2usize {
+                // 4 Wedge6 tip elements around tip node 1 (exercising rot = 1, 0, 2, 2):
+                // W1: [1, 2, 3] (rot 1)
+                model
+                    .set_element(eid, ElementKind::Wedge6, vec![nid(k, 1), nid(k, 2), nid(k, 3), nid(k + 1, 1), nid(k + 1, 2), nid(k + 1, 3)])
+                    .unwrap();
+                all_elems.push(eid);
+                eid += 1;
+                // W2: [3, 4, 1] (rot 0)
+                model
+                    .set_element(eid, ElementKind::Wedge6, vec![nid(k, 3), nid(k, 4), nid(k, 1), nid(k + 1, 3), nid(k + 1, 4), nid(k + 1, 1)])
+                    .unwrap();
+                all_elems.push(eid);
+                eid += 1;
+                // W3: [5, 1, 4] (rot 2)
+                model
+                    .set_element(eid, ElementKind::Wedge6, vec![nid(k, 5), nid(k, 1), nid(k, 4), nid(k + 1, 5), nid(k + 1, 1), nid(k + 1, 4)])
+                    .unwrap();
+                all_elems.push(eid);
+                eid += 1;
+                // W4: [6, 1, 5] (rot 2; face 3 = [0,1,4,3] = nodes 6-1 on y=0 crack face)
+                model
+                    .set_element(eid, ElementKind::Wedge6, vec![nid(k, 6), nid(k, 1), nid(k, 5), nid(k + 1, 6), nid(k + 1, 1), nid(k + 1, 5)])
+                    .unwrap();
+                all_elems.push(eid);
+                crack_faces.push(fieldcraft_model::ElementFace { element: eid, face: 3 });
+                eid += 1;
+
+                // 6 outer Hex8 elements:
+                let hex_defs: [([u32; 4], bool); 6] = [
+                    ([7, 6, 5, 8], true),    // crack face on y=0 (Hex8 face 3 = [0,1,5,4])
+                    ([2, 9, 10, 3], false),  // ligament on y=0
+                    ([8, 5, 12, 11], false), // top-left
+                    ([5, 4, 13, 12], false), // top-mid-left
+                    ([4, 3, 14, 13], false), // top-mid-right
+                    ([3, 10, 15, 14], false),
+                ];
+                for (q, is_crack_face) in hex_defs {
+                    model
+                        .set_element(
+                            eid,
+                            ElementKind::Hex8,
+                            vec![
+                                nid(k, q[0]),
+                                nid(k, q[1]),
+                                nid(k, q[2]),
+                                nid(k, q[3]),
+                                nid(k + 1, q[0]),
+                                nid(k + 1, q[1]),
+                                nid(k + 1, q[2]),
+                                nid(k + 1, q[3]),
+                            ],
+                        )
+                        .unwrap();
+                    all_elems.push(eid);
+                    if is_crack_face {
+                        crack_faces.push(fieldcraft_model::ElementFace { element: eid, face: 3 });
+                    }
+                    eid += 1;
+                }
+            }
+
+            let mut ligament = Vec::new();
+            let mut z_faces = Vec::new();
+            let mut back_x = Vec::new();
+            let mut front = Vec::new();
+            for k in 0..=2usize {
+                front.push(nid(k, 1));
+                ligament.push(nid(k, 1));
+                ligament.push(nid(k, 2));
+                ligament.push(nid(k, 9));
+                back_x.push(nid(k, 9));
+                back_x.push(nid(k, 10));
+                back_x.push(nid(k, 15));
+                if k == 0 || k == 2 {
+                    for &(local, _) in &xy {
+                        z_faces.push(nid(k, local));
+                    }
+                }
+            }
+
+            model
+                .add_material("Steel", Material { elastic: Some(Elastic::Isotropic { young: 2.0e11, poisson: 0.3 }), ..Default::default() })
+                .unwrap();
+            model.add_set("all", Set { elements: all_elems, ..Set::default() }).unwrap();
+            model.add_set("ligament", Set { nodes: ligament, ..Set::default() }).unwrap();
+            model.add_set("z_faces", Set { nodes: z_faces, ..Set::default() }).unwrap();
+            model.add_set("back_x", Set { nodes: back_x, ..Set::default() }).unwrap();
+            model.add_set("crack_front", Set { nodes: front, ..Set::default() }).unwrap();
+            model.add_set("crack_faces", Set { faces: crack_faces, ..Set::default() }).unwrap();
+            model
+                .add_section(
+                    "solid",
+                    Section { set: "all".into(), material: "Steel".into(), kind: SectionKind::Solid {}, formulation: Default::default() },
+                )
+                .unwrap();
+            model
+                .add_boundary_condition(
+                    "sym_y",
+                    BoundaryCondition::Symmetry { target: Target::Set("ligament".into()), plane: fieldcraft_model::Symmetry::Y },
+                )
+                .unwrap();
+            model
+                .add_boundary_condition(
+                    "fix_z",
+                    BoundaryCondition::Displacement { target: Target::Set("z_faces".into()), values: [None, None, Some(0.0), None, None, None] },
+                )
+                .unwrap();
+            model
+                .add_boundary_condition(
+                    "fix_x",
+                    BoundaryCondition::Displacement { target: Target::Set("back_x".into()), values: [Some(0.0), None, None, None, None, None] },
+                )
+                .unwrap();
+
+            let p = 1.0e8_f64;
+            if use_traction {
+                model.add_load("cface_load", Load::Traction { set: "crack_faces".into(), vector: [0.0, p, 0.0] }).unwrap();
+            } else {
+                model.add_load("cface_load", Load::Pressure { set: "crack_faces".into(), magnitude: p }).unwrap();
+            }
+            let mut step = Step::new("Load", Procedure::Static {});
+            step.boundary_conditions.insert("sym_y".into());
+            step.boundary_conditions.insert("fix_z".into());
+            step.boundary_conditions.insert("fix_x".into());
+            step.loads.insert("cface_load".into());
+            model.add_step(step, None).unwrap();
+            model
+        };
+
+        let crack = CrackFrontSpec {
+            set: "crack_front".into(),
+            normal: None,
+            symmetric: None,
+            rings: Some(2),
+            interaction_integral: Some(false),
+            function_type: CrackFunctionType::Pointwise,
+            every_step: None,
+        };
+        let cancel = AtomicBool::new(false);
+        let require_warp3d = std::env::var_os("FIELDCRAFT_REQUIRE_WARP3D").is_some();
+
+        let run_or_skip = |m: &Model| -> Option<crate::Warp3dSolution> {
+            match crate::runner::run_warp3d(m, "Load", Some(&crack), 2, None, &cancel) {
+                Ok(sol) => Some(sol),
+                Err(Warp3dError::BinaryNotFound(msg)) if !require_warp3d => {
+                    eprintln!("load_traction_live_warp3d_smoke: skipping cleanly ({msg})");
+                    None
+                }
+                Err(Warp3dError::SolverFailed { ref log_tail, .. }) if log_tail.contains("libimf.so") => {
+                    let win_bin = PathBuf::from(std::env::var_os("WARP3D_HOME").unwrap()).join("run_windows").join("warp3d.exe");
+                    Some(crate::runner::run_warp3d_with_bin(m, "Load", Some(&crack), 2, None, &cancel, &win_bin).unwrap())
+                }
+                Err(e) => panic!("WARP3D Load::Traction smoke failed: {e}"),
+            }
+        };
+
+        let m_trac = build_sent_model(true);
+        let Some(sol_trac) = run_or_skip(&m_trac) else {
+            return;
+        };
+        let m_press = build_sent_model(false);
+        let sol_press = run_or_skip(&m_press).unwrap();
+
+        assert_eq!(sol_trac.fracture.len(), 3);
+        assert_eq!(sol_press.fracture.len(), 3);
+        for (dt, dp) in sol_trac.fracture.iter().zip(sol_press.fracture.iter()) {
+            assert!(dt.j_mean > 0.0, "expected positive J from Load::Traction, got {:?}", dt);
+            let rel = (dt.j_mean - dp.j_mean).abs() / dp.j_mean;
+            assert!(rel < 1.0e-3, "traction J={} vs pressure J={} (rel={rel})", dt.j_mean, dp.j_mean);
         }
     }
 }

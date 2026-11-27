@@ -13,7 +13,7 @@ use fieldcraft_model::{
 use serde::{Deserialize, Serialize};
 
 use crate::CrackFrontSpec;
-use crate::deck::{select_step as select_export_step, warp3d_face};
+use crate::deck::{select_step as select_export_step, warp3d_face_for_elem};
 use crate::fracture::{order_crack_front, resolve_crack_normal_and_symmetry};
 
 /// Maximum diagnostics retained in a [`Warp3dCheckReport`].
@@ -118,7 +118,7 @@ fn format_sample_strings<'a>(samples: impl IntoIterator<Item = &'a str>, total: 
 }
 
 fn is_supported_solid_element(kind: ElementKind) -> bool {
-    matches!(kind, ElementKind::Hex8 | ElementKind::Hex20 | ElementKind::Tet4 | ElementKind::Tet10)
+    matches!(kind, ElementKind::Hex8 | ElementKind::Wedge6 | ElementKind::Hex20 | ElementKind::Tet4 | ElementKind::Tet10)
 }
 
 fn step_subject(name: &str) -> String {
@@ -313,14 +313,14 @@ fn check_mesh_elements(model: &Model, check_node_refs: bool, diags: &mut Diagnos
             diags.error(
                 "warp3d.unsupported_element",
                 "model",
-                format!("only 3D solid elements (Hex8, Hex20, Tet4, Tet10) are supported; element {first_id} is `{}`", kind.name()),
+                format!("only 3D solid elements (Hex8, Wedge6, Hex20, Tet4, Tet10) are supported; element {first_id} is `{}`", kind.name()),
             );
         } else {
             diags.error(
                 "warp3d.unsupported_element",
                 "model",
                 format!(
-                    "only 3D solid elements (Hex8, Hex20, Tet4, Tet10) are supported; {count} `{}` elements found (elements {})",
+                    "only 3D solid elements (Hex8, Wedge6, Hex20, Tet4, Tet10) are supported; {count} `{}` elements found (elements {})",
                     kind.name(),
                     format_sample_u32(&samples, count)
                 ),
@@ -468,10 +468,105 @@ fn check_sections_and_materials(
     elem_section
 }
 
+fn check_face_load_targets(
+    model: &Model,
+    resolved: Option<&Resolved>,
+    load_name: &str,
+    set: &str,
+    is_traction: bool,
+    crack: Option<&CrackFrontSpec>,
+    crack_front_nodes: &BTreeSet<u32>,
+    front_face_loaded_elems: &mut BTreeSet<u32>,
+    diags: &mut DiagnosticList,
+) {
+    let Some(rset) = resolve_set_view(model, resolved, set) else {
+        return;
+    };
+    let error_code = if is_traction { "warp3d.invalid_traction_face" } else { "warp3d.invalid_pressure_face" };
+    let kind_label = if is_traction { "traction" } else { "pressure" };
+
+    if is_traction && rset.faces.is_empty() {
+        diags.error(
+            error_code,
+            load_subject(load_name),
+            format!("surface traction load `{load_name}` requires non-empty element faces on set `{set}`"),
+        );
+        return;
+    }
+
+    let mut invalid_faces: Vec<String> = Vec::new();
+    let mut invalid_total: usize = 0;
+    let mut wedge_cap_elems: BTreeSet<u32> = BTreeSet::new();
+    let mut front_traction_elems: BTreeSet<u32> = BTreeSet::new();
+
+    for face in &rset.faces {
+        let Some(elem) = model.element(face.element) else {
+            continue;
+        };
+        if warp3d_face_for_elem(elem, face.face, crack_front_nodes).is_none() {
+            invalid_total += 1;
+            if invalid_faces.len() < MAX_SAMPLE_IDS {
+                invalid_faces.push(format!("invalid face {} on element {} ({})", face.face, face.element, elem.kind.name()));
+            }
+            continue;
+        }
+        let touches_front = !crack_front_nodes.is_empty() && elem.nodes.iter().any(|n| crack_front_nodes.contains(n));
+        if crack.is_some() && touches_front {
+            front_face_loaded_elems.insert(face.element);
+            if elem.kind == ElementKind::Wedge6 && (face.face == 1 || face.face == 2) {
+                wedge_cap_elems.insert(face.element);
+            }
+            if is_traction {
+                front_traction_elems.insert(face.element);
+            }
+        }
+    }
+
+    if invalid_total == 1
+        && let Some(first) = invalid_faces.first()
+    {
+        diags.error(error_code, load_subject(load_name), first.clone());
+    } else if invalid_total > 1 {
+        diags.error(
+            error_code,
+            load_subject(load_name),
+            format!(
+                "{invalid_total} invalid {kind_label} face(s) in `{load_name}` ({})",
+                format_sample_strings(invalid_faces.iter().map(String::as_str), invalid_total)
+            ),
+        );
+    }
+
+    if !wedge_cap_elems.is_empty() {
+        let samples: Vec<u32> = wedge_cap_elems.iter().copied().collect();
+        diags.warning(
+            "warp3d.wedge_cap_face_load",
+            load_subject(load_name),
+            format!(
+                "load `{load_name}` acts on triangular end-cap face(s) of fracture-adjacent wedge6 element(s) ({}); exported for structural equilibrium, but skipped by WARP3D domain surface integration (`dielwf`)",
+                format_sample_u32(&samples, samples.len())
+            ),
+        );
+    }
+
+    if !front_traction_elems.is_empty() && crack.is_some_and(|c| c.interaction_integral == Some(true)) {
+        let samples: Vec<u32> = front_traction_elems.iter().copied().collect();
+        diags.warning(
+            "warp3d.interaction_crack_face_load",
+            load_subject(load_name),
+            format!(
+                "traction load `{load_name}` acts on element(s) adjacent to the crack front ({}) with `interaction_integral` enabled; WARP3D Method-1 `II8` (`dielem_c.f`) evaluates only the in-plane advance component `t_1` and omits `t_2`/`t_3` traction contributions (`dm5` `J`/`K_J` integrates all components; use `Load::Pressure` for normal crack pressure)",
+                format_sample_u32(&samples, samples.len())
+            ),
+        );
+    }
+}
+
 fn check_step_bc_and_load_kinds(
     model: &Model,
     resolved: Option<&Resolved>,
     step_ref: &Step,
+    crack: Option<&CrackFrontSpec>,
     elem_section: &BTreeMap<u32, String>,
     diags: &mut DiagnosticList,
 ) {
@@ -495,41 +590,21 @@ fn check_step_bc_and_load_kinds(
         }
     }
 
+    let crack_front_nodes: BTreeSet<u32> =
+        crack.and_then(|spec| resolve_set_view(model, resolved, &spec.set)).map(|rset| rset.nodes.iter().copied().collect()).unwrap_or_default();
+    let mut front_face_loaded_elems: BTreeSet<u32> = BTreeSet::new();
+
     for load_name in &step_ref.loads {
         let Some(load) = model.load(load_name) else {
             continue;
         };
         match load {
-            Load::Force { target: Target::Set(_), .. } | Load::Traction { .. } | Load::BodyForce { .. } => {}
+            Load::Force { target: Target::Set(_), .. } | Load::BodyForce { .. } => {}
+            Load::Traction { set, .. } => {
+                check_face_load_targets(model, resolved, load_name, set, true, crack, &crack_front_nodes, &mut front_face_loaded_elems, diags);
+            }
             Load::Pressure { set, .. } => {
-                if let Some(rset) = resolve_set_view(model, resolved, set) {
-                    let mut invalid_faces: Vec<String> = Vec::new();
-                    let mut invalid_total: usize = 0;
-                    for face in &rset.faces {
-                        if let Some(elem) = model.element(face.element)
-                            && warp3d_face(elem.kind, face.face).is_none()
-                        {
-                            invalid_total += 1;
-                            if invalid_faces.len() < MAX_SAMPLE_IDS {
-                                invalid_faces.push(format!("invalid face {} on element {} ({})", face.face, face.element, elem.kind.name()));
-                            }
-                        }
-                    }
-                    if invalid_total == 1
-                        && let Some(first) = invalid_faces.first()
-                    {
-                        diags.error("warp3d.invalid_pressure_face", load_subject(load_name), first.clone());
-                    } else if invalid_total > 1 {
-                        diags.error(
-                            "warp3d.invalid_pressure_face",
-                            load_subject(load_name),
-                            format!(
-                                "{invalid_total} invalid pressure face(s) in `{load_name}` ({})",
-                                format_sample_strings(invalid_faces.iter().map(String::as_str), invalid_total)
-                            ),
-                        );
-                    }
-                }
+                check_face_load_targets(model, resolved, load_name, set, false, crack, &crack_front_nodes, &mut front_face_loaded_elems, diags);
             }
             Load::Gravity { set, .. } => {
                 let target_elems: Vec<u32> = match set.as_deref() {
@@ -559,6 +634,53 @@ fn check_step_bc_and_load_kinds(
                     "warp3d.unsupported_load",
                     load_subject(load_name),
                     format!("load `{load_name}` kind is not supported in WARP3D structural static decks"),
+                );
+            }
+        }
+    }
+
+    // Check body/gravity loads after collecting all face-loaded front elements so load-name ordering never matters.
+    if !front_face_loaded_elems.is_empty() {
+        for load_name in &step_ref.loads {
+            let Some(load) = model.load(load_name) else {
+                continue;
+            };
+            let overlapping: Vec<u32> = match load {
+                Load::BodyForce { set, vector } if vector.iter().any(|c| *c != 0.0) => resolve_set_view(model, resolved, set)
+                    .map(|rs| {
+                        let uniq: BTreeSet<u32> = rs.elements.iter().copied().filter(|eid| front_face_loaded_elems.contains(eid)).collect();
+                        uniq.into_iter().collect()
+                    })
+                    .unwrap_or_default(),
+                Load::Gravity { acceleration, set } if acceleration.iter().any(|c| *c != 0.0) => {
+                    let candidates: Vec<u32> = match set.as_deref() {
+                        Some(s) => resolve_set_view(model, resolved, s)
+                            .map(|rs| rs.elements.iter().copied().filter(|eid| front_face_loaded_elems.contains(eid)).collect())
+                            .unwrap_or_default(),
+                        None => front_face_loaded_elems.iter().copied().collect(),
+                    };
+                    let uniq: BTreeSet<u32> = candidates
+                        .into_iter()
+                        .filter(|eid| {
+                            elem_section
+                                .get(eid)
+                                .and_then(|sn| model.section(sn))
+                                .and_then(|s| model.material(&s.material))
+                                .is_some_and(|m| m.density.is_some_and(|rho| rho != 0.0))
+                        })
+                        .collect();
+                    uniq.into_iter().collect()
+                }
+                _ => Vec::new(),
+            };
+            if !overlapping.is_empty() {
+                diags.warning(
+                    "warp3d.body_load_masks_crack_face",
+                    load_subject(load_name),
+                    format!(
+                        "non-zero body/gravity load `{load_name}` overlaps face-loaded crack-front element(s) ({}); WARP3D `dielwf` skips element surface-traction domain integration when all element nodes carry non-zero equivalent loads",
+                        format_sample_u32(&overlapping, overlapping.len())
+                    ),
                 );
             }
         }
@@ -624,6 +746,8 @@ fn check_resolved_step_and_crack(
     diags: &mut DiagnosticList,
 ) -> bool {
     let mut suppressed_no_load_warning = false;
+    let crack_front_nodes: BTreeSet<u32> =
+        crack.and_then(|spec| resolved.sets.get(&spec.set)).map(|rset| rset.nodes.iter().copied().collect()).unwrap_or_default();
 
     if let Some(st) = step_ref {
         // Symmetric displacement conflict check across Fixed, Displacement, and axis-aligned Symmetry.
@@ -740,14 +864,17 @@ fn check_resolved_step_and_crack(
                 continue;
             };
             match load {
-                Load::Force { .. } | Load::Traction { .. } => {
+                Load::Force { .. } => {
                     if resolved.nodal_loads.get(load_name).is_some_and(|v| !v.is_empty()) {
                         has_loads = true;
                     }
                 }
-                Load::Pressure { set, .. } => {
+                Load::Pressure { set, .. } | Load::Traction { set, .. } => {
                     if let Some(rset) = resolved.sets.get(set)
-                        && rset.faces.iter().any(|f| model.element(f.element).is_some_and(|e| warp3d_face(e.kind, f.face).is_some()))
+                        && rset
+                            .faces
+                            .iter()
+                            .any(|f| model.element(f.element).is_some_and(|e| warp3d_face_for_elem(e, f.face, &crack_front_nodes).is_some()))
                     {
                         has_loads = true;
                     }
@@ -793,7 +920,6 @@ fn check_resolved_step_and_crack(
     }
 
     // Validate crack_front and crack_front_overconstrained.
-    let mut crack_front_nodes: BTreeSet<u32> = BTreeSet::new();
     if let Some(spec) = crack {
         if let Some(r) = spec.rings
             && !(1..=20).contains(&r)
@@ -805,9 +931,6 @@ fn check_resolved_step_and_crack(
         if spec.set.trim().is_empty() {
             diags.error("warp3d.missing_crack_front_set", "model", "crack front `set` must name an existing node set");
         } else if let Some(rset) = resolved.sets.get(&spec.set) {
-            for &n in &rset.nodes {
-                crack_front_nodes.insert(n);
-            }
             match order_crack_front(model, &spec.set, &rset.nodes) {
                 Ok(ordered) => {
                     if let Some(st) = step_ref {
@@ -1018,7 +1141,7 @@ pub fn validate_resolved(
     let elem_section = check_sections_and_materials(model, Some(resolved), step_ref, &mut diags);
 
     if let Some(st) = step_ref {
-        check_step_bc_and_load_kinds(model, Some(resolved), st, &elem_section, &mut diags);
+        check_step_bc_and_load_kinds(model, Some(resolved), st, crack, &elem_section, &mut diags);
     }
 
     let suppressed_no_load = check_resolved_step_and_crack(model, resolved, step_ref, crack, crack_face, &elem_section, &mut diags);
@@ -1068,7 +1191,7 @@ pub fn validate_model(
             let elem_section = check_sections_and_materials(model, None, step_ref, &mut diags);
 
             if let Some(st) = step_ref {
-                check_step_bc_and_load_kinds(model, None, st, &elem_section, &mut diags);
+                check_step_bc_and_load_kinds(model, None, st, crack, &elem_section, &mut diags);
             }
 
             if let Some(spec) = crack {
@@ -1246,19 +1369,19 @@ mod tests {
     }
 
     #[test]
-    fn hard_rejects_wedge6_elements_and_samples_up_to_10() {
+    fn hard_rejects_pyramid5_elements_and_samples_up_to_10() {
         let mut model = unit_hex8_base();
         for w in 0..15u32 {
-            model.set_element(100 + w, ElementKind::Wedge6, vec![1, 2, 3, 5, 6, 7]).unwrap();
+            model.set_element(100 + w, ElementKind::Pyramid5, vec![1, 2, 3, 4, 5]).unwrap();
         }
         model.replace_set("all", Set { elements: [1].into_iter().chain(100..115).collect(), ..Set::default() }).unwrap();
         let report = validate_model(&model, None, None, None, CheckScope::Export);
         assert!(!report.ready);
         let err = report.diagnostics.iter().find(|d| d.code == "warp3d.unsupported_element").unwrap();
-        assert!(err.message.contains("wedge6"));
-        assert!(err.message.contains("15 `wedge6`"));
+        assert!(err.message.contains("pyramid5"));
+        assert!(err.message.contains("15 `pyramid5`"));
         assert!(err.message.contains("and 5 more"));
-        assert!(matches!(write_deck(&model, None, None, Preset::MKgS), Err(crate::Warp3dError::Unsupported(ref msg)) if msg.contains("wedge6")));
+        assert!(matches!(write_deck(&model, None, None, Preset::MKgS), Err(crate::Warp3dError::Unsupported(ref msg)) if msg.contains("pyramid5")));
     }
 
     #[test]
@@ -1486,8 +1609,8 @@ mod tests {
         for eid in 2..=100_000u32 {
             model.set_element(eid, ElementKind::Hex8, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         }
-        // Add an error (`Wedge6` element) alongside the 120+ warnings, all covered by disjoint sections.
-        model.set_element(100_001, ElementKind::Wedge6, vec![1, 2, 3, 5, 6, 7]).unwrap();
+        // Add an error (`Pyramid5` element) alongside the 120+ warnings, all covered by disjoint sections.
+        model.set_element(100_001, ElementKind::Pyramid5, vec![1, 2, 3, 4, 5]).unwrap();
         model.replace_set("all", Set { elements: (121..=100_001).collect(), ..Set::default() }).unwrap();
         for i in 0..120usize {
             let sname = format!("w_sec_{i:03}");
@@ -1534,5 +1657,98 @@ mod tests {
         let q_bad = quick_note(&model, None, None, true, CheckScope::Solve { want_nonlinear: true }).unwrap();
         assert!(q_bad.problem.is_some());
         let _ = (ElementFace { element: 1, face: 1 }, NonlinearStatic::default());
+    }
+
+    #[test]
+    fn accepts_wedge6_and_checks_traction_cap_interaction_and_body_load_warnings() {
+        let mut model = Model::default();
+        for (id, xyz) in [
+            (1, [0.0, 0.0, 0.0]),
+            (2, [1.0, 0.0, 0.0]),
+            (3, [1.0, 1.0, 0.0]),
+            (4, [0.0, 0.0, 1.0]),
+            (5, [1.0, 0.0, 1.0]),
+            (6, [1.0, 1.0, 1.0]),
+            (7, [0.0, 1.0, 0.0]),
+            (8, [0.0, 1.0, 1.0]),
+        ] {
+            model.set_node(id, xyz).unwrap();
+        }
+        model.set_element(1, ElementKind::Wedge6, vec![1, 2, 3, 4, 5, 6]).unwrap();
+        model.set_element(2, ElementKind::Hex8, vec![1, 3, 7, 2, 4, 6, 8, 5]).unwrap();
+        model
+            .add_material(
+                "Steel",
+                Material { elastic: Some(Elastic::Isotropic { young: 2.1e11, poisson: 0.3 }), density: Some(7850.0), ..Default::default() },
+            )
+            .unwrap();
+        model.add_set("all", Set { elements: vec![1, 2], ..Set::default() }).unwrap();
+        model.add_set("other_elems", Set { elements: vec![2], ..Set::default() }).unwrap();
+        model.add_set("fix", Set { nodes: vec![2, 3, 5, 6, 7, 8], ..Set::default() }).unwrap();
+        model.add_set("front", Set { nodes: vec![1, 4], ..Set::default() }).unwrap();
+        model.add_set("w_quad", Set { faces: vec![ElementFace { element: 1, face: 3 }], ..Set::default() }).unwrap();
+        model
+            .add_section(
+                "solid",
+                Section { set: "all".into(), material: "Steel".into(), kind: SectionKind::Solid {}, formulation: Default::default() },
+            )
+            .unwrap();
+        model.add_boundary_condition("clamp", BoundaryCondition::Fixed { target: Target::Set("fix".into()) }).unwrap();
+        model.add_load("z_trac", Load::Traction { set: "w_quad".into(), vector: [0.0, 1.0e6, 0.0] }).unwrap();
+        model.add_load("a_body_other", Load::BodyForce { set: "other_elems".into(), vector: [0.0, 0.0, -10.0] }).unwrap();
+
+        // 1. Traction-only on Wedge6 quad face without crack_front -> ready, zero warnings, no cap warning.
+        let mut st_ok = Step::new("TracOnly", Procedure::Static {});
+        st_ok.boundary_conditions.insert("clamp".into());
+        st_ok.loads.insert("z_trac".into());
+        st_ok.loads.insert("a_body_other".into());
+        model.add_step(st_ok, None).unwrap();
+
+        let r_ok = validate_model(&model, Some("TracOnly"), None, None, CheckScope::Export);
+        assert!(r_ok.ready, "{r_ok:?}");
+        assert_eq!(r_ok.warnings, 0, "{r_ok:?}");
+
+        // 2. Invalid Wedge6 face 6 triggers warp3d.invalid_traction_face via fallback check.
+        let mut bad_model = model.clone();
+        bad_model.add_set("w_bad", Set { faces: vec![ElementFace { element: 1, face: 6 }], ..Set::default() }).unwrap();
+        bad_model.add_load("t_bad", Load::Traction { set: "w_bad".into(), vector: [0.0, 1.0, 0.0] }).unwrap();
+        let mut st_bad = Step::new("BadFace", Procedure::Static {});
+        st_bad.boundary_conditions.insert("clamp".into());
+        st_bad.loads.insert("t_bad".into());
+        bad_model.add_step(st_bad, None).unwrap();
+        let r_bad = validate_model(&bad_model, Some("BadFace"), None, None, CheckScope::Export);
+        assert!(!r_bad.ready);
+        assert!(r_bad.diagnostics.iter().any(|d| d.code == "warp3d.invalid_traction_face"), "{r_bad:?}");
+
+        // 3. With crack_front + interaction_integral + cap load + non-zero gravity (named alphabetically before z_trac).
+        model.add_set("w_cap", Set { faces: vec![ElementFace { element: 1, face: 1 }], ..Set::default() }).unwrap();
+        model.add_load("p_cap", Load::Pressure { set: "w_cap".into(), magnitude: 1.0e5 }).unwrap();
+        model.add_load("a_grav", Load::Gravity { acceleration: [0.0, 0.0, -9.81], set: None }).unwrap();
+        let mut st_crack = Step::new("CrackStep", Procedure::Static {});
+        st_crack.boundary_conditions.insert("clamp".into());
+        st_crack.loads.insert("z_trac".into());
+        st_crack.loads.insert("p_cap".into());
+        st_crack.loads.insert("a_grav".into());
+        st_crack.loads.insert("a_body_other".into());
+        model.add_step(st_crack, None).unwrap();
+
+        let crack = CrackFrontSpec {
+            set: "front".into(),
+            normal: Some([0.0, 1.0, 0.0]),
+            symmetric: Some(false),
+            rings: Some(2),
+            interaction_integral: Some(true),
+            function_type: crate::CrackFunctionType::FrontAverage,
+            every_step: None,
+        };
+        let r_crack = validate_model(&model, Some("CrackStep"), Some(&crack), None, CheckScope::Export);
+        assert!(r_crack.ready, "{r_crack:?}");
+        assert!(r_crack.diagnostics.iter().any(|d| d.code == "warp3d.wedge_cap_face_load"), "{r_crack:?}");
+        assert!(r_crack.diagnostics.iter().any(|d| d.code == "warp3d.interaction_crack_face_load"), "{r_crack:?}");
+        assert_eq!(
+            r_crack.diagnostics.iter().filter(|d| d.code == "warp3d.body_load_masks_crack_face").count(),
+            1,
+            "only overlapping a_grav should warn, not non-overlapping a_body_other: {r_crack:?}"
+        );
     }
 }
