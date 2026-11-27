@@ -3322,6 +3322,8 @@ pub const RESULTS_FFS: &[Field] = &[
     reference("step", "Step", C::SolvedStep)
         .help("Solved structural step with WARP3D fracture results; defaults to the shown step or sole current fracture step."),
     int("frame", "Frame", 0, 1_000_000_000).help("Nonlinear increment frame index (0 = unloaded); empty evaluates the final frame."),
+    text("domain_id", "Station domain ID")
+        .help("Optional crack-front domain ID for single-station load history; defaults to `fad/domain_id` or the peak-J station. Must match `fad/domain_id` if both are set."),
     choice(
         "exclude_inner_rings",
         "Exclude inner rings",

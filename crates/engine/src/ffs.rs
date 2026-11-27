@@ -3,10 +3,11 @@
 use fieldcraft_model::Model;
 pub use fieldcraft_warp3d::DiagnosticSeverity;
 use fieldcraft_warp3d::DomainIntegralResult;
+pub use fieldcraft_warp3d::InteractionStressState;
 pub use fieldcraft_warp3d::ffs::{
-    FAD_CURVE_POINTS, FadConfig, FadOption, FadPoint, FadSummary, FfsDiagnostic, FfsMaterialDefaults, FfsReport, FfsRequest, KrSource, LimitingMode,
-    LrInput, MAX_RING_EXCLUSION, Option2Curve, ReactionComponent, RingExclusion, SpreadStatus, StationProfile, StationSelection, ToughnessInput,
-    build_station_profiles, evaluate_fad_curve, extract_material_defaults, reserve_factor,
+    EvaluatedStep, FAD_CURVE_POINTS, FadConfig, FadOption, FadPoint, FadSummary, FfsDiagnostic, FfsMaterialDefaults, FfsReport, FfsRequest, KrSource,
+    LimitingMode, LrInput, MAX_RING_EXCLUSION, Option2Curve, ReactionComponent, RingExclusion, SpreadStatus, StationProfile, StationSelection,
+    StepStationPoint, ToughnessInput, build_station_profiles, evaluate_fad_curve, extract_material_defaults, reserve_factor,
 };
 
 use crate::Session;

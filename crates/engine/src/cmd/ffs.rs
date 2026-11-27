@@ -18,7 +18,7 @@ use crate::{CommandKind, CommandSpec, EngineError, Result, Session};
 pub const FFS: CommandSpec = CommandSpec {
     id: "results.ffs",
     label: "Fitness-for-Service (FAD)",
-    params: r#"{"step": "Load", "frame": null, "exclude_inner_rings": "auto", "fad": {"option": "option1", "option2_source": "model_material", "ramberg_alpha": 1.0, "ramberg_n": 5.0, "lr_mode": "reference_stress", "sigma_ref_full": 150.0, "l_r_full": 0.5, "bc_set": "clamp", "reaction_component": "magnitude", "limit_load": 100000.0, "toughness_mode": "k_mat", "k_mat": 100.0, "j_ic": 45.0, "j_ic_plane_strain": true, "kr_source": "auto", "station_mode": "governing", "domain_id": "cf_0001", "sigma_ys": 400.0, "sigma_uts": 550.0, "l_r_max": 1.18, "young": 210000.0, "poisson": 0.3}, "path": "ffs_report.csv"} — evaluate ring-filtered WARP3D crack-front fracture profiles (J, K_J, K_I, K_II, K_III, T-stress, ring spread) and optional API 579-1 / ASME FFS-1 Option 1 or Option 2 Failure Assessment Diagram trajectory and active-frame station verdicts in display units. Optional `path` writes an RFC 4180 CSV report (`trajectory` rows across increments followed by `station` rows at the active frame) in display units. Replies with the FfsReport (plus `path`, `rows`, `columns` when CSV is written)."#,
+    params: r#"{"step": "Load", "frame": null, "domain_id": "cf_0001", "exclude_inner_rings": "auto", "fad": {"option": "option1", "option2_source": "model_material", "ramberg_alpha": 1.0, "ramberg_n": 5.0, "lr_mode": "reference_stress", "sigma_ref_full": 150.0, "l_r_full": 0.5, "bc_set": "clamp", "reaction_component": "magnitude", "limit_load": 100000.0, "toughness_mode": "k_mat", "k_mat": 100.0, "j_ic": 45.0, "j_ic_plane_strain": true, "kr_source": "auto", "station_mode": "governing", "domain_id": "cf_0001", "sigma_ys": 400.0, "sigma_uts": 550.0, "l_r_max": 1.18, "young": 210000.0, "poisson": 0.3}, "path": "ffs_report.csv"} — evaluate ring-filtered WARP3D crack-front fracture profiles (J, K_J, K_I, K_II, K_III, T-stress, ring spread, active-step rings), single-station `step_history`, `evaluated_steps`, `step1_is_elastic`, and optional API 579-1 / ASME FFS-1 Option 1 or Option 2 Failure Assessment Diagram trajectory and active-frame station verdicts in display units. Optional `path` writes an RFC 4180 CSV report (`trajectory` rows across increments followed by `station` rows at the active frame) in display units. Replies with the FfsReport (plus `path`, `rows`, `columns` when CSV is written)."#,
     form: Some(super::forms::RESULTS_FFS),
     kind: CommandKind::Session,
     requires: &[crate::requirement::Requirement::Result],
@@ -82,8 +82,36 @@ fn run_ffs(s: &mut Session, p: &Value) -> Result<Value> {
         ),
     };
 
+    let domain_id = match obj.get("domain_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(dom)) => {
+            let trimmed = dom.trim();
+            if trimmed.is_empty() {
+                return Err(EngineError::invalid("domain_id", "domain ID must not be empty"));
+            }
+            Some(trimmed.to_string())
+        }
+        Some(_) => return Err(EngineError::param("domain_id", ProblemKind::NotText)),
+    };
+
     let ring_exclusion = parse_ring_exclusion(obj.get("exclude_inner_rings"))?;
     let fad = parse_fad_config(obj.get("fad"))?;
+
+    if let Some(top_dom) = domain_id.as_deref()
+        && let Some(fad_dom) = obj
+            .get("fad")
+            .and_then(Value::as_object)
+            .and_then(|f| f.get("domain_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        && top_dom != fad_dom
+    {
+        return Err(EngineError::invalid(
+            "domain_id",
+            format!("conflicting `domain_id` (`{top_dom}`) and `fad/domain_id` (`{fad_dom}`); specify matching values or omit one"),
+        ));
+    }
 
     let csv_path = match obj.get("path") {
         None | Some(Value::Null) => None,
@@ -130,7 +158,7 @@ fn run_ffs(s: &mut Session, p: &Value) -> Result<Value> {
         )));
     }
 
-    let req = FfsRequest { step: step_name.clone(), ring_exclusion, active_frame, fad, step1_is_elastic: fdata.step1_is_elastic };
+    let req = FfsRequest { step: step_name.clone(), ring_exclusion, active_frame, fad, domain_id, step1_is_elastic: fdata.step1_is_elastic };
     let report =
         evaluate_step_ffs_detailed(&s.model, sr, &fdata.domains, &fdata.step_numbers, fdata.domains_truncated, &req).map_err(|e| match e.path {
             Some(path) => EngineError::invalid(path, e.message),
@@ -432,6 +460,10 @@ fn ffs_csv_table(report: &FfsReport, all_profiles: &[StationProfile], display: &
         "limiting_mode".to_string(),
         "epfm_k_j_ratio".to_string(),
         "epfm_j_ratio".to_string(),
+        "interaction_stress_state".to_string(),
+        titled("k_ii_mean", Some(&k_unit)),
+        titled("k_iii_mean", Some(&k_unit)),
+        titled("t_33_mean", Some(p_unit)),
     ];
 
     let express = |q: Quantity, v: f64| -> Result<Cell> {
@@ -488,6 +520,18 @@ fn ffs_csv_table(report: &FfsReport, all_profiles: &[StationProfile], display: &
         let k_j_strain = prof.map_or(Cell::Empty, |pr| opt_k(pr.k_j_plane_strain));
         let k_j_stress = prof.map_or(Cell::Empty, |pr| opt_k(pr.k_j_plane_stress));
         let t_11_mean = prof.map_or(Ok(Cell::Empty), |pr| opt_express(Quantity::Pressure, pr.t_11_mean))?;
+        let stress_state = prof.and_then(|pr| pr.interaction_stress_state).map_or(Cell::Empty, |st| {
+            Cell::Text(
+                match st {
+                    fieldcraft_warp3d::InteractionStressState::PlaneStrain => "plane_strain",
+                    fieldcraft_warp3d::InteractionStressState::PlaneStress => "plane_stress",
+                }
+                .to_string(),
+            )
+        });
+        let k_ii_mean = prof.map_or(Cell::Empty, |pr| opt_k(pr.k_ii_mean));
+        let k_iii_mean = prof.map_or(Cell::Empty, |pr| opt_k(pr.k_iii_mean));
+        let t_33_mean = prof.map_or(Ok(Cell::Empty), |pr| opt_express(Quantity::Pressure, pr.t_33_mean))?;
 
         let (l_r, k_r, k_r_allow, k_eff, rf, margin, acceptable, limiting_mode, epfm_kj, epfm_j) = if let Some(fp) = pt {
             (
@@ -538,6 +582,10 @@ fn ffs_csv_table(report: &FfsReport, all_profiles: &[StationProfile], display: &
             limiting_mode,
             epfm_kj,
             epfm_j,
+            stress_state,
+            k_ii_mean,
+            k_iii_mean,
+            t_33_mean,
         ]);
         Ok(())
     };
@@ -650,18 +698,26 @@ mod tests {
                     ring: 1,
                     j: j_base * 0.85,
                     k_i: Some(k_base * 0.85),
-                    k_ii: Some(0.0),
-                    k_iii: Some(0.0),
+                    k_ii: Some(k_base * 0.085),
+                    k_iii: Some(k_base * 0.0425),
                     t_11: Some(-10.0e6),
                     t_33: Some(-3.0e6),
                 },
-                RingIntegral { ring: 2, j: j_base, k_i: Some(k_base), k_ii: Some(0.0), k_iii: Some(0.0), t_11: Some(-12.0e6), t_33: Some(-4.0e6) },
+                RingIntegral {
+                    ring: 2,
+                    j: j_base,
+                    k_i: Some(k_base),
+                    k_ii: Some(k_base * 0.1),
+                    k_iii: Some(k_base * 0.05),
+                    t_11: Some(-12.0e6),
+                    t_33: Some(-4.0e6),
+                },
                 RingIntegral {
                     ring: 3,
                     j: j_base * 1.02,
                     k_i: Some(k_base * 1.02),
-                    k_ii: Some(0.0),
-                    k_iii: Some(0.0),
+                    k_ii: Some(k_base * 0.102),
+                    k_iii: Some(k_base * 0.051),
                     t_11: Some(-12.2e6),
                     t_33: Some(-4.1e6),
                 },
@@ -674,11 +730,11 @@ mod tests {
             k_j_plane_strain: Some(k_base * 1.02),
             k_j_plane_stress: Some(k_base),
             k_i_mean: Some(k_base),
-            k_ii_mean: Some(0.0),
-            k_iii_mean: Some(0.0),
+            k_ii_mean: Some(k_base * 0.1),
+            k_iii_mean: Some(k_base * 0.05),
             t_11_mean: Some(-12.0e6),
             t_33_mean: Some(-4.0e6),
-            interaction_stress_state: None,
+            interaction_stress_state: Some(fieldcraft_warp3d::InteractionStressState::PlaneStrain),
         };
 
         let step_numbers = if nonlinear_steps {
@@ -736,7 +792,7 @@ mod tests {
         };
 
         s.store_result(StepResult::Implicit(fieldcraft_solver::StepResult::Static(sr)));
-        s.store_fracture_results("Load".into(), domains, step_numbers, false, None, Some("front"));
+        s.store_fracture_results("Load".into(), domains, step_numbers, false, Some(true), Some("front"));
         s
     }
 
@@ -757,7 +813,7 @@ mod tests {
         };
 
         // Top-level non-path fields.
-        for key in ["step", "frame", "exclude_inner_rings", "fad"] {
+        for key in ["step", "frame", "domain_id", "exclude_inner_rings", "fad"] {
             for v in &hostile {
                 let mut p = base.clone();
                 p[key] = v.clone();
@@ -765,7 +821,20 @@ mod tests {
             }
         }
         check_call(json!({"step": ""}));
+        check_call(json!({"domain_id": ""}));
         check_call(json!({"path": ""}));
+        check_call(json!({"domain_id": "cf_missing"}));
+        check_call(json!({
+            "domain_id": "cf_0001",
+            "fad": {
+                "lr_mode": "direct_load_ratio",
+                "l_r_full": 0.5,
+                "toughness_mode": "k_mat",
+                "k_mat": 100.0e6,
+                "station_mode": "domain_id",
+                "domain_id": "cf_0002"
+            }
+        }));
 
         // All nested `fad/*` subfields.
         let valid_fad = json!({
@@ -894,6 +963,23 @@ mod tests {
 
             let got_k_mat = reply["fad"]["k_mat"].as_f64().unwrap();
             assert!((got_k_mat - k_mat_display).abs() <= 1e-6 * k_mat_display.abs().max(1.0));
+            assert_eq!(reply["step1_is_elastic"], true);
+            assert_eq!(reply["evaluated_steps"].as_array().unwrap().len(), 2);
+            assert_eq!(reply["step_history_domain_id"], "cf_0002");
+            let hist = reply["step_history"].as_array().unwrap();
+            assert_eq!(hist.len(), 2);
+            let expected_hist_j0 = display.express(Quantity::ForcePerLength, 6_000.0 * 1.01).unwrap();
+            let got_hist_j0 = hist[0]["j_mean"].as_f64().unwrap();
+            assert!((got_hist_j0 - expected_hist_j0).abs() <= 1e-6 * expected_hist_j0.abs().max(1.0), "{hist:?}");
+            let expected_hist_kii0 = 35.0e6 * 0.1 * 1.01 * k_scale;
+            let got_hist_kii0 = hist[0]["k_ii_mean"].as_f64().unwrap();
+            assert!((got_hist_kii0 - expected_hist_kii0).abs() <= 1e-6 * expected_hist_kii0.abs().max(1.0), "{hist:?}");
+            let expected_ring_j = display.express(Quantity::ForcePerLength, 15_000.0).unwrap();
+            let got_ring_j = reply["active_profiles"][0]["rings"][1]["j"].as_f64().unwrap();
+            assert!((got_ring_j - expected_ring_j).abs() <= 1e-6 * expected_ring_j.abs().max(1.0));
+            let expected_ring_t33 = display.express(Quantity::Pressure, -4.0e6).unwrap();
+            let got_ring_t33 = reply["active_profiles"][0]["rings"][1]["t_33"].as_f64().unwrap();
+            assert!((got_ring_t33 - expected_ring_t33).abs() <= 1e-6 * expected_ring_t33.abs().max(1.0));
             assert_eq!(reply["fad"]["trajectory"].as_array().unwrap().len(), 2); // increments 1, 2
             assert_eq!(reply["fad"]["active_stations"].as_array().unwrap().len(), 2);
             assert_eq!(reply["rows"], 4); // 2 trajectory + 2 active stations
@@ -908,12 +994,16 @@ mod tests {
             assert!(header.contains(&format!("k_i_mean [{k_unit}]")), "{header}");
             assert!(header.contains(&format!("k_eff [{k_unit}]")), "{header}");
             assert!(header.contains(&format!("t_11_mean [{}]", display.symbol(Quantity::Pressure))), "{header}");
+            let expected_tail =
+                format!(",interaction_stress_state,k_ii_mean [{k_unit}],k_iii_mean [{k_unit}],t_33_mean [{}]", display.symbol(Quantity::Pressure));
+            assert!(header.ends_with(&expected_tail), "{header}");
             let data_rows: Vec<&str> = lines.collect();
             assert_eq!(data_rows.len(), 4);
             assert!(data_rows[0].starts_with("trajectory,Load,1,"));
             assert!(data_rows[1].starts_with("trajectory,Load,2,"));
             assert!(data_rows[2].starts_with("station,Load,2,"));
             assert!(data_rows[3].starts_with("station,Load,2,"));
+            assert!(data_rows[2].contains(",plane_strain,"), "{}", data_rows[2]);
         }
 
         // Underlying stored fracture data remains SI.

@@ -12,7 +12,7 @@ use fieldcraft_solver::StaticResult;
 use serde::{Deserialize, Serialize};
 
 use crate::results::{MIN_J_DENOM, MIN_VEC_NORM};
-use crate::{DiagnosticSeverity, DomainIntegralResult, Result, RingIntegral, Warp3dError};
+use crate::{DiagnosticSeverity, DomainIntegralResult, InteractionStressState, Result, RingIntegral, Warp3dError};
 
 pub const MAX_RING_EXCLUSION: usize = 64;
 pub const FAD_CURVE_POINTS: usize = 101;
@@ -187,6 +187,9 @@ pub struct FfsRequest {
     /// Optional FAD configuration (`None`: evaluate crack-front profiles & ring spread only).
     #[serde(default)]
     pub fad: Option<FadConfig>,
+    /// Optional top-level crack-front domain ID for single-station load history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_id: Option<String>,
     /// Tri-state Increment-1 elastic flag from `wes00001*` (`Some(false)` blocks Step-1 scaling).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step1_is_elastic: Option<bool>,
@@ -216,6 +219,32 @@ pub struct StationProfile {
     pub k_j_plane_stress: Option<f64>,
     pub t_11_mean: Option<f64>,
     pub t_33_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_stress_state: Option<InteractionStressState>,
+    #[serde(default)]
+    pub rings: Vec<RingIntegral>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepStationPoint {
+    pub warp_step: usize,
+    pub frame_index: Option<usize>,
+    pub load_factor: f64,
+    pub j_mean: f64,
+    pub k_j_plane_strain: Option<f64>,
+    pub k_j_plane_stress: Option<f64>,
+    pub k_i_mean: Option<f64>,
+    pub k_ii_mean: Option<f64>,
+    pub k_iii_mean: Option<f64>,
+    pub t_11_mean: Option<f64>,
+    pub t_33_mean: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluatedStep {
+    pub warp_step: usize,
+    pub frame_index: Option<usize>,
+    pub load_factor: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -284,6 +313,14 @@ pub struct FfsReport {
     pub worst_spread_status: SpreadStatus,
     pub fad: Option<FadSummary>,
     pub diagnostics: Vec<FfsDiagnostic>,
+    #[serde(default)]
+    pub step_history: Vec<StepStationPoint>,
+    #[serde(default)]
+    pub evaluated_steps: Vec<EvaluatedStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_history_domain_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step1_is_elastic: Option<bool>,
 }
 
 /// Runtime evaluator for API 579 Option 2 uniaxial true stress–true strain curves.
@@ -758,6 +795,8 @@ pub fn build_station_profiles(
                 k_j_plane_stress,
                 t_11_mean,
                 t_33_mean,
+                interaction_stress_state: d.interaction_stress_state,
+                rings: sorted_rings,
             });
         }
     }
@@ -1016,6 +1055,17 @@ pub fn evaluate_step_ffs_detailed(
         return Err(FfsError::param("exclude_inner_rings", format!("inner ring exclusion count must be at most {MAX_RING_EXCLUSION}, got {count}")));
     }
 
+    if let Some(top_dom) = req.domain_id.as_deref()
+        && let Some(fad) = &req.fad
+        && let StationSelection::DomainId { domain_id: fad_dom } = &fad.station_selection
+        && top_dom != fad_dom
+    {
+        return Err(FfsError::param(
+            "domain_id",
+            format!("conflicting `domain_id` (`{top_dom}`) and `fad/domain_id` (`{fad_dom}`); specify matching values or omit one"),
+        ));
+    }
+
     let mut diags = Vec::new();
     if domains_truncated {
         push_diag(
@@ -1164,8 +1214,65 @@ pub fn evaluate_step_ffs_detailed(
         p.frame_index = step_to_frame.get(&p.warp_step).copied().flatten();
     }
 
+    if let Some(top_dom) = req.domain_id.as_deref()
+        && !all_profiles.iter().any(|p| p.domain_id == top_dom)
+    {
+        return Err(FfsError::param("domain_id", format!("domain `{top_dom}` was not found in fracture results for step `{}`", req.step)));
+    }
+
     let active_profiles: Vec<StationProfile> =
         if active_warp_step == 0 { Vec::new() } else { all_profiles.iter().filter(|p| p.warp_step == active_warp_step).cloned().collect() };
+
+    let evaluated_steps: Vec<EvaluatedStep> =
+        matched_steps.iter().map(|ms| EvaluatedStep { warp_step: ms.warp_step, frame_index: ms.frame_index, load_factor: ms.load_factor }).collect();
+
+    let step_history_domain_id: Option<String> = if let Some(dom) = &req.domain_id {
+        Some(dom.clone())
+    } else if let Some(fad) = &req.fad
+        && let StationSelection::DomainId { domain_id } = &fad.station_selection
+    {
+        Some(domain_id.clone())
+    } else {
+        let latest_step = matched_steps.last().map(|m| m.warp_step);
+        let candidates: Vec<&StationProfile> = if !active_profiles.is_empty() {
+            active_profiles.iter().collect()
+        } else if let Some(ls) = latest_step {
+            all_profiles.iter().filter(|p| p.warp_step == ls).collect()
+        } else {
+            Vec::new()
+        };
+        let mut best: Option<&StationProfile> = None;
+        for &cand in &candidates {
+            if cand.j_mean.is_finite() && best.is_none_or(|b| cand.j_mean > b.j_mean) {
+                best = Some(cand);
+            }
+        }
+        best.or_else(|| candidates.first().copied()).map(|p| p.domain_id.clone())
+    };
+
+    let step_history: Vec<StepStationPoint> = if let Some(target_id) = step_history_domain_id.as_deref() {
+        matched_steps
+            .iter()
+            .filter_map(|ms| {
+                let prof = all_profiles.iter().find(|p| p.warp_step == ms.warp_step && p.domain_id == target_id)?;
+                Some(StepStationPoint {
+                    warp_step: ms.warp_step,
+                    frame_index: ms.frame_index,
+                    load_factor: ms.load_factor,
+                    j_mean: prof.j_mean,
+                    k_j_plane_strain: prof.k_j_plane_strain,
+                    k_j_plane_stress: prof.k_j_plane_stress,
+                    k_i_mean: prof.k_i_mean,
+                    k_ii_mean: prof.k_ii_mean,
+                    k_iii_mean: prof.k_iii_mean,
+                    t_11_mean: prof.t_11_mean,
+                    t_33_mean: prof.t_33_mean,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let max_ring_spread = active_profiles.iter().map(|p| p.ring_spread).filter(|v| v.is_finite()).fold(0.0_f64, f64::max);
     let worst_spread_status = active_profiles.iter().map(|p| p.spread_status).max_by_key(|&s| spread_rank(s)).unwrap_or(SpreadStatus::Unverified);
@@ -1730,6 +1837,10 @@ pub fn evaluate_step_ffs_detailed(
         worst_spread_status,
         fad: fad_summary,
         diagnostics: diags,
+        step_history,
+        evaluated_steps,
+        step_history_domain_id,
+        step1_is_elastic: req.step1_is_elastic,
     })
 }
 
@@ -1918,6 +2029,7 @@ mod tests {
             step: "Load".into(),
             ring_exclusion: RingExclusion::Auto,
             active_frame: None,
+            domain_id: None,
             step1_is_elastic: None,
             fad: Some(FadConfig {
                 option: FadOption::Option2,
@@ -2237,6 +2349,7 @@ mod tests {
             step: "Pull".into(),
             ring_exclusion: RingExclusion::Auto,
             active_frame: Some(2),
+            domain_id: None,
             step1_is_elastic: Some(true),
             fad: Some(FadConfig {
                 option: FadOption::Option1,
@@ -2306,5 +2419,130 @@ mod tests {
         assert_eq!(profs[0].kept_rings, 3);
         assert!(profs[1].excluded_rings.is_empty());
         assert_eq!(profs[1].kept_rings, 4);
+    }
+
+    #[test]
+    fn ffs_report_rings_step_history_evaluated_steps_and_domain_id_precedence() {
+        let model = hex8_test_model(None);
+        let hist = History {
+            increments: vec![
+                Increment {
+                    number: 1,
+                    load_factor: 0.25,
+                    size: 0.25,
+                    iterations: vec![],
+                    converged: true,
+                    cutback: None,
+                    negative_pivots: 0,
+                    augmentations: 0,
+                },
+                Increment {
+                    number: 2,
+                    load_factor: 0.50,
+                    size: 0.25,
+                    iterations: vec![],
+                    converged: true,
+                    cutback: None,
+                    negative_pivots: 0,
+                    augmentations: 0,
+                },
+                Increment {
+                    number: 3,
+                    load_factor: 1.00,
+                    size: 0.50,
+                    iterations: vec![],
+                    converged: true,
+                    cutback: None,
+                    negative_pivots: 0,
+                    augmentations: 0,
+                },
+            ],
+            frames: vec![
+                Frame { load_factor: 0.0, displacement: vec![[0.0; 3]; 4], reaction: vec![], stress: vec![], contacts: vec![] },
+                Frame { load_factor: 0.25, displacement: vec![[0.0; 3]; 4], reaction: vec![], stress: vec![], contacts: vec![] },
+                Frame { load_factor: 0.50, displacement: vec![[0.0; 3]; 4], reaction: vec![], stress: vec![], contacts: vec![] },
+                Frame { load_factor: 1.00, displacement: vec![[0.0; 3]; 4], reaction: vec![], stress: vec![], contacts: vec![] },
+            ],
+            iterations: 3,
+            critical_points: vec![],
+        };
+        let sr = base_static_result("Pull", vec![1, 2, 3, 4], Some(hist));
+
+        let mut d_a_1 = sample_domain("cf_0001", 1, vec![1], &[(3, 3.0e3), (1, 1.0e3), (2, 2.0e3)], Some(&[21.0e6, 19.0e6, 20.0e6]));
+        d_a_1.interaction_stress_state = Some(InteractionStressState::PlaneStress);
+        let d_b_1 = sample_domain("cf_0002", 1, vec![2], &[(1, 4.0e3), (2, 5.0e3), (3, 5.0e3)], Some(&[25.0e6, 26.0e6, 27.0e6]));
+        let mut d_a_3 = sample_domain("cf_0001", 3, vec![1], &[(1, 10.0e3), (2, 12.0e3), (3, 12.0e3)], Some(&[40.0e6, 42.0e6, 42.0e6]));
+        d_a_3.interaction_stress_state = Some(InteractionStressState::PlaneStress);
+        let d_b_3 = sample_domain("cf_0002", 3, vec![2], &[(1, 20.0e3), (2, 24.0e3), (3, 24.0e3)], Some(&[55.0e6, 56.0e6, 56.0e6]));
+        let domains = vec![d_a_1, d_b_1, d_a_3, d_b_3];
+        let step_numbers = [1, 2, 3]; // frame 2 (warp_step 2) is unevaluated!
+
+        // 1. Unevaluated frame 2 has empty active_profiles, yet evaluated_steps + governing peak-J step_history populate.
+        let req_empty_frame = FfsRequest {
+            step: "Pull".into(),
+            ring_exclusion: RingExclusion::Auto,
+            active_frame: Some(2),
+            domain_id: None,
+            step1_is_elastic: Some(true),
+            fad: None,
+        };
+        let rep = evaluate_step_ffs_detailed(&model, &sr, &domains, &step_numbers, false, &req_empty_frame).unwrap();
+        assert!(rep.active_profiles.is_empty());
+        assert_eq!(rep.step1_is_elastic, Some(true));
+        assert_eq!(rep.evaluated_steps.len(), 2);
+        assert_eq!(rep.evaluated_steps[0], EvaluatedStep { warp_step: 1, frame_index: Some(1), load_factor: 0.25 });
+        assert_eq!(rep.evaluated_steps[1], EvaluatedStep { warp_step: 3, frame_index: Some(3), load_factor: 1.00 });
+        assert_eq!(rep.step_history_domain_id.as_deref(), Some("cf_0002")); // governing peak-J at latest evaluated step
+        assert_eq!(rep.step_history.len(), 2);
+        assert!((rep.step_history[0].j_mean - 5.0e3).abs() < 1e-6);
+        assert!((rep.step_history[1].j_mean - 24.0e3).abs() < 1e-6);
+
+        // 2. Active frame sorts rings ascending and carries interaction_stress_state; top-level domain_id overrides peak-J.
+        let req_dom = FfsRequest {
+            step: "Pull".into(),
+            ring_exclusion: RingExclusion::Auto,
+            active_frame: Some(1),
+            domain_id: Some("cf_0001".into()),
+            step1_is_elastic: Some(false),
+            fad: None,
+        };
+        let rep_dom = evaluate_step_ffs_detailed(&model, &sr, &domains, &step_numbers, false, &req_dom).unwrap();
+        assert_eq!(rep_dom.step1_is_elastic, Some(false));
+        assert_eq!(rep_dom.step_history_domain_id.as_deref(), Some("cf_0001"));
+        assert_eq!(rep_dom.active_profiles[0].interaction_stress_state, Some(InteractionStressState::PlaneStress));
+        let ring_ids: Vec<usize> = rep_dom.active_profiles[0].rings.iter().map(|r| r.ring).collect();
+        assert_eq!(ring_ids, vec![1, 2, 3]);
+        assert_eq!(rep_dom.step_history.len(), 2);
+        assert!((rep_dom.step_history[0].j_mean - 2.5e3).abs() < 1e-6);
+        assert!((rep_dom.step_history[1].j_mean - 12.0e3).abs() < 1e-6);
+
+        // 3. fad/domain_id fallback when top-level domain_id is None, and conflict error when they disagree.
+        let mut req_fad = req_dom.clone();
+        req_fad.domain_id = None;
+        req_fad.fad = Some(FadConfig {
+            option: FadOption::Option1,
+            option2_curve: Option2Curve::ModelMaterial,
+            lr_input: LrInput::DirectLoadRatio { l_r_full: 0.5 },
+            toughness: ToughnessInput::KMat { value: 100.0e6 },
+            kr_source: KrSource::Auto,
+            station_selection: StationSelection::DomainId { domain_id: "cf_0001".into() },
+            sigma_ys: Some(400.0e6),
+            sigma_uts: None,
+            l_r_max: None,
+            young: None,
+            poisson: None,
+        });
+        let rep_fad = evaluate_step_ffs_detailed(&model, &sr, &domains, &step_numbers, false, &req_fad).unwrap();
+        assert_eq!(rep_fad.step_history_domain_id.as_deref(), Some("cf_0001"));
+
+        req_fad.domain_id = Some("cf_0002".into());
+        let err_conflict = evaluate_step_ffs_detailed(&model, &sr, &domains, &step_numbers, false, &req_fad).unwrap_err();
+        assert_eq!(err_conflict.path, Some("domain_id"));
+
+        // 4. Unknown top-level domain_id attributes error to `domain_id`.
+        let mut req_unknown = req_dom;
+        req_unknown.domain_id = Some("cf_9999".into());
+        let err_unknown = evaluate_step_ffs_detailed(&model, &sr, &domains, &step_numbers, false, &req_unknown).unwrap_err();
+        assert_eq!(err_unknown.path, Some("domain_id"));
     }
 }

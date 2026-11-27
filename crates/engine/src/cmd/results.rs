@@ -1310,6 +1310,19 @@ fn fracture_table(step: &str, domains: &[crate::results::DomainIntegralResult], 
             ("advance_x".into(), Cell::Number(d.advance[0])),
             ("advance_y".into(), Cell::Number(d.advance[1])),
             ("advance_z".into(), Cell::Number(d.advance[2])),
+            ("warp_step".into(), Cell::Number(d.step as f64)),
+            (
+                "interaction_stress_state".into(),
+                d.interaction_stress_state.map_or(Cell::Empty, |st| {
+                    Cell::Text(
+                        match st {
+                            fieldcraft_warp3d::InteractionStressState::PlaneStrain => "plane_strain",
+                            fieldcraft_warp3d::InteractionStressState::PlaneStress => "plane_stress",
+                        }
+                        .to_string(),
+                    )
+                }),
+            ),
         ]);
     }
     Ok(Table::from_named(rows))
@@ -2181,9 +2194,11 @@ mod tests {
             s.execute("results.export.csv", &json!({"what": "fracture", "step": "Pull", "path": frac_csv_mm.to_string_lossy()})).unwrap();
         assert_eq!(csv_reply_mm["rows"], 1);
         let csv_text_mm = std::fs::read_to_string(&frac_csv_mm).unwrap();
+        assert!(csv_text_mm.lines().next().unwrap().ends_with(",warp_step,interaction_stress_state"), "{csv_text_mm}");
         assert!(csv_text_mm.contains("j_mean [N/mm]"), "{csv_text_mm}");
         assert!(csv_text_mm.contains("k_i_mean [MPa·√mm]"), "{csv_text_mm}");
         assert!(csv_text_mm.contains("cf_0001") && csv_text_mm.contains("2 3"), "{csv_text_mm}");
+        assert!(csv_text_mm.contains(",1,plane_strain"), "{csv_text_mm}");
 
         // Switching display units preserves fracture results via refresh_results() and re-exports in SI.
         s.execute("model.units", &json!({"system": "m-kg-s-N-Pa"})).unwrap();

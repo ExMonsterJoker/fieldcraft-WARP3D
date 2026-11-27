@@ -36,10 +36,10 @@ pub use check::{
 };
 pub use deck::write_deck;
 pub use ffs::{
-    FAD_CURVE_POINTS, FadConfig, FadOption, FadPoint, FadSummary, FfsDiagnostic, FfsError, FfsMaterialDefaults, FfsReport, FfsRequest, KrSource,
-    LimitingMode, LrInput, MAX_RING_EXCLUSION, Option2Curve, Option2Evaluator, ReactionComponent, RingExclusion, SpreadStatus, StationProfile,
-    StationSelection, ToughnessInput, build_station_profiles, evaluate_fad_curve, evaluate_step_ffs, evaluate_step_ffs_detailed,
-    extract_material_defaults, reserve_factor,
+    EvaluatedStep, FAD_CURVE_POINTS, FadConfig, FadOption, FadPoint, FadSummary, FfsDiagnostic, FfsError, FfsMaterialDefaults, FfsReport, FfsRequest,
+    KrSource, LimitingMode, LrInput, MAX_RING_EXCLUSION, Option2Curve, Option2Evaluator, ReactionComponent, RingExclusion, SpreadStatus,
+    StationProfile, StationSelection, StepStationPoint, ToughnessInput, build_station_profiles, evaluate_fad_curve, evaluate_step_ffs,
+    evaluate_step_ffs_detailed, extract_material_defaults, reserve_factor,
 };
 pub use results::{parse_domain_integrals, read_results_dir};
 pub use runner::{Warp3dBinarySource, Warp3dBinaryStatus, find_warp3d_binary, resolve_warp3d_binary, run_warp3d, run_warp3d_with_override};
