@@ -291,6 +291,30 @@ fn read(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(reply)
 }
 
+/// Allowed keys inside a `crack_front` parameter object.
+pub const ALLOWED_CRACK_FRONT_KEYS: &[&str] = &[
+    "set",
+    "normal",
+    "symmetric",
+    "rings",
+    "ring_start",
+    "interaction_integral",
+    "interaction_stress_state",
+    "function_type",
+    "every_step",
+    "increment_interval",
+];
+
+/// Validate and normalize a raw `crack_front` JSON value via [`parse_crack_front_with`],
+/// stripping unset optional fields and redundant `every_step: false`.
+pub fn canonicalize_crack_front(val: &Value) -> Option<Value> {
+    let mut spec = parse_crack_front_with(&serde_json::json!({ "crack_front": val }), false).ok().flatten()?;
+    if spec.every_step == Some(false) {
+        spec.every_step = None;
+    }
+    serde_json::to_value(&spec).ok()
+}
+
 pub(super) fn parse_crack_front(p: &Value) -> Result<Option<fieldcraft_warp3d::CrackFrontSpec>> {
     parse_crack_front_with(p, false)
 }
@@ -305,6 +329,11 @@ pub(super) fn parse_crack_front_with(p: &Value, allow_empty_set: bool) -> Result
     let Some(obj) = raw.as_object() else {
         return Err(EngineError::invalid("crack_front", "must be a JSON object"));
     };
+    for key in obj.keys() {
+        if !ALLOWED_CRACK_FRONT_KEYS.contains(&key.as_str()) {
+            return Err(EngineError::invalid("crack_front", format!("unknown crack_front key `{key}`")));
+        }
+    }
     let set = match obj.get("set") {
         None | Some(Value::Null) if allow_empty_set => String::new(),
         Some(Value::String(s)) => {
@@ -352,17 +381,46 @@ pub(super) fn parse_crack_front_with(p: &Value, allow_empty_set: bool) -> Result
             let r = v
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
-                .filter(|r| (1..=20).contains(r))
-                .ok_or_else(|| EngineError::invalid("crack_front/rings", "must be an integer from 1 to 20"))?;
+                .filter(|r| (1..=64).contains(r))
+                .ok_or_else(|| EngineError::invalid("crack_front/rings", "must be an integer from 1 to 64"))?;
             Some(r)
         }
     };
+
+    let ring_start = match obj.get("ring_start") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let rs = v
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|rs| (1..=64).contains(rs))
+                .ok_or_else(|| EngineError::invalid("crack_front/ring_start", "must be an integer from 1 to 64"))?;
+            Some(rs)
+        }
+    };
+    if let Some(rs) = ring_start
+        && rs > rings.unwrap_or(4)
+    {
+        return Err(EngineError::invalid("crack_front/ring_start", "`ring_start` must be <= `rings`"));
+    }
 
     let interaction_integral = match obj.get("interaction_integral") {
         None | Some(Value::Null) => None,
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => return Err(EngineError::invalid("crack_front/interaction_integral", "must be true or false")),
     };
+
+    let interaction_stress_state = match obj.get("interaction_stress_state") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "plane_strain" => Some(fieldcraft_warp3d::InteractionStressState::PlaneStrain),
+        Some(Value::String(s)) if s == "plane_stress" => Some(fieldcraft_warp3d::InteractionStressState::PlaneStress),
+        Some(_) => {
+            return Err(EngineError::invalid("crack_front/interaction_stress_state", "must be `plane_strain` or `plane_stress`"));
+        }
+    };
+    if interaction_stress_state.is_some() && interaction_integral != Some(true) {
+        return Err(EngineError::invalid("crack_front/interaction_stress_state", "`interaction_stress_state` requires `interaction_integral: true`"));
+    }
 
     let function_type = match obj.get("function_type") {
         None | Some(Value::Null) => fieldcraft_warp3d::CrackFunctionType::Pointwise,
@@ -379,7 +437,33 @@ pub(super) fn parse_crack_front_with(p: &Value, allow_empty_set: bool) -> Result
         Some(_) => return Err(EngineError::invalid("crack_front/every_step", "must be true or false")),
     };
 
-    Ok(Some(fieldcraft_warp3d::CrackFrontSpec { set, normal, symmetric, rings, interaction_integral, function_type, every_step }))
+    let increment_interval = match obj.get("increment_interval") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let k = v
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|k| (1..=10_000).contains(k))
+                .ok_or_else(|| EngineError::invalid("crack_front/increment_interval", "must be an integer from 1 to 10000"))?;
+            Some(k)
+        }
+    };
+    if every_step == Some(true) && increment_interval.is_some() {
+        return Err(EngineError::invalid("crack_front/increment_interval", "cannot specify `increment_interval` together with `every_step: true`"));
+    }
+
+    Ok(Some(fieldcraft_warp3d::CrackFrontSpec {
+        set,
+        normal,
+        symmetric,
+        rings,
+        ring_start,
+        interaction_integral,
+        interaction_stress_state,
+        function_type,
+        every_step,
+        increment_interval,
+    }))
 }
 
 fn write(s: &mut Session, p: &Value) -> Result<Value> {
@@ -608,8 +692,18 @@ mod tests {
             ("crack_front/set", json!({})),
             ("crack_front/set", json!({"set": "   "})),
             ("crack_front/rings", json!({"set": "front", "rings": 0})),
-            ("crack_front/rings", json!({"set": "front", "rings": 21})),
+            ("crack_front/rings", json!({"set": "front", "rings": 65})),
             ("crack_front/rings", json!({"set": "front", "rings": "two"})),
+            ("crack_front/ring_start", json!({"set": "front", "ring_start": 0})),
+            ("crack_front/ring_start", json!({"set": "front", "ring_start": 5, "rings": 4})),
+            ("crack_front/increment_interval", json!({"set": "front", "increment_interval": 0})),
+            ("crack_front/increment_interval", json!({"set": "front", "increment_interval": 2, "every_step": true})),
+            ("crack_front/interaction_stress_state", json!({"set": "front", "interaction_stress_state": "invalid"})),
+            (
+                "crack_front/interaction_stress_state",
+                json!({"set": "front", "interaction_integral": false, "interaction_stress_state": "plane_stress"}),
+            ),
+            ("crack_front", json!({"set": "front", "bogus_key": 1})),
             ("crack_front/normal", json!({"set": "front", "normal": [1.0, 0.0]})),
             ("crack_front/normal", json!({"set": "front", "normal": [null, 0.0, 1.0]})),
             ("crack_front/normal", json!({"set": "front", "normal": ["x", 0.0, 1.0]})),
@@ -631,6 +725,26 @@ mod tests {
             .to_string();
         assert!(err.contains("no_such_set"), "{err}");
         assert!(!missing_set_path.exists());
+
+        // Canonicalization strips null/false optional keys and rejects unknown keys.
+        let canon = canonicalize_crack_front(&json!({
+            "set": "front",
+            "rings": 64,
+            "ring_start": 5,
+            "interaction_integral": true,
+            "interaction_stress_state": "plane_stress",
+            "increment_interval": 4,
+            "every_step": false,
+            "normal": null
+        }))
+        .unwrap();
+        assert_eq!(canon["rings"], 64);
+        assert_eq!(canon["ring_start"], 5);
+        assert_eq!(canon["interaction_stress_state"], "plane_stress");
+        assert_eq!(canon["increment_interval"], 4);
+        assert!(canon.get("every_step").is_none());
+        assert!(canon.get("normal").is_none());
+        assert!(canonicalize_crack_front(&json!({"set": "front", "extra": 1})).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

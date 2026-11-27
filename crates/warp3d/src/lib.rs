@@ -147,6 +147,18 @@ impl LabelMap {
     }
 }
 
+/// Maximum rings allowed per WARP3D crack-front domain (`1..=64`).
+pub(crate) const MAX_RINGS_PER_DOMAIN: usize = 64;
+
+/// Auxiliary stress state for WARP3D interaction-integral (`II8`) evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionStressState {
+    #[default]
+    PlaneStrain,
+    PlaneStress,
+}
+
 /// q-function distribution type for WARP3D `domain` evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -164,24 +176,32 @@ pub struct CrackFrontSpec {
     /// Name of the FieldCraft node `Set` lying along the 3D crack front.
     pub set: String,
     /// Unit normal to the crack plane (WARP3D x2 direction); inferred from a symmetry BC if None.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normal: Option<[f64; 3]>,
     /// Whether only half the crack geometry is modeled across a symmetry plane.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symmetric: Option<bool>,
-    /// Number of element rings to integrate (1..=20, default 4).
-    #[serde(default)]
+    /// Outer element ring to integrate (`1..=64`, default `4`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rings: Option<usize>,
+    /// Starting element ring to integrate (`1..=rings`, default `1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_start: Option<usize>,
     /// Also run `compute domain interaction integrals` for K_I, K_II, K_III, T11, T33.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interaction_integral: Option<bool>,
+    /// Auxiliary stress state for interaction integrals (`plane_strain` default | `plane_stress`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_stress_state: Option<InteractionStressState>,
     /// Pointwise (a/b/c per station) vs whole-front average (type d).
     #[serde(default)]
     pub function_type: CrackFunctionType,
-    /// Emit domain integral evaluation after every nonlinear load increment (`Some(true)`),
-    /// rather than only after the final step (`None` / `Some(false)`).
-    #[serde(default)]
+    /// Backward-compatible flag to evaluate domain integrals after every nonlinear increment (`Some(true)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub every_step: Option<bool>,
+    /// Evaluate domain integrals every `k` nonlinear increments, always anchoring Increment 1 and the final increment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub increment_interval: Option<usize>,
 }
 
 /// Values extracted for one ring of a WARP3D domain integral evaluation.
@@ -227,6 +247,8 @@ pub struct DomainIntegralResult {
     pub k_iii_mean: Option<f64>,
     pub t_11_mean: Option<f64>,
     pub t_33_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_stress_state: Option<InteractionStressState>,
 }
 
 /// Result of translating a FieldCraft model step into a WARP3D `.inp` deck.
@@ -250,6 +272,9 @@ pub struct Warp3dSolution {
     pub step_numbers: Vec<usize>,
     /// True if stdout or domain-integral parser bounds truncated any fracture output.
     pub domains_truncated: bool,
+    /// Tri-state Increment-1 elastic status from `wes00001*` (`Some(true)` = max peeq <= 1e-12,
+    /// `Some(false)` = yielded at Increment 1, `None` = missing/incomplete Increment-1 `wes*`).
+    pub step1_is_elastic: Option<bool>,
     pub warnings: Vec<String>,
     pub stdout_log: String,
 }

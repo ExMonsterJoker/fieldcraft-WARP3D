@@ -1897,8 +1897,9 @@ mod tests {
             k_iii_mean: None,
             t_11_mean: None,
             t_33_mean: None,
+            interaction_stress_state: None,
         };
-        s.store_fracture_results("Pull".into(), vec![sample_domain.clone()], vec![1], false, None);
+        s.store_fracture_results("Pull".into(), vec![sample_domain.clone()], vec![1], false, None, None);
         assert!(s.has_unpersisted_fracture());
 
         // 1. Save with results: true emits warning in both reply["warnings"] and reply["summary"].
@@ -1917,7 +1918,7 @@ mod tests {
         // 3. Backup save preserves both backup sentence and fracture warning inside summary.
         let path_old = d.join("migrated.fieldcraft");
         std::fs::write(&path_old, b"prior unrecognised file content").unwrap();
-        s.store_fracture_results("Pull".into(), vec![sample_domain], vec![1], false, None);
+        s.store_fracture_results("Pull".into(), vec![sample_domain], vec![1], false, None, None);
         let r_mig = s.execute("file.save_as", &json!({"path": path_old, "results": true})).unwrap();
         assert!(r_mig["backup"].is_string(), "{r_mig}");
         let mig_sum = r_mig["summary"].as_str().unwrap();

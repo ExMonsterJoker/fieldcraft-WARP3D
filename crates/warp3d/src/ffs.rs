@@ -187,6 +187,9 @@ pub struct FfsRequest {
     /// Optional FAD configuration (`None`: evaluate crack-front profiles & ring spread only).
     #[serde(default)]
     pub fad: Option<FadConfig>,
+    /// Tri-state Increment-1 elastic flag from `wes00001*` (`Some(false)` blocks Step-1 scaling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step1_is_elastic: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -635,7 +638,7 @@ pub fn build_station_profiles(
             } else {
                 let total = sorted_rings.len();
                 let skip = match ring_exclusion {
-                    RingExclusion::Auto => usize::from(total >= 3),
+                    RingExclusion::Auto => usize::from(total >= 3 && sorted_rings.first().is_some_and(|r| r.ring == 1)),
                     RingExclusion::Count { count } => {
                         let capped_count = count.min(MAX_RING_EXCLUSION);
                         let clamped = capped_count.min(total.saturating_sub(1));
@@ -1383,7 +1386,11 @@ pub fn evaluate_step_ffs_detailed(
                 (Some(a), Some(b)) => b.load_factor >= a.load_factor && a.load_factor > 0.0,
                 _ => true,
             });
-        let can_linear_scale_step1 = matched_steps.len() >= 2 && monotonic_positive_lambdas && !step1_k_by_domain.is_empty();
+        let can_linear_scale_step1 = matched_steps.len() >= 2
+            && first_step.is_some_and(|fs| fs.warp_step == 1)
+            && req.step1_is_elastic != Some(false)
+            && monotonic_positive_lambdas
+            && !step1_k_by_domain.is_empty();
 
         if fad.kr_source == KrSource::LinearScaledStep1Ki && !can_linear_scale_step1 {
             return Err(FfsError::param(
@@ -1853,6 +1860,7 @@ mod tests {
             k_iii_mean: Some(0.0),
             t_11_mean: Some(-10.0e6),
             t_33_mean: Some(-3.0e6),
+            interaction_stress_state: None,
         }
     }
 
@@ -1910,6 +1918,7 @@ mod tests {
             step: "Load".into(),
             ring_exclusion: RingExclusion::Auto,
             active_frame: None,
+            step1_is_elastic: None,
             fad: Some(FadConfig {
                 option: FadOption::Option2,
                 option2_curve: Option2Curve::ModelMaterial,
@@ -2216,7 +2225,7 @@ mod tests {
         let sr = base_static_result("Pull", vec![1, 2, 3, 4], Some(hist));
 
         let domains = vec![
-            sample_domain("cf_0001", 5, vec![1], &[(2, 2.0e3), (3, 2.0e3)], Some(&[20.0e6, 20.0e6])),
+            sample_domain("cf_0001", 1, vec![1], &[(2, 2.0e3), (3, 2.0e3)], Some(&[20.0e6, 20.0e6])),
             sample_domain("cf_0001", 10, vec![1], &[(2, 14.0e3), (3, 14.0e3)], Some(&[48.0e6, 48.0e6])),
             sample_domain("cf_0001", 15, vec![1], &[(2, 45.0e3), (3, 45.0e3)], Some(&[80.0e6, 80.0e6])),
             sample_domain("cf_0001", 99, vec![1], &[(2, 1.0e3), (3, 1.0e3)], Some(&[10.0e6, 10.0e6])), // orphan unmatched domain step
@@ -2228,6 +2237,7 @@ mod tests {
             step: "Pull".into(),
             ring_exclusion: RingExclusion::Auto,
             active_frame: Some(2),
+            step1_is_elastic: Some(true),
             fad: Some(FadConfig {
                 option: FadOption::Option1,
                 option2_curve: Option2Curve::ModelMaterial,
@@ -2242,23 +2252,40 @@ mod tests {
                 poisson: None,
             }),
         };
-        let rep = evaluate_step_ffs(&model, &sr, &domains, &[5, 10, 15], true, &req_auto).unwrap();
+        let rep = evaluate_step_ffs(&model, &sr, &domains, &[1, 10, 15], true, &req_auto).unwrap();
         assert!(rep.diagnostics.iter().any(|d| d.code == "ffs.domains_truncated"));
         assert!(rep.diagnostics.iter().any(|d| d.code == "ffs.unmatched_domain_step"));
         assert!(rep.diagnostics.iter().any(|d| d.code == "ffs.reaction_mpc_warning"));
         assert!(rep.diagnostics.iter().any(|d| d.code == "ffs.reaction_truncated"));
         let fad = rep.fad.unwrap();
-        assert_eq!(fad.trajectory.len(), 2); // step 5 and step 10; step 15 truncated
-        assert_eq!(fad.trajectory[0].warp_step, 5);
+        assert_eq!(fad.trajectory.len(), 2); // step 1 and step 10; step 15 truncated
+        assert_eq!(fad.trajectory[0].warp_step, 1);
         assert!((fad.trajectory[0].l_r - 0.25).abs() < 1e-12); // |-50k| / 200k
         assert!((fad.trajectory[1].l_r - 0.60).abs() < 1e-12); // |-120k| / 200k
         assert_eq!(fad.trajectory[1].kr_source_used, KrSource::LinearScaledStep1Ki);
         assert!((fad.trajectory[1].k_eff.unwrap() - 20.0e6 * (0.60 / 0.25)).abs() < 1e-6);
 
+        // 1b. Missing Increment-1 anchor (step_numbers = [5, 10, 15]) or step1_is_elastic == Some(false)
+        //     disables LinearScaledStep1Ki under Auto and rejects explicit LinearScaledStep1Ki.
+        let unanchored_domains = vec![
+            sample_domain("cf_0001", 5, vec![1], &[(2, 2.0e3), (3, 2.0e3)], Some(&[20.0e6, 20.0e6])),
+            sample_domain("cf_0001", 10, vec![1], &[(2, 14.0e3), (3, 14.0e3)], Some(&[48.0e6, 48.0e6])),
+            sample_domain("cf_0001", 15, vec![1], &[(2, 45.0e3), (3, 45.0e3)], Some(&[80.0e6, 80.0e6])),
+        ];
+        let rep_unanchored = evaluate_step_ffs(&model, &sr, &unanchored_domains, &[5, 10, 15], false, &req_auto).unwrap();
+        assert_eq!(rep_unanchored.fad.unwrap().trajectory[1].kr_source_used, KrSource::KjPlaneStrain);
+
+        let mut req_yielded_step1 = req_auto.clone();
+        req_yielded_step1.step1_is_elastic = Some(false);
+        let rep_yielded = evaluate_step_ffs(&model, &sr, &domains, &[1, 10, 15], false, &req_yielded_step1).unwrap();
+        assert_eq!(rep_yielded.fad.unwrap().trajectory[1].kr_source_used, KrSource::KjPlaneStrain);
+        req_yielded_step1.fad.as_mut().unwrap().kr_source = KrSource::LinearScaledStep1Ki;
+        assert!(evaluate_step_ffs_detailed(&model, &sr, &domains, &[1, 10, 15], false, &req_yielded_step1).is_err());
+
         // 2. Frame 0 gives unloaded verdict with zero spurious ffs.reaction_zero_or_missing warning.
         let mut req_f0 = req_auto.clone();
         req_f0.active_frame = Some(0);
-        let rep_f0 = evaluate_step_ffs(&model, &sr, &domains, &[5, 10, 15], false, &req_f0).unwrap();
+        let rep_f0 = evaluate_step_ffs(&model, &sr, &domains, &[1, 10, 15], false, &req_f0).unwrap();
         assert!(!rep_f0.diagnostics.iter().any(|d| d.code == "ffs.reaction_zero_or_missing"));
         let v0 = rep_f0.fad.unwrap().active_verdict.unwrap();
         assert_eq!(v0.limiting_mode, LimitingMode::Unloaded);
@@ -2268,7 +2295,16 @@ mod tests {
         // 3. Explicit KjPlaneStrain on plastic step emits ffs.epfm_double_count.
         let mut req_kj = req_auto;
         req_kj.fad.as_mut().unwrap().kr_source = KrSource::KjPlaneStrain;
-        let rep_kj = evaluate_step_ffs(&model, &sr, &domains, &[5, 10, 15], false, &req_kj).unwrap();
+        let rep_kj = evaluate_step_ffs(&model, &sr, &domains, &[1, 10, 15], false, &req_kj).unwrap();
         assert!(rep_kj.diagnostics.iter().any(|d| d.code == "ffs.epfm_double_count"));
+
+        // 4. RingExclusion::Auto excludes Ring 1 only when Ring 1 is present.
+        let inner_rings = sample_domain("cf_0001", 1, vec![1], &[(1, 1.0e3), (2, 2.0e3), (3, 2.0e3), (4, 2.0e3)], None);
+        let outer_rings = sample_domain("cf_0002", 1, vec![2], &[(5, 5.0e3), (6, 5.1e3), (7, 5.2e3), (8, 5.3e3)], None);
+        let (profs, _, _, _) = build_station_profiles(&model, &[inner_rings, outer_rings], RingExclusion::Auto, None);
+        assert_eq!(profs[0].excluded_rings, vec![1]);
+        assert_eq!(profs[0].kept_rings, 3);
+        assert!(profs[1].excluded_rings.is_empty());
+        assert_eq!(profs[1].kept_rings, 4);
     }
 }

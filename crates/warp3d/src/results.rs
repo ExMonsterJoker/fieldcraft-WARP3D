@@ -16,7 +16,7 @@ use fieldcraft_solver::nonlinear::{Frame, History, Increment, MAX_FIELD_VALUES, 
 use fieldcraft_solver::{ElementStress, StaticResult, Stats};
 
 use crate::deck::{piecewise_load_factor, select_step};
-use crate::{DomainIntegralResult, LabelMap, Result, RingIntegral, Warp3dError, Warp3dSolution};
+use crate::{DomainIntegralResult, InteractionStressState, LabelMap, MAX_RINGS_PER_DOMAIN, Result, RingIntegral, Warp3dError, Warp3dSolution};
 
 const MAX_STDOUT_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -25,9 +25,10 @@ const MAX_FLAT_LINE_BYTES: usize = 16 * 1024;
 const MAX_SKIPPED_LINES: usize = 100_000;
 const MAX_STEPS: usize = 10_000;
 const MAX_INP_HEADER_LINES: usize = 128;
-const MAX_DOMAIN_LINES: usize = 1_000_000;
-const MAX_DOMAINS: usize = 4_096;
-const MAX_RINGS_PER_DOMAIN: usize = 64;
+const MAX_DOMAIN_LINES: usize = 2_000_000;
+pub(crate) const MAX_DOMAINS: usize = 4_096;
+const MAX_DOMAIN_WARNINGS: usize = 32;
+const STEP1_ELASTIC_PEEQ_TOL: f64 = 1e-12; // unit-factors: dimensionless plastic strain zero threshold
 pub(crate) const MIN_J_DENOM: f64 = 1e-12; // unit-factors: denominator floor for path-independence ring spread
 pub(crate) const MIN_VEC_NORM: f64 = 1e-15;
 
@@ -276,6 +277,7 @@ struct DomainAccum {
     k_iii_mean: Option<f64>,
     t_11_mean: Option<f64>,
     t_33_mean: Option<f64>,
+    interaction_stress_state: Option<InteractionStressState>,
     symmetric_zero_modes: bool,
     has_invalid_summary: bool,
 }
@@ -324,6 +326,7 @@ impl DomainAccum {
             k_iii_mean: None,
             t_11_mean: None,
             t_33_mean: None,
+            interaction_stress_state: None,
             symmetric_zero_modes: false,
             has_invalid_summary: false,
         }
@@ -459,6 +462,7 @@ impl DomainAccum {
             k_iii_mean,
             t_11_mean,
             t_33_mean,
+            interaction_stress_state: self.interaction_stress_state,
         };
         Some((res, station_nodes))
     }
@@ -583,6 +587,18 @@ fn merge_interaction_into_existing(existing: &mut DomainIntegralResult, incoming
     if incoming.t_33_mean.is_some() {
         existing.t_33_mean = incoming.t_33_mean;
     }
+    if incoming.interaction_stress_state.is_some() {
+        existing.interaction_stress_state = incoming.interaction_stress_state;
+    }
+}
+
+/// Output of streaming WARP3D domain-integral stdout parsing.
+#[derive(Debug, Default)]
+pub(crate) struct ParsedDomainOutput {
+    pub domains: Vec<DomainIntegralResult>,
+    pub station_nodes: Vec<Vec<u32>>,
+    pub truncated: bool,
+    pub warnings: Vec<String>,
 }
 
 pub(crate) struct DomainIntegralParser<'a> {
@@ -598,6 +614,8 @@ pub(crate) struct DomainIntegralParser<'a> {
     awaiting_i_summary_values: Option<PendingSummary>,
     domain_lines: usize,
     domains_truncated: bool,
+    warnings: Vec<String>,
+    seen_warnings: BTreeSet<String>,
 }
 
 impl<'a> DomainIntegralParser<'a> {
@@ -615,6 +633,14 @@ impl<'a> DomainIntegralParser<'a> {
             awaiting_i_summary_values: None,
             domain_lines: 0,
             domains_truncated: false,
+            warnings: Vec::new(),
+            seen_warnings: BTreeSet::new(),
+        }
+    }
+
+    fn push_warning(&mut self, msg: String) {
+        if self.warnings.len() < MAX_DOMAIN_WARNINGS && self.seen_warnings.insert(msg.clone()) {
+            self.warnings.push(msg);
         }
     }
 
@@ -622,6 +648,17 @@ impl<'a> DomainIntegralParser<'a> {
         let clamped = clamp_str_utf8(raw_line, MAX_LINE_BYTES);
         let trimmed = clamped.trim();
         let lower = trimmed.to_ascii_lowercase();
+
+        // Capture WARP3D `didriv.f` / domain diagnostics before the active-block gate so messages
+        // emitted outside an open `domain id:` block still surface to the user.
+        if trimmed.starts_with(">>> Invalid domain definition")
+            || lower.starts_with(">>> warning:")
+            || lower.starts_with(">>> area under q-function")
+            || lower.starts_with(">>>>> warning:")
+            || lower.starts_with(">>>>> error:")
+        {
+            self.push_warning(clamp_str_utf8(trimmed, 512).to_string());
+        }
 
         // Track WARP3D `loading: ... step: N ...` line (both outside and inside domain output)
         // without counting non-domain solver filler against `MAX_DOMAIN_LINES`.
@@ -880,18 +917,22 @@ impl<'a> DomainIntegralParser<'a> {
                         continue;
                     }
                     if lower.contains("ki = 1, kii = 0, kiii = 0, plane stress") {
+                        acc.interaction_stress_state.get_or_insert(InteractionStressState::PlaneStress);
                         *sec = WarpSection::Ki { plane_strain: false };
                         continue;
                     }
                     if lower.contains("ki = 1, kii = 0, kiii = 0, plane strain") {
+                        acc.interaction_stress_state = Some(InteractionStressState::PlaneStrain);
                         *sec = WarpSection::Ki { plane_strain: true };
                         continue;
                     }
                     if lower.contains("ki = 0, kii = 1, kiii = 0, plane stress") {
+                        acc.interaction_stress_state.get_or_insert(InteractionStressState::PlaneStress);
                         *sec = WarpSection::Kii { plane_strain: false };
                         continue;
                     }
                     if lower.contains("ki = 0, kii = 1, kiii = 0, plane strain") {
+                        acc.interaction_stress_state = Some(InteractionStressState::PlaneStrain);
                         *sec = WarpSection::Kii { plane_strain: true };
                         continue;
                     }
@@ -904,10 +945,12 @@ impl<'a> DomainIntegralParser<'a> {
                         continue;
                     }
                     if lower.contains("t-stress (plane stress") {
+                        acc.interaction_stress_state.get_or_insert(InteractionStressState::PlaneStress);
                         *sec = WarpSection::TStress { plane_strain: false };
                         continue;
                     }
                     if lower.contains("t-stress (\"plane strain\"") || lower.contains("t-stress (plane strain") {
+                        acc.interaction_stress_state = Some(InteractionStressState::PlaneStrain);
                         *sec = WarpSection::TStress { plane_strain: true };
                         continue;
                     }
@@ -1215,22 +1258,22 @@ impl<'a> DomainIntegralParser<'a> {
         self.awaiting_i_summary_values = awaiting_i_summary_values;
     }
 
-    pub(crate) fn finish(mut self) -> (Vec<DomainIntegralResult>, Vec<Vec<u32>>, bool) {
+    pub(crate) fn finish(mut self) -> ParsedDomainOutput {
         if let Some(prev) = self.active.take() {
             flush_active_domain(&mut self.results, prev, self.active_is_schematic_interaction, &mut self.domains_truncated);
         }
 
         let mut domains = Vec::with_capacity(self.results.len());
-        let mut stations = Vec::with_capacity(self.results.len());
+        let mut station_nodes = Vec::with_capacity(self.results.len());
         for (d, s) in self.results {
             domains.push(d);
-            stations.push(s);
+            station_nodes.push(s);
         }
-        (domains, stations, self.domains_truncated)
+        ParsedDomainOutput { domains, station_nodes, truncated: self.domains_truncated, warnings: self.warnings }
     }
 }
 
-fn parse_domain_integrals_with_meta(stdout: &str, label_map: &LabelMap) -> (Vec<DomainIntegralResult>, Vec<Vec<u32>>, bool) {
+fn parse_domain_integrals_with_meta(stdout: &str, label_map: &LabelMap) -> ParsedDomainOutput {
     let mut parser = DomainIntegralParser::new(label_map);
     for raw_line in stdout.lines() {
         parser.feed_line(raw_line);
@@ -1241,7 +1284,7 @@ fn parse_domain_integrals_with_meta(stdout: &str, label_map: &LabelMap) -> (Vec<
 /// Parse WARP3D Chapter 4 `Domain:` decomposition and real WARP3D 18.5.0 domain/interaction-integral
 /// tables from `stdout`.
 pub fn parse_domain_integrals(stdout: &str, label_map: &LabelMap) -> Vec<DomainIntegralResult> {
-    parse_domain_integrals_with_meta(stdout, label_map).0
+    parse_domain_integrals_with_meta(stdout, label_map).domains
 }
 
 pub(crate) fn convert_domain_integrals_to_si(domains: &mut [DomainIntegralResult], display: &DisplaySystem) -> Result<()> {
@@ -1411,7 +1454,7 @@ pub(crate) fn read_results_dir_with_preparsed_fracture(
     dir_or_file: &Path,
     units: Option<Preset>,
     stdout_log: String,
-    preparsed_fracture: (Vec<DomainIntegralResult>, Vec<Vec<u32>>, bool),
+    preparsed_fracture: ParsedDomainOutput,
     warnings: Vec<String>,
 ) -> Result<Warp3dSolution> {
     read_results_dir_inner(model, step, dir_or_file, units, stdout_log, false, Some(preparsed_fracture), MAX_FRAME_VALUES, warnings)
@@ -1425,7 +1468,7 @@ fn read_results_dir_inner(
     units: Option<Preset>,
     stdout_log: String,
     stdout_truncated: bool,
-    preparsed_fracture: Option<(Vec<DomainIntegralResult>, Vec<Vec<u32>>, bool)>,
+    preparsed_fracture: Option<ParsedDomainOutput>,
     max_frame_values: usize,
     mut warnings: Vec<String>,
 ) -> Result<Warp3dSolution> {
@@ -1645,6 +1688,23 @@ fn read_results_dir_inner(
     let applied_total =
         compute_applied_total(model, &si_resolved, step_ref, final_factor).unwrap_or([-reaction_total[0], -reaction_total[1], -reaction_total[2]]);
 
+    let parsed_domain = match preparsed_fracture {
+        Some(pre) => pre,
+        None => parse_domain_integrals_with_meta(&stdout_log, &label_map),
+    };
+    warnings.extend(parsed_domain.warnings);
+    if parsed_domain.truncated {
+        warnings.push("WARP3D fracture domain integral output exceeded parser bounds; fracture results may be incomplete".into());
+    }
+
+    let step1_is_elastic = if step_nums.as_slice() == [1] && !final_elems.is_empty() {
+        Some(final_elems.iter().all(|e| e.plastic_strain.iter().all(|&p| p <= STEP1_ELASTIC_PEEQ_TOL)))
+    } else if let Some(wes1_path) = step_files.get(&1).and_then(|f| f.wes.as_ref()) {
+        scan_wes_step1_is_elastic(wes1_path, n_elems)
+    } else {
+        None
+    };
+
     let total_dofs = n_nodes.saturating_mul(3);
     let equations = total_dofs.saturating_sub(constrained_dofs);
     let static_result = StaticResult {
@@ -1670,17 +1730,11 @@ fn read_results_dir_inner(
         contacts: Vec::new(),
     };
 
-    let (mut fracture, station_nodes, parser_truncated) = match preparsed_fracture {
-        Some(pre) => pre,
-        None => parse_domain_integrals_with_meta(&stdout_log, &label_map),
-    };
-    if parser_truncated {
-        warnings.push("WARP3D fracture domain integral output exceeded parser bounds; fracture results may be incomplete".into());
-    }
-    let domains_truncated = stdout_truncated || parser_truncated;
+    let mut fracture = parsed_domain.domains;
+    let domains_truncated = stdout_truncated || parsed_domain.truncated;
     convert_domain_integrals_to_si(&mut fracture, &display)?;
-    enrich_domain_geometry(&mut fracture, &station_nodes, model);
-    Ok(Warp3dSolution { static_result, fracture, step_numbers: step_nums, domains_truncated, warnings, stdout_log })
+    enrich_domain_geometry(&mut fracture, &parsed_domain.station_nodes, model);
+    Ok(Warp3dSolution { static_result, fracture, step_numbers: step_nums, domains_truncated, step1_is_elastic, warnings, stdout_log })
 }
 
 fn resolve_dir(dir_or_file: &Path) -> Result<(PathBuf, Option<&Path>)> {
@@ -2002,6 +2056,78 @@ fn parse_element_stress_file(path: &Path, model: &fieldcraft_model::Model, resol
         elements.push(ElementStress { label: fc_label, kind: elem.kind, points: Vec::new(), nodal: Vec::new(), plastic_strain });
     }
     Ok(elements)
+}
+
+/// Stream column 8 (`epspls` / `peeq`) from an Increment-1 `wes*` flat file without allocating
+/// a full element table.
+///
+/// Returns `Some(true)` when all `expected_rows` parse cleanly with `peeq <= STEP1_ELASTIC_PEEQ_TOL`,
+/// `Some(false)` when any element yields (`peeq > STEP1_ELASTIC_PEEQ_TOL`), and `None` when the
+/// file is unreadable, empty, truncated, or malformed.
+fn scan_wes_step1_is_elastic(path: &Path, expected_rows: usize) -> Option<bool> {
+    if expected_rows == 0 {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_FLAT_FILE_BYTES {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut scratch = Vec::new();
+    let mut skipped_lines = 0usize;
+    let mut rows = 0usize;
+    let mut saw_plastic = false;
+
+    loop {
+        let Ok(opt_line) = read_bounded_line(&mut reader, &mut scratch, MAX_FLAT_LINE_BYTES) else {
+            return None;
+        };
+        let Some((line, truncated)) = opt_line else {
+            break;
+        };
+        if truncated {
+            return None;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            skipped_lines += 1;
+            if skipped_lines > MAX_SKIPPED_LINES {
+                return None;
+            }
+            continue;
+        }
+        if rows >= expected_rows {
+            return None;
+        }
+        let mut cols = 0usize;
+        let mut epspls_opt = None;
+        for tok in trimmed.split_whitespace() {
+            if cols >= 26 {
+                return None;
+            }
+            let Ok(val) = tok.parse::<f64>() else {
+                return None;
+            };
+            if !val.is_finite() {
+                return None;
+            }
+            if cols == 8 {
+                epspls_opt = Some(val);
+            }
+            cols += 1;
+        }
+        if cols != 26 {
+            return None;
+        }
+        let epspls = epspls_opt?;
+        if epspls > STEP1_ELASTIC_PEEQ_TOL {
+            saw_plastic = true;
+        }
+        rows += 1;
+    }
+
+    (rows == expected_rows).then_some(!saw_plastic)
 }
 
 fn collect_constraints(
@@ -2639,16 +2765,16 @@ Domain: d1 (interaction integral, step 2)
      1  1500.0     0.0      0.0     -10.0    -3.0
      2  1600.0     0.0      0.0     -11.0    -3.2
 ";
-        let (batch_domains, batch_nodes, batch_truncated) = parse_domain_integrals_with_meta(domain_log, &label_map);
-        assert!(!batch_truncated);
+        let batch = parse_domain_integrals_with_meta(domain_log, &label_map);
+        assert!(!batch.truncated);
         let mut streamed = DomainIntegralParser::new(&label_map);
         for line in domain_log.lines() {
             streamed.feed_line(line);
         }
-        let (stream_domains, stream_nodes, stream_truncated) = streamed.finish();
-        assert_eq!(stream_domains, batch_domains);
-        assert_eq!(stream_nodes, batch_nodes);
-        assert!(!stream_truncated);
+        let stream = streamed.finish();
+        assert_eq!(stream.domains, batch.domains);
+        assert_eq!(stream.station_nodes, batch.station_nodes);
+        assert!(!stream.truncated);
 
         // Overlong non-domain filler lines beyond MAX_DOMAIN_LINES must not starve late domain output,
         // and multi-byte UTF-8 lines exceeding MAX_LINE_BYTES must clamp without panicking.
@@ -2661,9 +2787,9 @@ Domain: d1 (interaction integral, step 2)
         for line in domain_log.lines() {
             late_parser.feed_line(line);
         }
-        let (late_domains, _, late_truncated) = late_parser.finish();
-        assert_eq!(late_domains, batch_domains);
-        assert!(!late_truncated);
+        let late = late_parser.finish();
+        assert_eq!(late.domains, batch.domains);
+        assert!(!late.truncated);
     }
 
     #[test]
@@ -2837,15 +2963,15 @@ domain id: cf_0001
                 j = (s as f64) * 10.0
             ));
         }
-        let (domains, stations, truncated) = parse_domain_integrals_with_meta(&log, &label_map);
-        assert!(!truncated);
-        assert_eq!(domains.len(), 3);
-        assert_eq!(stations.len(), 3);
+        let parsed = parse_domain_integrals_with_meta(&log, &label_map);
+        assert!(!parsed.truncated);
+        assert_eq!(parsed.domains.len(), 3);
+        assert_eq!(parsed.station_nodes.len(), 3);
         for (idx, step_no) in [1usize, 2, 3].into_iter().enumerate() {
-            assert_eq!(domains[idx].step, step_no);
-            assert_eq!(domains[idx].front_nodes, vec![2], "step {step_no} lost dump front_nodes");
-            assert_eq!(domains[idx].normal, [0.0, 1.0, 0.0], "step {step_no} lost normal");
-            assert_eq!(domains[idx].tangent, [0.0, 0.0, 1.0], "step {step_no} lost tangent");
+            assert_eq!(parsed.domains[idx].step, step_no);
+            assert_eq!(parsed.domains[idx].front_nodes, vec![2], "step {step_no} lost dump front_nodes");
+            assert_eq!(parsed.domains[idx].normal, [0.0, 1.0, 0.0], "step {step_no} lost normal");
+            assert_eq!(parsed.domains[idx].tangent, [0.0, 0.0, 1.0], "step {step_no} lost tangent");
         }
 
         // 2. MAX_DOMAINS cap sets `domains_truncated = true`.
@@ -2854,16 +2980,16 @@ domain id: cf_0001
             cap_parser.feed_line(&format!("Domain: d{i}"));
             cap_parser.feed_line("  J_mean: 1.0");
         }
-        let (capped_domains, _, cap_truncated) = cap_parser.finish();
-        assert_eq!(capped_domains.len(), MAX_DOMAINS);
-        assert!(cap_truncated);
+        let cap_out = cap_parser.finish();
+        assert_eq!(cap_out.domains.len(), MAX_DOMAINS);
+        assert!(cap_out.truncated);
 
         // 3. MAX_DOMAIN_LINES cap sets `domains_truncated = true`.
         let mut line_parser = DomainIntegralParser::new(&label_map);
         line_parser.domain_lines = MAX_DOMAIN_LINES;
         line_parser.feed_line("Domain: d_overflow");
-        let (_, _, line_truncated) = line_parser.finish();
-        assert!(line_truncated);
+        let line_out = line_parser.finish();
+        assert!(line_out.truncated);
 
         // 4. Sparse step_numbers ([5, 10]) and oversized stdout warning propagate to Warp3dSolution.
         let dir = temp_dir("sparse-steps");
@@ -2880,7 +3006,104 @@ domain id: cf_0001
         let sol = read_results_dir(&model, "Pull", &dir, Some(Preset::MKgS)).unwrap();
         assert_eq!(sol.step_numbers, vec![5, 10]);
         assert!(!sol.domains_truncated);
+        assert_eq!(sol.step1_is_elastic, None);
         assert_eq!(sol.fracture.len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_stress_state_tags_captures_domain_warnings_and_scans_step1_elastic() {
+        let mut model = Model::default();
+        for (id, x, y, z) in [
+            (1u32, 0.0, 0.0, 0.0),
+            (2, 1.0, 0.0, 0.0),
+            (3, 1.0, 1.0, 0.0),
+            (4, 0.0, 1.0, 0.0),
+            (5, 0.0, 0.0, 1.0),
+            (6, 1.0, 0.0, 1.0),
+            (7, 1.0, 1.0, 1.0),
+            (8, 0.0, 1.0, 1.0),
+        ] {
+            model.set_node(id, [x, y, z]).unwrap();
+        }
+        model.set_element(1, ElementKind::Hex8, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        model.add_material("Steel", Material { elastic: Some(Elastic::Isotropic { young: 210e9, poisson: 0.3 }), ..Default::default() }).unwrap();
+        model.add_set("All", Set { elements: vec![1], ..Set::default() }).unwrap();
+        model.add_set("Fix", Set { nodes: vec![1, 2, 3, 4], ..Set::default() }).unwrap();
+        model.add_set("Top", Set { nodes: vec![5, 6, 7, 8], ..Set::default() }).unwrap();
+        model
+            .add_section(
+                "Solid",
+                Section { set: "All".into(), material: "Steel".into(), kind: SectionKind::Solid {}, formulation: Default::default() },
+            )
+            .unwrap();
+        model.add_boundary_condition("Clamp", BoundaryCondition::Fixed { target: Target::Set("Fix".into()) }).unwrap();
+        model
+            .add_load("PullLoad", Load::Force { target: Target::Set("Top".into()), vector: [0.0, 0.0, 100.0], distribution: Default::default() })
+            .unwrap();
+        let mut step = Step::new("Pull", Procedure::NonlinearStatic(NonlinearStatic::default()));
+        step.boundary_conditions.insert("Clamp".into());
+        step.loads.insert("PullLoad".into());
+        model.add_step(step, None).unwrap();
+        let label_map = LabelMap::from_model(&model);
+
+        // 1. Capture >>> / >>>>> warnings emitted outside an open domain id block, deduplicated and capped at 32.
+        let mut warn_log = String::from(
+            "\
+>>> Invalid domain definition. Skipped..
+>>> Warning: front nodes not monotonic
+>>> Area under q-function is zero
+>>>>> warning: duplicate line
+>>>>> warning: duplicate line
+>>>>> error: interaction integral skipped
+domain id: cf_0001
+  J-integral components
+  1 10.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 10.0
+  KI = 1, KII = 0, KIII = 0, plane stress
+  1 0 0 0 0 0 0 0 0 0 25.0
+>>> Completed domain integral calculations
+",
+        );
+        for i in 0..40 {
+            warn_log.push_str(&format!(">>> Warning: synthetic extra {i}\n"));
+        }
+        let parsed = parse_domain_integrals_with_meta(&warn_log, &label_map);
+        assert_eq!(parsed.domains.len(), 1);
+        assert_eq!(parsed.domains[0].interaction_stress_state, Some(InteractionStressState::PlaneStress));
+        assert_eq!(parsed.warnings.len(), MAX_DOMAIN_WARNINGS);
+        assert!(parsed.warnings.iter().any(|w| w.contains("Invalid domain definition")));
+        assert!(parsed.warnings.iter().any(|w| w.contains("Area under q-function")));
+        assert!(parsed.warnings.iter().any(|w| w.contains(">>>>> error:")));
+
+        // 2. Multi-step Increment-1 wes* streaming sets step1_is_elastic and forwards domain warnings into static_result.warnings.
+        let dir = temp_dir("step1-elastic");
+        let vec_rows = "0.0 0.0 0.0\n".repeat(8);
+        let stress_rows = format!("{}\n", format_26col_row(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)).repeat(8);
+        for s in [1usize, 2] {
+            fs::write(dir.join(format!("wnd{s:05}_text")), &vec_rows).unwrap();
+            fs::write(dir.join(format!("wnr{s:05}_text")), &vec_rows).unwrap();
+            fs::write(dir.join(format!("wns{s:05}_text")), &stress_rows).unwrap();
+        }
+        let elastic_wes = format!("{}\n", format_26col_row(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+        let plastic_wes = format!("{}\n", format_26col_row(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.002));
+        fs::write(dir.join("wes00001_text"), &elastic_wes).unwrap();
+        fs::write(dir.join("wes00002_text"), &plastic_wes).unwrap();
+        fs::write(dir.join("job.out"), ">>> Warning: out-of-block test\n").unwrap();
+
+        let sol_elastic = read_results_dir(&model, "Pull", &dir, Some(Preset::MKgS)).unwrap();
+        assert_eq!(sol_elastic.step1_is_elastic, Some(true));
+        assert!(sol_elastic.static_result.warnings.iter().any(|w| w.contains("out-of-block test")));
+
+        // Yielded Step 1 -> Some(false)
+        fs::write(dir.join("wes00001_text"), &plastic_wes).unwrap();
+        let sol_plastic = read_results_dir(&model, "Pull", &dir, Some(Preset::MKgS)).unwrap();
+        assert_eq!(sol_plastic.step1_is_elastic, Some(false));
+
+        // Truncated/malformed Step 1 -> None
+        fs::write(dir.join("wes00001_text"), "0.0 0.0\n").unwrap();
+        let sol_bad = read_results_dir(&model, "Pull", &dir, Some(Preset::MKgS)).unwrap();
+        assert_eq!(sol_bad.step1_is_elastic, None);
 
         let _ = fs::remove_dir_all(&dir);
     }

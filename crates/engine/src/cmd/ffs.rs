@@ -130,7 +130,7 @@ fn run_ffs(s: &mut Session, p: &Value) -> Result<Value> {
         )));
     }
 
-    let req = FfsRequest { step: step_name.clone(), ring_exclusion, active_frame, fad };
+    let req = FfsRequest { step: step_name.clone(), ring_exclusion, active_frame, fad, step1_is_elastic: fdata.step1_is_elastic };
     let report =
         evaluate_step_ffs_detailed(&s.model, sr, &fdata.domains, &fdata.step_numbers, fdata.domains_truncated, &req).map_err(|e| match e.path {
             Some(path) => EngineError::invalid(path, e.message),
@@ -678,6 +678,7 @@ mod tests {
             k_iii_mean: Some(0.0),
             t_11_mean: Some(-12.0e6),
             t_33_mean: Some(-4.0e6),
+            interaction_stress_state: None,
         };
 
         let step_numbers = if nonlinear_steps {
@@ -735,7 +736,7 @@ mod tests {
         };
 
         s.store_result(StepResult::Implicit(fieldcraft_solver::StepResult::Static(sr)));
-        s.store_fracture_results("Load".into(), domains, step_numbers, false, Some("front"));
+        s.store_fracture_results("Load".into(), domains, step_numbers, false, None, Some("front"));
         s
     }
 

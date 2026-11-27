@@ -96,6 +96,14 @@ pub(crate) fn piecewise_load_factor(points: &[[f64; 2]], t: f64) -> f64 {
     points.last().map_or(t, |p| p[1])
 }
 
+pub(crate) fn step_increment_count(step: &Step) -> usize {
+    match &step.procedure {
+        Procedure::Static {} => 1,
+        Procedure::NonlinearStatic(nl) => ((1.0 / nl.initial_increment).round() as usize).clamp(1, nl.max_increments.max(1) as usize),
+        _ => 1,
+    }
+}
+
 pub(crate) fn select_step<'a>(model: &'a Model, requested: Option<&str>) -> std::result::Result<&'a Step, String> {
     if model.steps().is_empty() {
         return Err("model has no analysis steps".into());
@@ -192,7 +200,7 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
     let (nlgeom, n_steps, max_iters, conv_tol, load_factors) = match &step_ref.procedure {
         Procedure::Static {} => (false, 1usize, 16u32, 1.0e-5, vec![1.0]),
         Procedure::NonlinearStatic(nl) => {
-            let n = ((1.0 / nl.initial_increment).round() as usize).clamp(1, nl.max_increments.max(1) as usize);
+            let n = step_increment_count(step_ref);
             let mut factors = Vec::with_capacity(n);
             let mut prev_lam = 0.0;
             for k in 1..=n {
@@ -604,6 +612,9 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
     push_wrapped(&mut out, "  trace solution on");
     push_wrapped(&mut out, "  extrapolate on");
 
+    let eval_steps: BTreeSet<usize> =
+        crack.map(|spec| crate::fracture::evaluated_increments(spec, n_steps).into_iter().collect()).unwrap_or_default();
+
     for k in 1..=n_steps {
         push_wrapped(&mut out, &format!("compute displacements for loading {step_ident} step {k}"));
         push_wrapped(&mut out, "output flat text nodal displacements");
@@ -611,16 +622,10 @@ pub fn write_deck(model: &Model, step: Option<&str>, crack: Option<&CrackFrontSp
         push_wrapped(&mut out, "output flat text nodal reactions");
         push_wrapped(&mut out, "output flat text element stresses");
         if let Some(spec) = crack
-            && spec.every_step == Some(true)
+            && eval_steps.contains(&k)
         {
             emit_domain_commands(&mut out, &expressed, &resolved, step_ref, &label_map, spec)?;
         }
-    }
-
-    if let Some(spec) = crack
-        && spec.every_step != Some(true)
-    {
-        emit_domain_commands(&mut out, &expressed, &resolved, step_ref, &label_map, spec)?;
     }
 
     push_wrapped(&mut out, "stop");
@@ -805,9 +810,12 @@ mod tests {
             normal: Some([0.0, 1.0, 0.0]),
             symmetric: Some(false),
             rings: Some(4),
+            ring_start: None,
             interaction_integral: Some(true),
+            interaction_stress_state: None,
             function_type: CrackFunctionType::FrontAverage,
             every_step: None,
+            increment_interval: None,
         };
         // `fix` forms a quad loop [1,4,8,5], check open edge subset instead:
         model.add_set("front_edge", Set { nodes: vec![1, 5], ..Set::default() }).unwrap();
@@ -985,9 +993,12 @@ mod tests {
             normal: Some([0.0, 1.0, 0.0]),
             symmetric: Some(false),
             rings: Some(3),
+            ring_start: None,
             interaction_integral: Some(false),
+            interaction_stress_state: None,
             function_type: CrackFunctionType::FrontAverage,
             every_step: None,
+            increment_interval: None,
         };
 
         let post_only = write_deck(&model, Some("NL"), Some(&base_crack), Preset::MKgS).unwrap();
@@ -1010,6 +1021,46 @@ mod tests {
             };
             let slice = &per_step.text[s_pos..next_pos];
             assert_eq!(slice.matches("compute domain integral").count(), 1, "step {k} slice: {slice}");
+        }
+
+        // Anchored increment_interval=2 across 5 increments evaluates at {1, 2, 4, 5},
+        // emitting ring_start..=rings and plane stress output for interaction integral.
+        let mut model5 = unit_hex8_model();
+        model5.add_set("front_edge", Set { nodes: vec![1, 5], ..Set::default() }).unwrap();
+        let mut nl5 = Step::new(
+            "NL5",
+            Procedure::NonlinearStatic(NonlinearStatic { initial_increment: 0.2, max_increments: 10, ..NonlinearStatic::default() }),
+        );
+        nl5.boundary_conditions.insert("clamp".into());
+        nl5.loads.insert("pull".into());
+        model5.add_step(nl5, None).unwrap();
+        let sparse_crack = CrackFrontSpec {
+            set: "front_edge".into(),
+            normal: Some([0.0, 1.0, 0.0]),
+            symmetric: Some(false),
+            rings: Some(10),
+            ring_start: Some(3),
+            interaction_integral: Some(true),
+            interaction_stress_state: Some(crate::InteractionStressState::PlaneStress),
+            function_type: CrackFunctionType::FrontAverage,
+            every_step: None,
+            increment_interval: Some(2),
+        };
+        let sparse_deck = write_deck(&model5, Some("NL5"), Some(&sparse_crack), Preset::MKgS).unwrap();
+        assert_eq!(sparse_deck.step_count, 5);
+        assert!(sparse_deck.text.contains("q-values automatic rings 3-10\n"));
+        assert!(sparse_deck.text.contains("plane stress output for interaction integral\n"));
+        assert_eq!(sparse_deck.text.matches("compute domain interaction integral").count(), 4);
+        for k in 1..=5usize {
+            let s_pos = sparse_deck.text.find(&format!("compute displacements for loading NL5 step {k}")).unwrap();
+            let next_pos = if k < 5 {
+                sparse_deck.text.find(&format!("compute displacements for loading NL5 step {}", k + 1)).unwrap()
+            } else {
+                sparse_deck.text.find("stop").unwrap()
+            };
+            let slice = &sparse_deck.text[s_pos..next_pos];
+            let expected = usize::from(matches!(k, 1 | 2 | 4 | 5));
+            assert_eq!(slice.matches("compute domain interaction integral").count(), expected, "step {k} slice: {slice}");
         }
     }
 
@@ -1100,9 +1151,12 @@ mod tests {
             normal: Some([0.0, 1.0, 0.0]),
             symmetric: Some(false),
             rings: Some(2),
+            ring_start: None,
             interaction_integral: Some(false),
+            interaction_stress_state: None,
             function_type: CrackFunctionType::FrontAverage,
             every_step: None,
+            increment_interval: None,
         };
         let with_crack = write_deck(&model, None, Some(&crack), Preset::MKgS).unwrap();
         assert!(with_crack.text.contains("  2 2 3 1 1 5 6 4 4\n"));
@@ -1346,9 +1400,12 @@ mod tests {
             normal: None,
             symmetric: None,
             rings: Some(2),
+            ring_start: None,
             interaction_integral: Some(false),
+            interaction_stress_state: None,
             function_type: CrackFunctionType::Pointwise,
             every_step: None,
+            increment_interval: None,
         };
         let cancel = AtomicBool::new(false);
         let require_warp3d = std::env::var_os("FIELDCRAFT_REQUIRE_WARP3D").is_some();

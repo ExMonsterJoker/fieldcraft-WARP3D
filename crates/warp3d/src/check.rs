@@ -12,9 +12,9 @@ use fieldcraft_model::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::CrackFrontSpec;
-use crate::deck::{select_step as select_export_step, warp3d_face_for_elem};
-use crate::fracture::{order_crack_front, resolve_crack_normal_and_symmetry};
+use crate::deck::{select_step as select_export_step, step_increment_count, warp3d_face_for_elem};
+use crate::fracture::{build_domain_stations, evaluated_increments, order_crack_front, resolve_crack_normal_and_symmetry};
+use crate::{CrackFrontSpec, CrackFunctionType, MAX_RINGS_PER_DOMAIN};
 
 /// Maximum diagnostics retained in a [`Warp3dCheckReport`].
 pub const MAX_DIAGNOSTICS: usize = 100;
@@ -687,6 +687,84 @@ fn check_step_bc_and_load_kinds(
     }
 }
 
+fn validate_crack_front_spec_fields(spec: &CrackFrontSpec, step_ref: Option<&Step>, diags: &mut DiagnosticList) {
+    let subj = if spec.set.trim().is_empty() { "model".to_string() } else { set_subject(&spec.set) };
+    let rings_ok = match spec.rings {
+        Some(r) if !(1..=MAX_RINGS_PER_DOMAIN).contains(&r) => {
+            diags.error(
+                "warp3d.invalid_crack_front",
+                subj.clone(),
+                format!("crack front domain `rings` must be in 1..={MAX_RINGS_PER_DOMAIN}, got {r}"),
+            );
+            false
+        }
+        _ => true,
+    };
+    let ring_start_ok = match spec.ring_start {
+        Some(rs) if !(1..=MAX_RINGS_PER_DOMAIN).contains(&rs) => {
+            diags.error(
+                "warp3d.invalid_crack_front",
+                subj.clone(),
+                format!("crack front domain `ring_start` must be in 1..={MAX_RINGS_PER_DOMAIN}, got {rs}"),
+            );
+            false
+        }
+        _ => true,
+    };
+    if rings_ok && ring_start_ok && spec.ring_start.unwrap_or(1) > spec.rings.unwrap_or(4) {
+        diags.error(
+            "warp3d.invalid_crack_front",
+            subj.clone(),
+            format!("crack front `ring_start` ({}) must be <= `rings` ({})", spec.ring_start.unwrap_or(1), spec.rings.unwrap_or(4)),
+        );
+    }
+
+    if let Some(k) = spec.increment_interval {
+        if !(1..=10_000).contains(&k) {
+            diags.error("warp3d.invalid_crack_front", subj.clone(), format!("crack front `increment_interval` must be in 1..=10000, got {k}"));
+        } else if spec.every_step == Some(true) {
+            diags.error("warp3d.invalid_crack_front", subj.clone(), "crack front cannot specify both `every_step: true` and `increment_interval`");
+        } else if let Some(st) = step_ref
+            && matches!(st.procedure, Procedure::NonlinearStatic(_))
+        {
+            let n_steps = step_increment_count(st);
+            if k > n_steps {
+                diags.warning(
+                    "warp3d.increment_interval_exceeds_steps",
+                    subj.clone(),
+                    format!("crack front `increment_interval` ({k}) exceeds step `{}` increment count ({n_steps}); only Increment 1 and {n_steps} will be evaluated", st.name),
+                );
+            }
+        }
+    }
+
+    if spec.interaction_stress_state.is_some() && spec.interaction_integral != Some(true) {
+        diags.error("warp3d.invalid_crack_front", subj, "crack front `interaction_stress_state` requires `interaction_integral: true`");
+    }
+}
+
+/// Mirror WARP3D `didriv.f::dickdm`: verify Euclidean chord distance from node `0` strictly
+/// increases along `nodes`, returning the first offending FieldCraft node label if violated.
+fn first_non_monotonic_chord_node(model: &Model, nodes: &[u32]) -> Option<u32> {
+    if nodes.len() < 2 {
+        return None;
+    }
+    let p0 = model.node(*nodes.first()?)?.xyz;
+    let mut prev_dist = 0.0_f64;
+    for &nid in nodes.get(1..)? {
+        let p = model.node(nid)?.xyz;
+        let dx = p[0] - p0[0];
+        let dy = p[1] - p0[1];
+        let dz = p[2] - p0[2];
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if !dist.is_finite() || dist <= prev_dist {
+            return Some(nid);
+        }
+        prev_dist = dist;
+    }
+    None
+}
+
 fn check_normal_spec_basic(normal: Option<[f64; 3]>) -> std::result::Result<(), &'static str> {
     let Some(raw) = normal else {
         return Ok(());
@@ -921,12 +999,7 @@ fn check_resolved_step_and_crack(
 
     // Validate crack_front and crack_front_overconstrained.
     if let Some(spec) = crack {
-        if let Some(r) = spec.rings
-            && !(1..=20).contains(&r)
-        {
-            let subj = if spec.set.trim().is_empty() { "model".to_string() } else { set_subject(&spec.set) };
-            diags.error("warp3d.invalid_crack_front", subj, format!("crack front domain `rings` must be in 1..=20, got {r}"));
-        }
+        validate_crack_front_spec_fields(spec, step_ref, diags);
 
         if spec.set.trim().is_empty() {
             diags.error("warp3d.missing_crack_front_set", "model", "crack front `set` must name an existing node set");
@@ -941,7 +1014,51 @@ fn check_resolved_step_and_crack(
                         diags.error("warp3d.invalid_crack_front", set_subject(&spec.set), msg);
                     }
 
+                    let stations = build_domain_stations(&ordered, spec.function_type);
+                    if spec.function_type == CrackFunctionType::FrontAverage {
+                        if ordered.is_closed {
+                            diags.error(
+                                "warp3d.invalid_front_average",
+                                set_subject(&spec.set),
+                                "crack front `front_average` (`function type d`) cannot be used on a closed crack loop; use `pointwise`",
+                            );
+                        } else if let Some(bad) = stations.first().and_then(|st| first_non_monotonic_chord_node(model, &st.station_fc_nodes)) {
+                            diags.error(
+                                "warp3d.invalid_front_average",
+                                set_subject(&spec.set),
+                                format!(
+                                    "crack front `front_average` (`function type d`) failed WARP3D `didriv.f::dickdm` monotonic chord-distance check from start node at node {bad}; use `pointwise`"
+                                ),
+                            );
+                        }
+                    } else if let Some(bad) = stations
+                        .iter()
+                        .find_map(|st| first_non_monotonic_chord_node(model, &st.station_fc_nodes))
+                        .or_else(|| (ordered.corners.len() >= 3).then(|| first_non_monotonic_chord_node(model, &ordered.corners)).flatten())
+                    {
+                        diags.warning(
+                            "warp3d.non_monotonic_crack_front",
+                            set_subject(&spec.set),
+                            format!(
+                                "crack front node ordering fails WARP3D `didriv.f::dickdm` monotonic chord-distance check from the start node at node {bad}; strongly curved stations may be skipped by WARP3D"
+                            ),
+                        );
+                    }
+
                     if let Some(st) = step_ref {
+                        let eval_increments = evaluated_increments(spec, step_increment_count(st)).len();
+                        let total_domains = stations.len().saturating_mul(eval_increments);
+                        if total_domains > crate::results::MAX_DOMAINS {
+                            diags.warning(
+                                "warp3d.domain_budget_exceeded",
+                                set_subject(&spec.set),
+                                format!(
+                                    "crack front evaluates {total_domains} total domains ({} stations x {eval_increments} increments), exceeding parser budget {}; increase `increment_interval` or reduce stations",
+                                    stations.len(),
+                                    crate::results::MAX_DOMAINS
+                                ),
+                            );
+                        }
                         check_crack_front_overconstrained(model, resolved, st, &spec.set, &rset.nodes, &ordered, diags);
                     }
                 }
@@ -1195,12 +1312,7 @@ pub fn validate_model(
             }
 
             if let Some(spec) = crack {
-                if let Some(r) = spec.rings
-                    && !(1..=20).contains(&r)
-                {
-                    let subj = if spec.set.trim().is_empty() { "model".to_string() } else { set_subject(&spec.set) };
-                    diags.error("warp3d.invalid_crack_front", subj, format!("crack front domain `rings` must be in 1..=20, got {r}"));
-                }
+                validate_crack_front_spec_fields(spec, step_ref, &mut diags);
                 if spec.set.trim().is_empty() {
                     diags.error("warp3d.missing_crack_front_set", "model", "crack front `set` must name an existing node set");
                 } else if model.set(&spec.set).is_none() {
@@ -1508,9 +1620,12 @@ mod tests {
             normal: None,
             symmetric: None,
             rings: Some(3),
+            ring_start: None,
             interaction_integral: Some(false),
+            interaction_stress_state: None,
             function_type: CrackFunctionType::Pointwise,
             every_step: None,
+            increment_interval: None,
         };
         let report = validate_model(&model, Some("Pull"), Some(&crack), Some("cface"), CheckScope::Export);
         assert!(report.ready, "{report:?}");
@@ -1634,9 +1749,12 @@ mod tests {
             normal: None,
             symmetric: None,
             rings: Some(99),
+            ring_start: None,
             interaction_integral: None,
+            interaction_stress_state: None,
             function_type: CrackFunctionType::Pointwise,
             every_step: None,
+            increment_interval: None,
         };
         let t0 = std::time::Instant::now();
         let report = validate_resolved(&model, &si_resolved, None, Some(&crack), Some("missing_face"), CheckScope::Export);
@@ -1737,9 +1855,12 @@ mod tests {
             normal: Some([0.0, 1.0, 0.0]),
             symmetric: Some(false),
             rings: Some(2),
+            ring_start: None,
             interaction_integral: Some(true),
+            interaction_stress_state: None,
             function_type: crate::CrackFunctionType::FrontAverage,
             every_step: None,
+            increment_interval: None,
         };
         let r_crack = validate_model(&model, Some("CrackStep"), Some(&crack), None, CheckScope::Export);
         assert!(r_crack.ready, "{r_crack:?}");
@@ -1750,5 +1871,148 @@ mod tests {
             1,
             "only overlapping a_grav should warn, not non-overlapping a_body_other: {r_crack:?}"
         );
+    }
+
+    #[test]
+    fn validates_ring_start_increment_interval_stress_state_dickdm_and_domain_budget() {
+        // U-shaped 3-element Hex8 front in XY plane: corners [1, 2, 3, 4] at (0,0), (1,0), (1,1), (0,1)
+        // where ||p_3 - p_0|| = 1.0 <= ||p_2 - p_0|| = sqrt(2) (non-monotonic chord distance!).
+        let mut model = Model::default();
+        let pts = [(1u32, [0.0, 0.0, 0.0]), (2, [1.0, 0.0, 0.0]), (3, [1.0, 1.0, 0.0]), (4, [0.0, 1.0, 0.0])];
+        for (i, &(nid, p)) in pts.iter().enumerate() {
+            model.set_node(nid, p).unwrap();
+            model.set_node(10 + i as u32, [p[0], p[1], 1.0]).unwrap();
+        }
+        // Build 3 Hex8s along [1->2->3->4] by extruding radially outward in Z=[0,1] + outer nodes.
+        model.set_node(21, [-1.0, -1.0, 0.0]).unwrap();
+        model.set_node(22, [2.0, -1.0, 0.0]).unwrap();
+        model.set_node(23, [2.0, 2.0, 0.0]).unwrap();
+        model.set_node(24, [-1.0, 2.0, 0.0]).unwrap();
+        model.set_node(31, [-1.0, -1.0, 1.0]).unwrap();
+        model.set_node(32, [2.0, -1.0, 1.0]).unwrap();
+        model.set_node(33, [2.0, 2.0, 1.0]).unwrap();
+        model.set_node(34, [-1.0, 2.0, 1.0]).unwrap();
+        model.set_element(1, ElementKind::Hex8, vec![1, 2, 22, 21, 10, 11, 32, 31]).unwrap();
+        model.set_element(2, ElementKind::Hex8, vec![2, 3, 23, 22, 11, 12, 33, 32]).unwrap();
+        model.set_element(3, ElementKind::Hex8, vec![3, 4, 24, 23, 12, 13, 34, 33]).unwrap();
+
+        model.add_material("Steel", Material { elastic: Some(Elastic::Isotropic { young: 2.1e11, poisson: 0.3 }), ..Default::default() }).unwrap();
+        model.add_set("all", Set { elements: vec![1, 2, 3], ..Set::default() }).unwrap();
+        model.add_set("fix", Set { nodes: vec![21, 22, 31, 32], ..Set::default() }).unwrap();
+        model.add_set("u_front", Set { nodes: vec![1, 2, 3, 4], ..Set::default() }).unwrap();
+        model
+            .add_section(
+                "solid",
+                Section { set: "all".into(), material: "Steel".into(), kind: SectionKind::Solid {}, formulation: Default::default() },
+            )
+            .unwrap();
+        model.add_boundary_condition("clamp", BoundaryCondition::Fixed { target: Target::Set("fix".into()) }).unwrap();
+        let mut nl = Step::new(
+            "NL",
+            Procedure::NonlinearStatic(NonlinearStatic { initial_increment: 0.25, max_increments: 20, ..NonlinearStatic::default() }),
+        );
+        nl.boundary_conditions.insert("clamp".into());
+        model.add_step(nl, None).unwrap();
+
+        // 1. rings=64 + ring_start=5 + plane_stress accepted on monotonic subset [1, 2, 3],
+        //    with increment_interval=10 warning on exceeding n_steps=4.
+        model.add_set("mono", Set { nodes: vec![1, 2, 3], ..Set::default() }).unwrap();
+        let ok_crack = CrackFrontSpec {
+            set: "mono".into(),
+            normal: Some([0.0, 0.0, 1.0]),
+            symmetric: Some(false),
+            rings: Some(64),
+            ring_start: Some(5),
+            interaction_integral: Some(true),
+            interaction_stress_state: Some(crate::InteractionStressState::PlaneStress),
+            function_type: CrackFunctionType::FrontAverage,
+            every_step: None,
+            increment_interval: Some(10),
+        };
+        let r_ok = validate_model(&model, Some("NL"), Some(&ok_crack), None, CheckScope::Export);
+        assert!(r_ok.ready, "{r_ok:?}");
+        assert!(r_ok.diagnostics.iter().any(|d| d.code == "warp3d.increment_interval_exceeds_steps"), "{r_ok:?}");
+
+        // 2. Reject rings=65, ring_start > rings, every_step+increment_interval, interaction_stress_state without interaction_integral.
+        let bad_spec = CrackFrontSpec {
+            set: "mono".into(),
+            normal: Some([0.0, 0.0, 1.0]),
+            symmetric: Some(false),
+            rings: Some(65),
+            ring_start: Some(10),
+            interaction_integral: Some(false),
+            interaction_stress_state: Some(crate::InteractionStressState::PlaneStress),
+            function_type: CrackFunctionType::Pointwise,
+            every_step: Some(true),
+            increment_interval: Some(2),
+        };
+        let r_bad = validate_model(&model, Some("NL"), Some(&bad_spec), None, CheckScope::Export);
+        assert!(!r_bad.ready);
+        assert!(r_bad.diagnostics.iter().filter(|d| d.code == "warp3d.invalid_crack_front").count() >= 2, "{r_bad:?}");
+
+        // 3. FrontAverage on U-shaped non-monotonic front fails with warp3d.invalid_front_average;
+        //    Pointwise emits non-blocking warning warp3d.non_monotonic_crack_front.
+        let u_avg = CrackFrontSpec {
+            set: "u_front".into(),
+            normal: Some([0.0, 0.0, 1.0]),
+            symmetric: Some(false),
+            rings: Some(4),
+            ring_start: None,
+            interaction_integral: Some(false),
+            interaction_stress_state: None,
+            function_type: CrackFunctionType::FrontAverage,
+            every_step: None,
+            increment_interval: None,
+        };
+        let r_u_avg = validate_model(&model, Some("NL"), Some(&u_avg), None, CheckScope::Export);
+        assert!(!r_u_avg.ready);
+        assert!(r_u_avg.diagnostics.iter().any(|d| d.code == "warp3d.invalid_front_average"), "{r_u_avg:?}");
+
+        let u_pw = CrackFrontSpec { function_type: CrackFunctionType::Pointwise, ..u_avg };
+        let r_u_pw = validate_model(&model, Some("NL"), Some(&u_pw), None, CheckScope::Export);
+        assert!(r_u_pw.ready, "{r_u_pw:?}");
+        assert!(r_u_pw.diagnostics.iter().any(|d| d.code == "warp3d.non_monotonic_crack_front"), "{r_u_pw:?}");
+
+        // 4. Closed loop with FrontAverage fails with warp3d.invalid_front_average.
+        model.set_element(4, ElementKind::Hex8, vec![4, 1, 21, 24, 13, 10, 31, 34]).unwrap();
+        model.replace_set("all", Set { elements: vec![1, 2, 3, 4], ..Set::default() }).unwrap();
+        let closed_avg = CrackFrontSpec {
+            set: "u_front".into(),
+            normal: Some([0.0, 0.0, 1.0]),
+            symmetric: Some(false),
+            rings: Some(4),
+            ring_start: None,
+            interaction_integral: Some(false),
+            interaction_stress_state: None,
+            function_type: CrackFunctionType::FrontAverage,
+            every_step: None,
+            increment_interval: None,
+        };
+        let r_closed = validate_model(&model, Some("NL"), Some(&closed_avg), None, CheckScope::Export);
+        assert!(!r_closed.ready);
+        assert!(r_closed.diagnostics.iter().any(|d| d.code == "warp3d.invalid_front_average" && d.message.contains("closed")), "{r_closed:?}");
+
+        // 5. Domain budget warning when stations * eval_increments > MAX_DOMAINS.
+        let mut nl_big = Step::new(
+            "NLBig",
+            Procedure::NonlinearStatic(NonlinearStatic { initial_increment: 0.0005, max_increments: 2000, ..NonlinearStatic::default() }),
+        );
+        nl_big.boundary_conditions.insert("clamp".into());
+        model.add_step(nl_big, None).unwrap();
+        let budget_crack = CrackFrontSpec {
+            set: "u_front".into(),
+            normal: Some([0.0, 0.0, 1.0]),
+            symmetric: Some(false),
+            rings: Some(4),
+            ring_start: None,
+            interaction_integral: Some(false),
+            interaction_stress_state: None,
+            function_type: CrackFunctionType::Pointwise,
+            every_step: None,
+            increment_interval: Some(1),
+        };
+        let r_budget = validate_model(&model, Some("NLBig"), Some(&budget_crack), None, CheckScope::Export);
+        assert!(r_budget.ready, "{r_budget:?}");
+        assert!(r_budget.diagnostics.iter().any(|d| d.code == "warp3d.domain_budget_exceeded"), "{r_budget:?}");
     }
 }

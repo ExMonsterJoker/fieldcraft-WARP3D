@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fieldcraft_model::{BoundaryCondition, ElementKind, Model, Resolved, Step, Target};
 
-use crate::{CrackFrontSpec, CrackFunctionType, LabelMap, Result, Warp3dError};
+use crate::{CrackFrontSpec, CrackFunctionType, InteractionStressState, LabelMap, MAX_RINGS_PER_DOMAIN, Result, Warp3dError};
 
 // WARP3D's fixed-format Fortran input reader truncates/rejects records past column ~80.
 const MAX_WARP3D_LINE_LEN: usize = 72;
@@ -433,6 +433,36 @@ pub fn build_domain_stations(ordered: &OrderedFront, func_type: CrackFunctionTyp
     }
 }
 
+/// Compute the sorted, deduplicated 1-based WARP3D increments at which domain integrals should
+/// be evaluated for `spec` across `n_steps` increments.
+///
+/// - `n_steps == 0` -> empty.
+/// - `every_step == Some(true)` -> `1..=n_steps`.
+/// - `increment_interval == Some(k)` -> `{1, k', 2k', ..., n_steps}` (`k' = k.max(1)`), always
+///   anchoring Increment 1 and the final increment.
+/// - Default -> `[n_steps]`.
+pub fn evaluated_increments(spec: &CrackFrontSpec, n_steps: usize) -> Vec<usize> {
+    if n_steps == 0 {
+        return Vec::new();
+    }
+    if spec.every_step == Some(true) {
+        return (1..=n_steps).collect();
+    }
+    if let Some(k) = spec.increment_interval {
+        let step = k.max(1);
+        let mut set = BTreeSet::new();
+        set.insert(1);
+        set.insert(n_steps);
+        let mut cur = step;
+        while cur <= n_steps {
+            set.insert(cur);
+            cur = cur.saturating_add(step);
+        }
+        return set.into_iter().collect();
+    }
+    vec![n_steps]
+}
+
 /// Emit WARP3D `domain`, `compute domain integral`, and optional `compute domain interaction integrals`
 /// commands for `spec` onto `out`.
 pub fn emit_domain_commands(
@@ -444,17 +474,29 @@ pub fn emit_domain_commands(
     spec: &CrackFrontSpec,
 ) -> Result<()> {
     let rings = spec.rings.unwrap_or(4);
-    if !(1..=20).contains(&rings) {
-        return Err(Warp3dError::Unsupported(format!("crack front domain `rings` must be in 1..=20, got {rings}")));
+    if !(1..=MAX_RINGS_PER_DOMAIN).contains(&rings) {
+        return Err(Warp3dError::Unsupported(format!("crack front domain `rings` must be in 1..={MAX_RINGS_PER_DOMAIN}, got {rings}")));
+    }
+    let ring_start = spec.ring_start.unwrap_or(1);
+    if !(1..=MAX_RINGS_PER_DOMAIN).contains(&ring_start) {
+        return Err(Warp3dError::Unsupported(format!("crack front domain `ring_start` must be in 1..={MAX_RINGS_PER_DOMAIN}, got {ring_start}")));
+    }
+    if ring_start > rings {
+        return Err(Warp3dError::Unsupported(format!("crack front domain `ring_start` ({ring_start}) must be <= `rings` ({rings})")));
+    }
+
+    let interaction = spec.interaction_integral.unwrap_or(false);
+    if spec.interaction_stress_state.is_some() && !interaction {
+        return Err(Warp3dError::Unsupported("crack front `interaction_stress_state` requires `interaction_integral: true`".into()));
     }
 
     let rset = resolved.sets.get(&spec.set).ok_or_else(|| Warp3dError::Unsupported(format!("crack front node set `{}` not found", spec.set)))?;
     let ordered = order_crack_front(model, &spec.set, &rset.nodes)?;
     let (normal, symmetric) = resolve_crack_normal_and_symmetry(model, resolved, step, spec, &ordered.corners)?;
 
-    let interaction = spec.interaction_integral.unwrap_or(false);
     let order_kw = if ordered.is_quadratic { "quadratic" } else { "linear" };
     let stations = build_domain_stations(&ordered, spec.function_type);
+    let stress_state = spec.interaction_stress_state.unwrap_or_default();
 
     for station in &stations {
         let mut warp_ids = Vec::with_capacity(station.station_fc_nodes.len());
@@ -473,10 +515,13 @@ pub fn emit_domain_commands(
         }
         push_wrapped(out, &format!("  normal plane nx {:.8e} ny {:.8e} nz {:.8e}", normal[0], normal[1], normal[2]));
         push_wrapped(out, &format!("  front nodes {} {} verify", warp_ids.join(" "), order_kw));
-        push_wrapped(out, &format!("  q-values automatic rings 1-{rings}"));
+        push_wrapped(out, &format!("  q-values automatic rings {ring_start}-{rings}"));
         push_wrapped(out, &format!("  function type {}", station.function_type));
         if interaction {
-            push_wrapped(out, "  plane strain output for interaction integral");
+            match stress_state {
+                InteractionStressState::PlaneStrain => push_wrapped(out, "  plane strain output for interaction integral"),
+                InteractionStressState::PlaneStress => push_wrapped(out, "  plane stress output for interaction integral"),
+            }
         }
         push_wrapped(out, "  J to K");
         push_wrapped(out, "  dump");
@@ -544,9 +589,12 @@ mod tests {
             normal: None,
             symmetric: None,
             rings: Some(4),
+            ring_start: None,
             interaction_integral: Some(false),
+            interaction_stress_state: None,
             function_type: CrackFunctionType::Pointwise,
             every_step: None,
+            increment_interval: None,
         };
         let ordered = order_crack_front(&model, "crack_front", &[50, 12, 99, 3, 27]).unwrap();
         assert_eq!(ordered.corners, vec![3, 27, 12, 99, 50]);
@@ -640,9 +688,12 @@ mod tests {
             normal: Some([0.0, 2.0, 0.0]),
             symmetric: Some(false),
             rings: Some(5),
+            ring_start: None,
             interaction_integral: Some(true),
+            interaction_stress_state: None,
             function_type: CrackFunctionType::Pointwise,
             every_step: None,
+            increment_interval: None,
         };
         let ordered = order_crack_front(&model, "crack_front", &[88, 50, 3, 77, 27]).unwrap();
         assert_eq!(ordered.corners, vec![3, 27, 50]);
@@ -751,9 +802,12 @@ mod tests {
             normal: Some([0.0, 0.0, 1.0]),
             symmetric: Some(false),
             rings: Some(3),
+            ring_start: None,
             interaction_integral: Some(false),
+            interaction_stress_state: None,
             function_type: CrackFunctionType::Pointwise,
             every_step: None,
+            increment_interval: None,
         };
         let mut out = String::new();
         emit_domain_commands(&mut out, &model, &resolved, &step, &label_map, &spec).unwrap();
@@ -808,9 +862,12 @@ mod tests {
             normal: Some([0.0, 1.0, 0.0]),
             symmetric: Some(false),
             rings: Some(3),
+            ring_start: None,
             interaction_integral: Some(false),
+            interaction_stress_state: None,
             function_type: CrackFunctionType::Pointwise,
             every_step: None,
+            increment_interval: None,
         };
         let mut out = String::new();
         emit_domain_commands(&mut out, &model, &resolved, &step, &label_map, &spec).unwrap();
@@ -846,5 +903,35 @@ mod tests {
         mixed_quad.set_element(2, ElementKind::Hex20, (101..=120).collect()).unwrap();
         let err_mixed = order_crack_front(&mixed_quad, "mixed", &[1, 101, 117, 105]).unwrap_err();
         assert!(err_mixed.to_string().contains("mixes linear (Hex8/Wedge6) and quadratic (Hex20)"), "{err_mixed}");
+    }
+
+    #[test]
+    fn evaluated_increments_and_ring_start_plane_stress_emit_cleanly() {
+        let base = CrackFrontSpec {
+            set: "crack_front".into(),
+            normal: None,
+            symmetric: None,
+            rings: Some(64),
+            ring_start: Some(5),
+            interaction_integral: Some(true),
+            interaction_stress_state: Some(InteractionStressState::PlaneStress),
+            function_type: CrackFunctionType::Pointwise,
+            every_step: None,
+            increment_interval: Some(4),
+        };
+        assert_eq!(evaluated_increments(&base, 0), Vec::<usize>::new());
+        assert_eq!(evaluated_increments(&base, 1), vec![1]);
+        assert_eq!(evaluated_increments(&base, 20), vec![1, 4, 8, 12, 16, 20]);
+        assert_eq!(evaluated_increments(&CrackFrontSpec { increment_interval: Some(0), ..base.clone() }, 3), vec![1, 2, 3]);
+        assert_eq!(evaluated_increments(&CrackFrontSpec { increment_interval: Some(99), ..base.clone() }, 7), vec![1, 7]);
+        assert_eq!(evaluated_increments(&CrackFrontSpec { every_step: Some(true), increment_interval: None, ..base.clone() }, 4), vec![1, 2, 3, 4]);
+        assert_eq!(evaluated_increments(&CrackFrontSpec { every_step: None, increment_interval: None, ..base.clone() }, 5), vec![5]);
+
+        let (model, label_map, resolved, step) = hex8_chain_model();
+        let mut out = String::new();
+        emit_domain_commands(&mut out, &model, &resolved, &step, &label_map, &base).unwrap();
+        assert!(out.contains("q-values automatic rings 5-64\n"), "{out}");
+        assert!(out.contains("plane stress output for interaction integral\n"), "{out}");
+        assert!(!out.contains("plane strain output for interaction integral"), "{out}");
     }
 }

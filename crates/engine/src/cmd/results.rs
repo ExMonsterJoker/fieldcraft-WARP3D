@@ -1346,7 +1346,7 @@ fn read(s: &mut Session, p: &Value) -> Result<Value> {
         summary["fracture"] = json!(&sol.fracture);
     }
     s.store_result(crate::StepResult::Implicit(fieldcraft_solver::StepResult::Static(sol.static_result)));
-    s.store_fracture_results(step_name, sol.fracture, sol.step_numbers, sol.domains_truncated, None);
+    s.store_fracture_results(step_name, sol.fracture, sol.step_numbers, sol.domains_truncated, sol.step1_is_elastic, None);
     Ok(summary)
 }
 

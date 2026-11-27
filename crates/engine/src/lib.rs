@@ -23,6 +23,7 @@ pub mod logfile;
 pub mod machine;
 
 pub use cmd::analytic_surfaces;
+pub use cmd::deck::{ALLOWED_CRACK_FRONT_KEYS, canonicalize_crack_front};
 pub use cmd::file::OpenFileKind;
 pub use cmd::replace::{MESHERS, Replacement, replacement, thousands};
 pub use cmd::update::enable_checks as enable_update_checks;
@@ -344,6 +345,7 @@ pub(crate) struct Warp3dFractureData {
     pub domains: Vec<fieldcraft_warp3d::DomainIntegralResult>,
     pub step_numbers: Vec<usize>,
     pub domains_truncated: bool,
+    pub step1_is_elastic: Option<bool>,
 }
 
 /// Opaque background solve/import fracture bundle transferred across [`Session::take_solved_step`]
@@ -866,6 +868,7 @@ impl Session {
         fracture: Vec<fieldcraft_warp3d::DomainIntegralResult>,
         step_numbers: Vec<usize>,
         domains_truncated: bool,
+        step1_is_elastic: Option<bool>,
         crack_set_name: Option<&str>,
     ) {
         if fracture.is_empty() {
@@ -878,7 +881,8 @@ impl Session {
             let definition = fieldcraft_io::results::definition_hash(&self.model, &step, &self.sources).unwrap_or([0; 32]);
             let crack_set = crack_set_name.map(|name| (name.to_string(), self.model.set(name).cloned()));
             self.fracture_inputs.insert(step.clone(), FractureInputKey { definition, crack_set });
-            self.fracture_results.insert(step, (self.revision, Warp3dFractureData { domains: fracture, step_numbers, domains_truncated }));
+            self.fracture_results
+                .insert(step, (self.revision, Warp3dFractureData { domains: fracture, step_numbers, domains_truncated, step1_is_elastic }));
             self.results_stored = self.results_stored.wrapping_add(1);
         }
     }
@@ -1016,6 +1020,7 @@ impl Session {
                 fracture.data.domains,
                 fracture.data.step_numbers,
                 fracture.data.domains_truncated,
+                fracture.data.step1_is_elastic,
                 fracture.crack_set.as_deref(),
             );
         }
