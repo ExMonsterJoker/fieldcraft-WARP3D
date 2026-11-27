@@ -119,22 +119,23 @@ pub fn push_wrapped(out: &mut String, line: &str) {
     }
 }
 
-/// Order the nodes of `front_set` along shared `Hex8` or `Hex20` element edges into a continuous
-/// open chain or closed loop. Refuses tetrahedral (`Tet4`/`Tet10`) meshes and branched or
-/// disconnected crack fronts.
+/// Order the nodes of `front_set` along shared `Hex8`, `Wedge6`, or `Hex20` element edges into
+/// a continuous open chain or closed loop. Refuses tetrahedral (`Tet4`/`Tet10`) meshes, mixed
+/// linear/quadratic fronts, wedge cap/multi-axial front contacts, and branched or disconnected fronts.
 pub fn order_crack_front(model: &Model, set_name: &str, front_set: &[u32]) -> Result<OrderedFront> {
     if model.elements().values().any(|e| matches!(e.kind, ElementKind::Tet4 | ElementKind::Tet10)) {
         return Err(Warp3dError::Unsupported(
-            "WARP3D does not support J-integral or interaction-integral domains on tetrahedral (tet4/tet10) meshes; mesh with hex8 or hex20".into(),
+            "WARP3D does not support J-integral or interaction-integral domains on tetrahedral (tet4/tet10) meshes; mesh with hex8, wedge6, or hex20"
+                .into(),
         ));
     }
 
     let in_front: BTreeSet<u32> = front_set.iter().copied().collect();
     if in_front.len() < 2 {
-        return Err(Warp3dError::Unsupported(format!("crack front set `{set_name}` must contain at least 2 nodes along hex edges")));
+        return Err(Warp3dError::Unsupported(format!("crack front set `{set_name}` must contain at least 2 nodes along hex or wedge edges")));
     }
 
-    let mut has_hex8 = false;
+    let mut has_linear = false;
     let mut has_hex20 = false;
     // Key: (min(corner_a, corner_b), max(corner_a, corner_b)), value: optional Hex20 midside node.
     let mut segments: BTreeMap<(u32, u32), Option<u32>> = BTreeMap::new();
@@ -145,11 +146,25 @@ pub fn order_crack_front(model: &Model, set_name: &str, front_set: &[u32]) -> Re
             continue;
         }
         match elem.kind {
-            ElementKind::Hex8 => has_hex8 = true,
+            ElementKind::Hex8 => has_linear = true,
+            ElementKind::Wedge6 => {
+                has_linear = true;
+                let axial_count = crate::wedge6::touching_axial_edges(&elem.nodes, &in_front).into_iter().filter(|&t| t).count();
+                if axial_count > 1 {
+                    return Err(Warp3dError::Unsupported(format!(
+                        "crack front wedge6 element {elem_id} touches more than one axial edge on `{set_name}`"
+                    )));
+                }
+                if crate::wedge6::touches_cap_edge(&elem.nodes, &in_front) {
+                    return Err(Warp3dError::Unsupported(format!(
+                        "crack front wedge6 element {elem_id} has a triangular cap edge on `{set_name}`; crack front must follow axial wedge edges"
+                    )));
+                }
+            }
             ElementKind::Hex20 => has_hex20 = true,
             other => {
                 return Err(Warp3dError::Unsupported(format!(
-                    "crack front element {elem_id} has unsupported kind `{}` (only Hex8 and Hex20 are supported for WARP3D domain integrals)",
+                    "crack front element {elem_id} has unsupported kind `{}` (only Hex8, Wedge6, and Hex20 are supported for WARP3D domain integrals)",
                     other.name()
                 )));
             }
@@ -183,11 +198,13 @@ pub fn order_crack_front(model: &Model, set_name: &str, front_set: &[u32]) -> Re
         }
     }
 
-    if has_hex8 && has_hex20 {
-        return Err(Warp3dError::Unsupported(format!("crack front set `{set_name}` mixes Hex8 and Hex20 elements along the front")));
+    if has_linear && has_hex20 {
+        return Err(Warp3dError::Unsupported(format!(
+            "crack front set `{set_name}` mixes linear (Hex8/Wedge6) and quadratic (Hex20) elements along the front"
+        )));
     }
     if segments.is_empty() {
-        return Err(Warp3dError::Unsupported(format!("crack front set `{set_name}` does not follow connected Hex8/Hex20 element edges")));
+        return Err(Warp3dError::Unsupported(format!("crack front set `{set_name}` does not follow connected Hex8/Wedge6/Hex20 element edges")));
     }
 
     let mut adj: BTreeMap<u32, Vec<(u32, Option<u32>)>> = BTreeMap::new();
@@ -747,5 +764,87 @@ mod tests {
         for line in out.lines() {
             assert!(line.len() <= MAX_WARP3D_LINE_LEN, "line too long ({}): {line}", line.len());
         }
+    }
+
+    #[test]
+    fn chains_mixed_wedge6_and_hex8_front_and_rejects_bad_wedge6_contacts() {
+        // Two elements along Z (0..2): elem 1 is Wedge6 on z=0..1, elem 2 is Hex8 on z=1..2,
+        // sharing the crack-front edge (3 -> 27 -> 50).
+        let mut model = Model::default();
+        for (i, &fz) in [3u32, 27, 50].iter().enumerate() {
+            let z = i as f64;
+            let base = 200 + (i as u32) * 10;
+            model.set_node(fz, [1.0, 0.0, z]).unwrap();
+            model.set_node(base + 1, [2.0, 0.0, z]).unwrap();
+            model.set_node(base + 2, [1.5, 1.0, z]).unwrap();
+            model.set_node(base + 3, [1.0, 1.0, z]).unwrap();
+        }
+        // Wedge6 on axial edge (0, 3) = (3, 27).
+        model.set_element(1, ElementKind::Wedge6, vec![3, 201, 202, 27, 211, 212]).unwrap();
+        // Hex8 continuing along edge (27, 50).
+        model.set_element(2, ElementKind::Hex8, vec![27, 211, 212, 213, 50, 221, 222, 223]).unwrap();
+
+        model.add_material("Steel", Material { elastic: Some(Elastic::Isotropic { young: 2.1e11, poisson: 0.3 }), ..Default::default() }).unwrap();
+        model.add_set("all", Set { elements: vec![1, 2], ..Set::default() }).unwrap();
+        model.add_set("crack_front", Set { nodes: vec![50, 3, 27], ..Set::default() }).unwrap();
+        model
+            .add_section(
+                "solid",
+                Section { set: "all".into(), material: "Steel".into(), kind: SectionKind::Solid {}, formulation: Default::default() },
+            )
+            .unwrap();
+        let step = Step::new("Load", Procedure::Static {});
+        model.add_step(step.clone(), None).unwrap();
+
+        let resolved = model.resolve().unwrap();
+        let label_map = LabelMap::from_model(&model);
+        let ordered = order_crack_front(&model, "crack_front", &[50, 3, 27]).unwrap();
+        assert_eq!(ordered.corners, vec![3, 27, 50]);
+        assert!(!ordered.is_quadratic);
+        assert!(!ordered.is_closed);
+
+        let spec = CrackFrontSpec {
+            set: "crack_front".into(),
+            normal: Some([0.0, 1.0, 0.0]),
+            symmetric: Some(false),
+            rings: Some(3),
+            interaction_integral: Some(false),
+            function_type: CrackFunctionType::Pointwise,
+            every_step: None,
+        };
+        let mut out = String::new();
+        emit_domain_commands(&mut out, &model, &resolved, &step, &label_map, &spec).unwrap();
+        assert!(out.contains("linear verify\n"));
+        assert_eq!(out.matches("compute domain integral\n").count(), 3);
+
+        // Reject Wedge6 touching > 1 axial edge on front.
+        let err_multi_axial = order_crack_front(&model, "multi", &[3, 27, 201, 211]).unwrap_err();
+        assert!(err_multi_axial.to_string().contains("more than one axial edge"), "{err_multi_axial}");
+
+        // Reject Wedge6 touching a triangular cap edge on front.
+        let err_cap = order_crack_front(&model, "cap", &[3, 201]).unwrap_err();
+        assert!(err_cap.to_string().contains("triangular cap edge"), "{err_cap}");
+
+        // Reject mixed Wedge6 + Hex20.
+        let mut mixed_quad = Model::default();
+        let hex_corners =
+            [[1.0, 0.0, 1.0], [2.0, 0.0, 1.0], [2.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 0.0, 2.0], [2.0, 0.0, 2.0], [2.0, 1.0, 2.0], [1.0, 1.0, 2.0]];
+        let mut hex_xyz = hex_corners.to_vec();
+        hex_xyz.resize(20, [0.0; 3]);
+        for e in ElementKind::Hex20.edges() {
+            if let [a, b, m] = **e {
+                hex_xyz[m] = [0, 1, 2].map(|k| 0.5 * (hex_corners[a][k] + hex_corners[b][k]));
+            }
+        }
+        for (i, xyz) in hex_xyz.iter().enumerate() {
+            mixed_quad.set_node((101 + i) as u32, *xyz).unwrap();
+        }
+        mixed_quad.set_node(1, [1.0, 0.0, 0.0]).unwrap();
+        mixed_quad.set_node(2, [2.0, 0.0, 0.0]).unwrap();
+        mixed_quad.set_node(3, [1.5, 1.0, 0.0]).unwrap();
+        mixed_quad.set_element(1, ElementKind::Wedge6, vec![1, 2, 3, 101, 102, 103]).unwrap();
+        mixed_quad.set_element(2, ElementKind::Hex20, (101..=120).collect()).unwrap();
+        let err_mixed = order_crack_front(&mixed_quad, "mixed", &[1, 101, 117, 105]).unwrap_err();
+        assert!(err_mixed.to_string().contains("mixes linear (Hex8/Wedge6) and quadratic (Hex20)"), "{err_mixed}");
     }
 }
