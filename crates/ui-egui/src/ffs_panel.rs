@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, pos2, vec2};
 use fieldcraft_engine::ffs::{
-    FadOption, FadPoint, FadSummary, FfsMaterialDefaults, FfsReport, KrSource, LimitingMode, ReactionComponent, SpreadStatus, StationProfile,
+    EvaluatedStep, FadOption, FadPoint, FadSummary, FfsMaterialDefaults, FfsReport, InteractionStressState, KrSource, LimitingMode,
+    ReactionComponent, SpreadStatus, StationProfile, StepStationPoint,
 };
 use fieldcraft_engine::results::{DomainIntegralResult, Quantity};
 use fieldcraft_model::DisplaySystem;
@@ -34,21 +35,27 @@ pub enum ProfileQuantity {
     #[default]
     J,
     Ki,
+    Kii,
+    Kiii,
     KjPlaneStrain,
     KjPlaneStress,
     T11,
+    T33,
 }
 
 impl ProfileQuantity {
-    const ALL: [Self; 5] = [Self::J, Self::Ki, Self::KjPlaneStrain, Self::KjPlaneStress, Self::T11];
+    const ALL: [Self; 8] = [Self::J, Self::Ki, Self::Kii, Self::Kiii, Self::KjPlaneStrain, Self::KjPlaneStress, Self::T11, Self::T33];
 
     fn label(self) -> &'static str {
         match self {
             Self::J => "J-integral",
             Self::Ki => "K_I (interaction)",
+            Self::Kii => "K_II (interaction)",
+            Self::Kiii => "K_III (interaction)",
             Self::KjPlaneStrain => "K_J (plane strain)",
             Self::KjPlaneStress => "K_J (plane stress)",
             Self::T11 => "T_11 stress",
+            Self::T33 => "T_33 stress",
         }
     }
 
@@ -56,17 +63,61 @@ impl ProfileQuantity {
         match self {
             Self::J => Some(p.j_mean),
             Self::Ki => p.k_i_mean,
+            Self::Kii => p.k_ii_mean,
+            Self::Kiii => p.k_iii_mean,
             Self::KjPlaneStrain => p.k_j_plane_strain,
             Self::KjPlaneStress => p.k_j_plane_stress,
             Self::T11 => p.t_11_mean,
+            Self::T33 => p.t_33_mean,
+        }
+    }
+
+    fn history_value(self, pt: &StepStationPoint) -> Option<f64> {
+        match self {
+            Self::J => Some(pt.j_mean),
+            Self::Ki => pt.k_i_mean,
+            Self::Kii => pt.k_ii_mean,
+            Self::Kiii => pt.k_iii_mean,
+            Self::KjPlaneStrain => pt.k_j_plane_strain,
+            Self::KjPlaneStress => pt.k_j_plane_stress,
+            Self::T11 => pt.t_11_mean,
+            Self::T33 => pt.t_33_mean,
         }
     }
 
     fn unit(self, units: &DisplaySystem, k_unit: &str) -> String {
         match self {
             Self::J => units.symbol(Quantity::ForcePerLength).to_string(),
-            Self::Ki | Self::KjPlaneStrain | Self::KjPlaneStress => k_unit.to_string(),
-            Self::T11 => units.symbol(Quantity::Pressure).to_string(),
+            Self::Ki | Self::Kii | Self::Kiii | Self::KjPlaneStrain | Self::KjPlaneStress => k_unit.to_string(),
+            Self::T11 | Self::T33 => units.symbol(Quantity::Pressure).to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FfsChartTab {
+    #[default]
+    FrontProfile,
+    RingConvergence,
+    LoadHistory,
+}
+
+impl FfsChartTab {
+    const ALL: [Self; 3] = [Self::FrontProfile, Self::RingConvergence, Self::LoadHistory];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FrontProfile => "front_profile",
+            Self::RingConvergence => "ring_convergence",
+            Self::LoadHistory => "load_history",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::FrontProfile => "Front Profile",
+            Self::RingConvergence => "Ring Convergence",
+            Self::LoadHistory => "Load History",
         }
     }
 }
@@ -239,6 +290,7 @@ struct FfsTextBuffers {
 /// Physical inputs are stored in SI so switching display units preserves exact values.
 #[derive(Clone, Debug)]
 pub struct FfsState {
+    pub chart_tab: FfsChartTab,
     pub quantity: ProfileQuantity,
     pub x_axis: FrontAxis,
     pub ring_exclusion: RingExclusionChoice,
@@ -278,6 +330,7 @@ pub struct FfsState {
 impl Default for FfsState {
     fn default() -> Self {
         Self {
+            chart_tab: FfsChartTab::default(),
             quantity: ProfileQuantity::default(),
             x_axis: FrontAxis::default(),
             ring_exclusion: RingExclusionChoice::default(),
@@ -330,6 +383,7 @@ impl FfsState {
         let verdict = self.cached_report.as_ref().and_then(|r| r.fad.as_ref()).and_then(|f| f.active_verdict.as_ref());
         json!({
             "open": open,
+            "chart_tab": self.chart_tab.as_str(),
             "step": self.cached_report.as_ref().map(|r| r.step.as_str()),
             "selected_domain": self.selected_domain,
             "active_frame": self.cached_report.as_ref().and_then(|r| r.active_frame),
@@ -375,6 +429,9 @@ impl FfsState {
         root.insert("exclude_inner_rings".into(), json!(self.ring_exclusion.as_str()));
 
         if !self.fad_enabled || !include_fad_if_ready {
+            if let Some(dom) = self.selected_domain.as_deref().filter(|s| !s.is_empty()) {
+                root.insert("domain_id".into(), json!(dom));
+            }
             return (Value::Object(root), false);
         }
 
@@ -478,6 +535,11 @@ impl FfsState {
 
         if !incomplete {
             root.insert("fad".into(), Value::Object(fad));
+        }
+        let fad_handles_domain =
+            !incomplete && self.station_mode == StationModeChoice::SelectedStation && self.selected_domain.as_deref().is_some_and(|s| !s.is_empty());
+        if !fad_handles_domain && let Some(dom) = self.selected_domain.as_deref().filter(|s| !s.is_empty()) {
+            root.insert("domain_id".into(), json!(dom));
         }
         (Value::Object(root), incomplete)
     }
@@ -660,6 +722,15 @@ pub fn panel(app: &mut ModelApp, ui: &mut egui::Ui) {
     }
 }
 
+fn stress_state_label(s: InteractionStressState) -> &'static str {
+    match s {
+        InteractionStressState::PlaneStrain => "Plane strain",
+        InteractionStressState::PlaneStress => "Plane stress",
+    }
+}
+
+const LOCAL_AXIS_LEGEND: &str = "(x1=advance, x2=normal, x3=tangent)";
+
 /// Container-agnostic FFS crack-front and API 579 FAD contents.
 /// Can be embedded in the bottom panel today or a pop-out window (`#1088`) without rewriting.
 pub fn show_contents(app: &mut ModelApp, plot: &Plot, ui: &mut egui::Ui, t: &Tokens) {
@@ -677,6 +748,12 @@ pub fn show_contents(app: &mut ModelApp, plot: &Plot, ui: &mut egui::Ui, t: &Tok
 
     let mut state = app.ffs.take().unwrap_or_default();
     state.sync_buffers(&plot.units);
+
+    if let Some(sel) = state.selected_domain.as_deref()
+        && !app.session.fracture_results(&plot.view.step).is_some_and(|ds| ds.iter().any(|d| d.domain_id == sel))
+    {
+        state.selected_domain = None;
+    }
 
     let defaults = fieldcraft_engine::ffs::material_defaults(&app.session, &plot.view.step);
     let bc_sets = fieldcraft_engine::ffs::reaction_bc_sets(&app.session, &plot.view.step);
@@ -703,7 +780,9 @@ pub fn show_contents(app: &mut ModelApp, plot: &Plot, ui: &mut egui::Ui, t: &Tok
         match app.run("results.ffs", params.clone()) {
             Ok(val) => match serde_json::from_value::<FfsReport>(val) {
                 Ok(report) => {
-                    if state.selected_domain.as_ref().is_none_or(|sel| !report.active_profiles.iter().any(|p| p.domain_id == *sel)) {
+                    if !report.active_profiles.is_empty()
+                        && state.selected_domain.as_ref().is_none_or(|sel| !report.active_profiles.iter().any(|p| p.domain_id == *sel))
+                    {
                         state.selected_domain = report.active_profiles.first().map(|p| p.domain_id.clone());
                     }
                     state.cached_report = Some(report);
@@ -725,108 +804,178 @@ pub fn show_contents(app: &mut ModelApp, plot: &Plot, ui: &mut egui::Ui, t: &Tok
     let mut export_params: Option<Value> = None;
     let mut clicked_station: Option<StationProfile> = None;
     let mut sync_frame: Option<usize> = None;
-
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("Quantity").small().color(t.text_dim));
-        egui::ComboBox::from_id_salt("fc_ffs_qty").selected_text(state.quantity.label()).width(142.0).show_ui(ui, |ui| {
-            for q in ProfileQuantity::ALL {
-                ui.selectable_value(&mut state.quantity, q, q.label());
-            }
-        });
-
-        ui.label(RichText::new("X").small().color(t.text_dim));
-        egui::ComboBox::from_id_salt("fc_ffs_axis").selected_text(state.x_axis.label()).width(126.0).show_ui(ui, |ui| {
-            ui.selectable_value(&mut state.x_axis, FrontAxis::PhysicalS, FrontAxis::PhysicalS.label());
-            ui.selectable_value(&mut state.x_axis, FrontAxis::NormalizedSNorm, FrontAxis::NormalizedSNorm.label());
-        });
-
-        let mut exclude_ring1 = state.ring_exclusion != RingExclusionChoice::Count(0);
-        if ui
-            .checkbox(&mut exclude_ring1, "Exclude Ring 1")
-            .on_hover_text("Exclude innermost crack-tip rosette ring distortion when 3+ rings are present")
-            .changed()
-        {
-            state.ring_exclusion = if exclude_ring1 { RingExclusionChoice::Auto } else { RingExclusionChoice::Count(0) };
-        }
-
-        ui.label(RichText::new("Rings").small().color(t.text_dim));
-        egui::ComboBox::from_id_salt("fc_ffs_rings").selected_text(state.ring_exclusion.label()).width(156.0).show_ui(ui, |ui| {
-            for choice in RingExclusionChoice::ALL {
-                ui.selectable_value(&mut state.ring_exclusion, choice, choice.label());
-            }
-        });
-
-        if state.quantity == ProfileQuantity::J {
-            ui.checkbox(&mut state.show_ring_band, "Ring band").on_hover_text("Shade J_min..J_max across kept outer rings");
-        }
-
-        ui.checkbox(&mut state.fad_enabled, "API 579 FAD").on_hover_text("Evaluate API 579-1 / ASME FFS-1 Option 1 or Option 2 FAD");
-
-        if ui.button("Export CSV…").on_hover_text("Write crack-front profiles and FAD trajectory to RFC 4180 CSV (results.ffs)").clicked() {
-            export_params = Some(app.session.params_with_units("results.ffs", &params));
-        }
-    });
-
-    ui.add_space(4.0);
-
     let report_snapshot = state.report_for(&plot.view.step).cloned();
-    if let Some(report) = report_snapshot.as_ref() {
-        let wide = ui.available_width() >= WIDE_SPLIT_MIN_WIDTH;
-        if wide && state.fad_enabled {
-            ui.columns(2, |cols| {
-                if let Some((left, right)) = cols.split_first_mut() {
-                    draw_profile_section(left, &mut state, report, plot, t, &mut clicked_station);
-                    if let Some(right) = right.first_mut() {
-                        draw_fad_section(
-                            right,
-                            &mut state,
-                            report,
-                            defaults.as_ref(),
-                            &bc_sets,
-                            &plot.units,
-                            fad_incomplete,
-                            t,
-                            &mut clicked_station,
-                            &mut sync_frame,
-                        );
-                    }
+    let session_export_params = app.session.params_with_units("results.ffs", &params);
+
+    ui.push_id("fc_ffs_contents", |ui| {
+        let ring_bounds: Option<(usize, usize)> = report_snapshot.as_ref().and_then(|rep| {
+            let mut lo = usize::MAX;
+            let mut hi = 0usize;
+            let mut any = false;
+            for p in &rep.active_profiles {
+                for r in &p.rings {
+                    lo = lo.min(r.ring);
+                    hi = hi.max(r.ring);
+                    any = true;
+                }
+            }
+            any.then_some((lo, hi))
+        });
+        let has_ring_1 = ring_bounds.is_none_or(|(lo, _)| lo == 1);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Quantity").small().color(t.text_dim));
+            egui::ComboBox::from_id_salt("fc_ffs_qty").selected_text(state.quantity.label()).width(142.0).show_ui(ui, |ui| {
+                for q in ProfileQuantity::ALL {
+                    ui.selectable_value(&mut state.quantity, q, q.label());
                 }
             });
-        } else {
-            draw_profile_section(ui, &mut state, report, plot, t, &mut clicked_station);
-            if state.fad_enabled {
-                ui.separator();
-                draw_fad_section(
-                    ui,
-                    &mut state,
-                    report,
-                    defaults.as_ref(),
-                    &bc_sets,
-                    &plot.units,
-                    fad_incomplete,
-                    t,
-                    &mut clicked_station,
-                    &mut sync_frame,
-                );
+
+            ui.label(RichText::new("X").small().color(t.text_dim));
+            egui::ComboBox::from_id_salt("fc_ffs_axis").selected_text(state.x_axis.label()).width(126.0).show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.x_axis, FrontAxis::PhysicalS, FrontAxis::PhysicalS.label());
+                ui.selectable_value(&mut state.x_axis, FrontAxis::NormalizedSNorm, FrontAxis::NormalizedSNorm.label());
+            });
+
+            let mut exclude_ring1 = state.ring_exclusion != RingExclusionChoice::Count(0);
+            if ui
+                .add_enabled(has_ring_1, egui::Checkbox::new(&mut exclude_ring1, "Exclude Ring 1"))
+                .on_hover_text("Exclude innermost crack-tip rosette ring distortion when 3+ rings are present")
+                .on_disabled_hover_text("Ring 1 is not present in this solve (rings start past Ring 1); Exclude Ring 1 has no effect")
+                .changed()
+            {
+                state.ring_exclusion = if exclude_ring1 { RingExclusionChoice::Auto } else { RingExclusionChoice::Count(0) };
+            }
+            if let Some((min_r, max_r)) = ring_bounds {
+                ui.label(RichText::new(format!("Rings {min_r}–{max_r}")).small().color(t.text_dim));
+            }
+
+            ui.label(RichText::new("Rings").small().color(t.text_dim));
+            egui::ComboBox::from_id_salt("fc_ffs_rings").selected_text(state.ring_exclusion.label()).width(156.0).show_ui(ui, |ui| {
+                for choice in RingExclusionChoice::ALL {
+                    ui.selectable_value(&mut state.ring_exclusion, choice, choice.label());
+                }
+            });
+
+            if state.quantity == ProfileQuantity::J {
+                ui.checkbox(&mut state.show_ring_band, "Ring band").on_hover_text("Shade J_min..J_max across kept outer rings");
+            }
+
+            ui.checkbox(&mut state.fad_enabled, "API 579 FAD").on_hover_text("Evaluate API 579-1 / ASME FFS-1 Option 1 or Option 2 FAD");
+
+            if ui.button("Export CSV…").on_hover_text("Write crack-front profiles and FAD trajectory to RFC 4180 CSV (results.ffs)").clicked() {
+                export_params = Some(session_export_params.clone());
+            }
+        });
+
+        ui.add_space(4.0);
+
+        if let Some(report) = report_snapshot.as_ref() {
+            let eval_frames: Vec<&EvaluatedStep> = report.evaluated_steps.iter().filter(|e| e.frame_index.is_some()).collect();
+            if report.active_profiles.is_empty() && !eval_frames.is_empty() {
+                let cur_frame = report.active_frame.unwrap_or(0);
+                let nearest = eval_frames.iter().copied().min_by(|a, b| {
+                    let da = a.frame_index.unwrap_or(0).abs_diff(cur_frame);
+                    let db = b.frame_index.unwrap_or(0).abs_diff(cur_frame);
+                    da.cmp(&db).then_with(|| b.frame_index.unwrap_or(0).cmp(&a.frame_index.unwrap_or(0)))
+                });
+                let prev_eval = eval_frames.iter().rev().copied().find(|e| e.frame_index.is_some_and(|f| f < cur_frame));
+                let next_eval = eval_frames.iter().copied().find(|e| e.frame_index.is_some_and(|f| f > cur_frame));
+                egui::Frame::NONE
+                    .fill(t.field)
+                    .stroke(Stroke::new(1.0, t.border))
+                    .corner_radius(3.0)
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            let frame_desc = report.active_frame.map_or_else(|| "this state".into(), |f| format!("frame {f}"));
+                            ui.label(
+                                RichText::new(format!("No fracture domains evaluated on {frame_desc} (λ = {}).", number(report.active_load_factor)))
+                                    .small()
+                                    .color(t.warm),
+                            );
+                            if let Some(n) = nearest
+                                && let Some(fi) = n.frame_index
+                                && ui.small_button(format!("Jump to Inc {} (λ = {})", n.warp_step, number(n.load_factor))).clicked()
+                            {
+                                sync_frame = Some(fi);
+                            }
+                            if let Some(p) = prev_eval
+                                && nearest.is_none_or(|n| n.frame_index != p.frame_index)
+                                && let Some(fi) = p.frame_index
+                                && ui.small_button(format!("◀ Inc {}", p.warp_step)).clicked()
+                            {
+                                sync_frame = Some(fi);
+                            }
+                            if let Some(nx) = next_eval
+                                && nearest.is_none_or(|n| n.frame_index != nx.frame_index)
+                                && let Some(fi) = nx.frame_index
+                                && ui.small_button(format!("Inc {} ▶", nx.warp_step)).clicked()
+                            {
+                                sync_frame = Some(fi);
+                            }
+                        });
+                    });
+                ui.add_space(4.0);
+            }
+
+            let wide = ui.available_width() >= WIDE_SPLIT_MIN_WIDTH;
+            if wide && state.fad_enabled {
+                ui.columns(2, |cols| {
+                    if let Some((left, right)) = cols.split_first_mut() {
+                        draw_left_chart_pane(left, &mut state, report, plot, t, &mut clicked_station, &mut sync_frame);
+                        if let Some(right) = right.first_mut() {
+                            draw_fad_section(
+                                right,
+                                &mut state,
+                                report,
+                                defaults.as_ref(),
+                                &bc_sets,
+                                &plot.units,
+                                fad_incomplete,
+                                t,
+                                &mut clicked_station,
+                                &mut sync_frame,
+                            );
+                        }
+                    }
+                });
+            } else {
+                draw_left_chart_pane(ui, &mut state, report, plot, t, &mut clicked_station, &mut sync_frame);
+                if state.fad_enabled {
+                    ui.separator();
+                    draw_fad_section(
+                        ui,
+                        &mut state,
+                        report,
+                        defaults.as_ref(),
+                        &bc_sets,
+                        &plot.units,
+                        fad_incomplete,
+                        t,
+                        &mut clicked_station,
+                        &mut sync_frame,
+                    );
+                }
+            }
+
+            if !report.diagnostics.is_empty() {
+                ui.add_space(4.0);
+                for d in &report.diagnostics {
+                    let (prefix, color) = match d.severity {
+                        fieldcraft_engine::ffs::DiagnosticSeverity::Error => ("✖ ", t.error),
+                        fieldcraft_engine::ffs::DiagnosticSeverity::Warning => ("⚠ ", t.warm),
+                    };
+                    ui.add(egui::Label::new(RichText::new(format!("{prefix}{}", d.message)).small().color(color)).wrap());
+                }
             }
         }
 
-        if !report.diagnostics.is_empty() {
-            ui.add_space(4.0);
-            for d in &report.diagnostics {
-                let (prefix, color) = match d.severity {
-                    fieldcraft_engine::ffs::DiagnosticSeverity::Error => ("✖ ", t.error),
-                    fieldcraft_engine::ffs::DiagnosticSeverity::Warning => ("⚠ ", t.warm),
-                };
-                ui.add(egui::Label::new(RichText::new(format!("{prefix}{}", d.message)).small().color(color)).wrap());
-            }
+        if let Some(err) = &state.last_error {
+            ui.add_space(2.0);
+            ui.add(egui::Label::new(RichText::new(err).small().color(t.error)).wrap());
         }
-    }
-
-    if let Some(err) = &state.last_error {
-        ui.add_space(2.0);
-        ui.add(egui::Label::new(RichText::new(err).small().color(t.error)).wrap());
-    }
+    });
 
     app.ffs = Some(state);
 
@@ -838,6 +987,35 @@ pub fn show_contents(app: &mut ModelApp, plot: &Plot, ui: &mut egui::Ui, t: &Tok
     }
     if let Some(export) = export_params {
         app.export_csv_with("results.ffs", export);
+    }
+}
+
+fn draw_left_chart_pane(
+    ui: &mut egui::Ui,
+    state: &mut FfsState,
+    report: &FfsReport,
+    plot: &Plot,
+    t: &Tokens,
+    clicked_station: &mut Option<StationProfile>,
+    sync_frame: &mut Option<usize>,
+) {
+    let stress_state = report.active_profiles.iter().find_map(|p| p.interaction_stress_state);
+    ui.horizontal_wrapped(|ui| {
+        for tab in FfsChartTab::ALL {
+            ui.selectable_value(&mut state.chart_tab, tab, tab.label());
+        }
+        if let Some(st) = stress_state {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(stress_state_label(st)).small().color(t.text_dim));
+            });
+        }
+    });
+    ui.add_space(2.0);
+
+    match state.chart_tab {
+        FfsChartTab::FrontProfile => draw_profile_section(ui, state, report, plot, t, clicked_station),
+        FfsChartTab::RingConvergence => draw_ring_convergence_section(ui, state, report, plot, t),
+        FfsChartTab::LoadHistory => draw_load_history_section(ui, state, report, plot, t, sync_frame),
     }
 }
 
@@ -895,11 +1073,12 @@ fn draw_profile_section(
         .collect();
 
     if points.is_empty() {
-        ui.label(
-            RichText::new(format!("{} is unavailable for this solve (enable interaction_integral or switch quantity)", state.quantity.label()))
-                .small()
-                .color(t.text_dim),
-        );
+        let msg = if profiles.is_empty() {
+            "No fracture domains were evaluated on this frame; use the jump banner above or switch to Load History.".to_string()
+        } else {
+            format!("{} is unavailable for this solve (enable interaction_integral or switch quantity)", state.quantity.label())
+        };
+        ui.label(RichText::new(msg).small().color(t.text_dim));
         return;
     }
 
@@ -1040,11 +1219,23 @@ fn draw_profile_section(
         if let Some(ki) = p.k_i_mean {
             tip.push_str(&format!("\nK_I = {}", with_unit(number(ki), Some(k_unit.as_str()))));
         }
+        if let Some(kii) = p.k_ii_mean {
+            tip.push_str(&format!("\nK_II = {}", with_unit(number(kii), Some(k_unit.as_str()))));
+        }
+        if let Some(kiii) = p.k_iii_mean {
+            tip.push_str(&format!("\nK_III = {}", with_unit(number(kiii), Some(k_unit.as_str()))));
+        }
         if let Some(kj) = p.k_j_plane_strain {
             tip.push_str(&format!("\nK_J = {}", with_unit(number(kj), Some(k_unit.as_str()))));
         }
         if let Some(t11) = p.t_11_mean {
             tip.push_str(&format!("\nT_11 = {}", with_unit(number(t11), Some(plot.units.symbol(Quantity::Pressure)))));
+        }
+        if let Some(t33) = p.t_33_mean {
+            tip.push_str(&format!("\nT_33 = {}", with_unit(number(t33), Some(plot.units.symbol(Quantity::Pressure)))));
+        }
+        if let Some(st) = p.interaction_stress_state {
+            tip.push_str(&format!("\nStress state: {}", stress_state_label(st)));
         }
         tip.push_str("\nClick to focus in 3D");
         response.clone().on_hover_text(tip);
@@ -1088,8 +1279,349 @@ fn draw_profile_section(
             if plot.frame().is_some_and(|(k, _, n)| k + 1 < n) {
                 ui.label(RichText::new("(Node probe applies to final state)").small().color(t.text_dim));
             }
+            ui.label(RichText::new(LOCAL_AXIS_LEGEND).small().color(t.text_dim));
         });
     }
+}
+
+fn draw_ring_convergence_section(ui: &mut egui::Ui, state: &mut FfsState, report: &FfsReport, plot: &Plot, t: &Tokens) {
+    let profiles = &report.active_profiles;
+    if profiles.is_empty() {
+        ui.label(
+            RichText::new("No fracture domains were evaluated on this frame; use the jump banner above or switch to Load History.")
+                .small()
+                .color(t.text_dim),
+        );
+        return;
+    }
+
+    let j_unit = plot.units.symbol(Quantity::ForcePerLength);
+    let p_unit = plot.units.symbol(Quantity::Pressure);
+    let (_, k_unit) = k_scale_and_unit(&plot.units);
+
+    let sel_idx = state.selected_domain.as_deref().and_then(|id| profiles.iter().position(|p| p.domain_id == id)).unwrap_or(0);
+    let Some(prof) = profiles.get(sel_idx) else { return };
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Ring convergence").strong());
+        ui.label(RichText::new(format!("[{j_unit}]")).small().color(t.text_dim));
+        if profiles.len() > 1 {
+            let mut active_id = prof.domain_id.clone();
+            egui::ComboBox::from_id_salt("fc_ffs_ring_dom").selected_text(&active_id).width(104.0).show_ui(ui, |ui| {
+                for p in profiles {
+                    ui.selectable_value(&mut active_id, p.domain_id.clone(), &p.domain_id);
+                }
+            });
+            if active_id != prof.domain_id {
+                state.selected_domain = Some(active_id);
+            }
+        } else {
+            ui.label(RichText::new(&prof.domain_id).small().color(t.text_dim));
+        }
+        let spread_pct = if prof.ring_spread.is_finite() { format!("{:.1}%", prof.ring_spread * 100.0) } else { "—".into() };
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(format!("Spread: {} ({spread_pct})", spread_label(prof.spread_status)))
+                    .small()
+                    .color(spread_color(prof.spread_status, t)),
+            );
+        });
+    });
+
+    let ring_pts: Vec<(usize, &fieldcraft_engine::results::RingIntegral, f64, bool)> =
+        prof.rings.iter().enumerate().filter(|(_, r)| r.j.is_finite()).map(|(i, r)| (i, r, r.j, !prof.excluded_rings.contains(&r.ring))).collect();
+
+    if ring_pts.is_empty() {
+        ui.label(RichText::new("No per-ring domain integral values available for this station.").small().color(t.text_dim));
+        return;
+    }
+
+    let (outer, response) = ui.allocate_exact_size(vec2(ui.available_width().max(120.0), PLOT_HEIGHT + AXIS_BOTTOM), egui::Sense::hover());
+    let rect = Rect::from_min_max(outer.min + vec2(AXIS_LEFT, AXIS_TOP), outer.max - vec2(AXIS_RIGHT, AXIS_BOTTOM));
+    let painter = ui.painter_at(outer);
+    painter.rect_filled(rect, 3.0, t.field);
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+
+    let (mut x0, mut x1) = ring_pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(_, r, _, _)| {
+        let rx = r.ring as f64;
+        (a.min(rx), b.max(rx))
+    });
+    if !(x0 < x1) {
+        x0 -= 0.5;
+        x1 += 0.5;
+    } else {
+        x0 -= 0.25;
+        x1 += 0.25;
+    }
+
+    let (mut y0, mut y1) = ring_pts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(_, _, y, _)| (a.min(y), b.max(y)));
+    if prof.j_mean.is_finite() {
+        y0 = y0.min(prof.j_mean);
+        y1 = y1.max(prof.j_mean);
+    }
+    if !(y0 < y1) {
+        let pad = y0.abs().max(1.0) * 0.1;
+        y0 -= pad;
+        y1 += pad;
+    } else {
+        let pad = (y1 - y0) * 0.1;
+        y0 -= pad;
+        y1 += pad;
+    }
+
+    let map = |x: f64, y: f64| -> Pos2 {
+        let tx = ((x - x0) / (x1 - x0)).clamp(0.0, 1.0) as f32;
+        let ty = ((y - y0) / (y1 - y0)).clamp(0.0, 1.0) as f32;
+        pos2(rect.left() + tx * rect.width(), rect.bottom() - ty * rect.height())
+    };
+
+    let small = FontId::proportional(10.0);
+    let min_ring = ring_pts.first().map_or(1, |(_, r, _, _)| r.ring);
+    let max_ring = ring_pts.last().map_or(min_ring, |(_, r, _, _)| r.ring);
+    painter.text(pos2(rect.left() - 4.0, rect.top()), Align2::RIGHT_TOP, number(y1), small.clone(), t.text_dim);
+    painter.text(pos2(rect.left() - 4.0, rect.bottom()), Align2::RIGHT_BOTTOM, number(y0), small.clone(), t.text_dim);
+    painter.text(pos2(rect.left(), rect.bottom() + 2.0), Align2::LEFT_TOP, format!("Ring {min_ring}"), small.clone(), t.text_dim);
+    painter.text(pos2(rect.right(), rect.bottom() + 2.0), Align2::RIGHT_TOP, format!("Ring {max_ring}"), small, t.text_dim);
+
+    if state.show_ring_band && prof.j_min.is_finite() && prof.j_max.is_finite() {
+        let band_top = map(x0, prof.j_max).y;
+        let band_bot = map(x0, prof.j_min).y;
+        let band_rect = Rect::from_min_max(pos2(rect.left(), band_top.min(band_bot)), pos2(rect.right(), band_top.max(band_bot)));
+        painter.rect_filled(band_rect, 0.0, t.accent.gamma_multiply(0.14));
+    }
+
+    if prof.j_mean.is_finite() {
+        let ym = map(x0, prof.j_mean).y;
+        painter.line_segment([pos2(rect.left(), ym), pos2(rect.right(), ym)], Stroke::new(1.2, t.ok));
+    }
+
+    let screen_pts: Vec<(&fieldcraft_engine::results::RingIntegral, bool, Pos2)> =
+        ring_pts.iter().map(|&(_, r, j, kept)| (r, kept, map(r.ring as f64, j))).collect();
+    if screen_pts.len() >= 2 {
+        painter.add(egui::Shape::line(screen_pts.iter().map(|(_, _, p)| *p).collect(), Stroke::new(1.5, t.accent)));
+    }
+
+    let hovered_ring = response.hover_pos().filter(|p| rect.contains(*p)).and_then(|ptr| {
+        screen_pts
+            .iter()
+            .filter_map(|&(r, kept, pt)| {
+                let d = ptr.distance(pt);
+                (d <= HIT_RADIUS_PX * 1.8).then_some((r, kept, pt, d))
+            })
+            .min_by(|a, b| a.3.total_cmp(&b.3))
+    });
+
+    for &(r, kept, pt) in &screen_pts {
+        let is_hovered = hovered_ring.is_some_and(|(hr, _, _, _)| hr.ring == r.ring);
+        if kept {
+            painter.circle(pt, 4.0, t.accent, Stroke::new(1.0, t.overlay_text));
+        } else {
+            painter.circle(pt, 4.0, t.field, Stroke::new(1.6, t.text_dim));
+        }
+        if is_hovered {
+            painter.circle_stroke(pt, 6.5, Stroke::new(1.5, t.pick_hover));
+        }
+    }
+
+    if let Some((r, kept, pt, _)) = hovered_ring {
+        painter.line_segment([pos2(pt.x, rect.top()), pos2(pt.x, rect.bottom())], Stroke::new(1.0, t.border));
+        let tag = if kept { "kept" } else { "excluded" };
+        let mut tip = format!("Ring {} ({tag})\nJ = {}", r.ring, with_unit(number(r.j), Some(j_unit)));
+        if let Some(ki) = r.k_i {
+            tip.push_str(&format!("\nK_I = {}", with_unit(number(ki), Some(k_unit.as_str()))));
+        }
+        if let Some(kii) = r.k_ii {
+            tip.push_str(&format!("\nK_II = {}", with_unit(number(kii), Some(k_unit.as_str()))));
+        }
+        if let Some(kiii) = r.k_iii {
+            tip.push_str(&format!("\nK_III = {}", with_unit(number(kiii), Some(k_unit.as_str()))));
+        }
+        if let Some(t11) = r.t_11 {
+            tip.push_str(&format!("\nT_11 = {}", with_unit(number(t11), Some(p_unit))));
+        }
+        if let Some(t33) = r.t_33 {
+            tip.push_str(&format!("\nT_33 = {}", with_unit(number(t33), Some(p_unit))));
+        }
+        response.on_hover_text(tip);
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(format!(
+                "Station {}: ● kept ({}) · ○ excluded ({}) · J_mean = {}",
+                prof.domain_id,
+                prof.kept_rings,
+                prof.excluded_rings.len(),
+                with_unit(number(prof.j_mean), Some(j_unit))
+            ))
+            .small()
+            .color(t.text),
+        );
+        ui.label(RichText::new(LOCAL_AXIS_LEGEND).small().color(t.text_dim));
+    });
+}
+
+fn draw_load_history_section(ui: &mut egui::Ui, state: &FfsState, report: &FfsReport, plot: &Plot, t: &Tokens, sync_frame: &mut Option<usize>) {
+    let (_, k_unit) = k_scale_and_unit(&plot.units);
+    let y_unit = state.quantity.unit(&plot.units, &k_unit);
+    let j_unit = plot.units.symbol(Quantity::ForcePerLength);
+    let p_unit = plot.units.symbol(Quantity::Pressure);
+    let station_label = report.step_history_domain_id.as_deref().unwrap_or("—");
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{} vs. load factor ({station_label})", state.quantity.label())).strong());
+        ui.label(RichText::new(format!("[{y_unit}]")).small().color(t.text_dim));
+    });
+
+    let points: Vec<(&StepStationPoint, f64, f64)> = report
+        .step_history
+        .iter()
+        .filter_map(|pt| {
+            let y = state.quantity.history_value(pt)?;
+            (pt.load_factor.is_finite() && y.is_finite()).then_some((pt, pt.load_factor, y))
+        })
+        .collect();
+
+    if points.is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "{} load history is unavailable for this solve (switch quantity or enable interaction_integral).",
+                state.quantity.label()
+            ))
+            .small()
+            .color(t.text_dim),
+        );
+        return;
+    }
+
+    let (outer, response) = ui.allocate_exact_size(vec2(ui.available_width().max(120.0), PLOT_HEIGHT + AXIS_BOTTOM), egui::Sense::click());
+    let rect = Rect::from_min_max(outer.min + vec2(AXIS_LEFT, AXIS_TOP), outer.max - vec2(AXIS_RIGHT, AXIS_BOTTOM));
+    let painter = ui.painter_at(outer);
+    painter.rect_filled(rect, 3.0, t.field);
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+
+    let (mut x0, mut x1) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(_, x, _)| (a.min(x), b.max(x)));
+    if !(x0 < x1) {
+        x0 -= 0.5;
+        x1 += 0.5;
+    } else {
+        let pad = (x1 - x0) * 0.05;
+        x0 -= pad;
+        x1 += pad;
+    }
+
+    let (mut y0, mut y1) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(_, _, y)| (a.min(y), b.max(y)));
+    if !(y0 < y1) {
+        let pad = y0.abs().max(1.0) * 0.1;
+        y0 -= pad;
+        y1 += pad;
+    } else {
+        let pad = (y1 - y0) * 0.08;
+        y0 -= pad;
+        y1 += pad;
+    }
+
+    let map = |x: f64, y: f64| -> Pos2 {
+        let tx = ((x - x0) / (x1 - x0)).clamp(0.0, 1.0) as f32;
+        let ty = ((y - y0) / (y1 - y0)).clamp(0.0, 1.0) as f32;
+        pos2(rect.left() + tx * rect.width(), rect.bottom() - ty * rect.height())
+    };
+
+    let small = FontId::proportional(10.0);
+    painter.text(pos2(rect.left() - 4.0, rect.top()), Align2::RIGHT_TOP, number(y1), small.clone(), t.text_dim);
+    painter.text(pos2(rect.left() - 4.0, rect.bottom()), Align2::RIGHT_BOTTOM, number(y0), small.clone(), t.text_dim);
+    painter.text(pos2(rect.left(), rect.bottom() + 2.0), Align2::LEFT_TOP, number(x0), small.clone(), t.text_dim);
+    painter.text(pos2(rect.right(), rect.bottom() + 2.0), Align2::RIGHT_TOP, format!("{}  λ", number(x1)), small, t.text_dim);
+
+    if y0 < 0.0 && y1 > 0.0 {
+        let y_zero = map(x0, 0.0).y;
+        painter.line_segment([pos2(rect.left(), y_zero), pos2(rect.right(), y_zero)], Stroke::new(1.0, t.border));
+    }
+
+    let screen_pts: Vec<(&StepStationPoint, Pos2)> = points.iter().map(|&(pt, x, y)| (pt, map(x, y))).collect();
+    if screen_pts.len() >= 2 {
+        painter.add(egui::Shape::line(screen_pts.iter().map(|(_, p)| *p).collect(), Stroke::new(1.6, t.accent)));
+    }
+
+    let is_active_pt = |pt: &StepStationPoint| -> bool {
+        match report.active_frame {
+            Some(f) => pt.frame_index == Some(f),
+            None => pt.warp_step == report.active_warp_step,
+        }
+    };
+
+    let hovered_pt = response.hover_pos().filter(|p| rect.contains(*p)).and_then(|ptr| {
+        screen_pts
+            .iter()
+            .filter_map(|&(pt, pos)| {
+                let d = ptr.distance(pos);
+                (d <= HIT_RADIUS_PX * 1.8).then_some((pt, pos, d))
+            })
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+    });
+
+    for &(pt, pos) in &screen_pts {
+        let active = is_active_pt(pt);
+        let is_hovered = hovered_pt.is_some_and(|(hp, _, _)| hp.warp_step == pt.warp_step);
+        painter.circle(pos, if active { 5.0 } else { 3.5 }, t.accent, Stroke::new(1.0, t.overlay_text));
+        if is_hovered {
+            painter.circle_stroke(pos, 6.5, Stroke::new(1.5, t.pick_hover));
+        }
+        if active {
+            painter.circle_stroke(pos, 7.0, Stroke::new(2.0, t.pick_selected));
+        }
+    }
+
+    if let Some((pt, pos, _)) = hovered_pt {
+        painter.line_segment([pos2(pos.x, rect.top()), pos2(pos.x, rect.bottom())], Stroke::new(1.0, t.border));
+        let mut tip = format!("Inc {} (λ = {})\nJ = {}", pt.warp_step, number(pt.load_factor), with_unit(number(pt.j_mean), Some(j_unit)));
+        if let Some(ki) = pt.k_i_mean {
+            tip.push_str(&format!("\nK_I = {}", with_unit(number(ki), Some(k_unit.as_str()))));
+        }
+        if let Some(kii) = pt.k_ii_mean {
+            tip.push_str(&format!("\nK_II = {}", with_unit(number(kii), Some(k_unit.as_str()))));
+        }
+        if let Some(kiii) = pt.k_iii_mean {
+            tip.push_str(&format!("\nK_III = {}", with_unit(number(kiii), Some(k_unit.as_str()))));
+        }
+        if let Some(kj) = pt.k_j_plane_strain {
+            tip.push_str(&format!("\nK_J (pstrn) = {}", with_unit(number(kj), Some(k_unit.as_str()))));
+        }
+        if let Some(t11) = pt.t_11_mean {
+            tip.push_str(&format!("\nT_11 = {}", with_unit(number(t11), Some(p_unit))));
+        }
+        if let Some(t33) = pt.t_33_mean {
+            tip.push_str(&format!("\nT_33 = {}", with_unit(number(t33), Some(p_unit))));
+        }
+        if report.is_nonlinear && pt.frame_index.is_some() {
+            tip.push_str("\nClick to view increment");
+        }
+        response.clone().on_hover_text(tip);
+    }
+
+    if response.clicked()
+        && let Some(ptr) = response.interact_pointer_pos()
+    {
+        let hit = screen_pts
+            .iter()
+            .filter_map(|&(pt, pos)| {
+                let d = ptr.distance(pos);
+                (d <= HIT_RADIUS_PX * 1.8).then_some((pt, d))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(pt, _)| pt);
+        if let Some(pt) = hit
+            && report.is_nonlinear
+            && let Some(frame) = pt.frame_index
+        {
+            *sync_frame = Some(frame);
+        }
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(format!("Station {station_label} · {} evaluated increment(s)", report.step_history.len())).small().color(t.text));
+        ui.label(RichText::new(LOCAL_AXIS_LEGEND).small().color(t.text_dim));
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2075,5 +2607,336 @@ mod tests {
         app.run("file.new", json!({})).unwrap();
         app.model_changed();
         assert!(!app.ui.show_ffs && app.ffs.is_none());
+    }
+
+    fn build_sparse_mixed_mode_fracture_app(ring_start: usize) -> (ModelApp, u32, u32) {
+        use fieldcraft_geometry::sample::{Plate, plate_design};
+        let dir = scratch_dir("sparse-mixed");
+        let plate_path = dir.join("plate.solidcraft");
+        std::fs::write(&plate_path, plate_design(&Plate::default()).unwrap()).unwrap();
+        let mut s = Session::default();
+        s.execute("geometry.open", &json!({"path": plate_path.to_str().unwrap()})).unwrap();
+        s.run_script(&json!([
+            {"command": "model.units", "params": {"system": "mm-t-s-N-MPa"}},
+            {"command": "mesh.block", "params": {"body": "Body1", "kind": "hex8", "corners": [[0, 0, 0], [20, 0, 0], [20, 10, 0], [0, 10, 0], [0, 0, 10], [20, 0, 10], [20, 10, 10], [0, 10, 10]], "divisions": [2, 1, 1]}}
+        ]))
+        .unwrap();
+
+        let mut clamp = Vec::new();
+        let mut tip = Vec::new();
+        let mut front = Vec::new();
+        for (&label, n) in s.model.nodes() {
+            if n.xyz[0].abs() < 1e-6 {
+                clamp.push(label);
+            } else if (n.xyz[0] - 0.02).abs() < 1e-6 {
+                tip.push(label);
+            } else if (n.xyz[0] - 0.01).abs() < 1e-6 && n.xyz[2].abs() < 1e-6 {
+                front.push((n.xyz[1], label));
+            }
+        }
+        front.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let n_a = front[0].1;
+        let n_b = front[1].1;
+
+        s.run_script(&json!([
+            {"command": "model.set.create", "params": {"name": "all", "elements": [1, 2]}},
+            {"command": "model.set.create", "params": {"name": "fix", "nodes": clamp}},
+            {"command": "model.set.create", "params": {"name": "pull_face", "nodes": tip}},
+            {"command": "model.set.create", "params": {"name": "front", "nodes": [n_a, n_b]}},
+            {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": 210000, "poisson": 0.3}}},
+            {"command": "model.section.create", "params": {"name": "solid", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+            {"command": "model.boundary_condition.create", "params": {"name": "clamp", "type": "fixed", "target": {"set": "fix"}}},
+            {"command": "model.load.create", "params": {"name": "pull", "type": "force", "target": {"set": "pull_face"}, "vector": [20000, 0, 0]}},
+            {"command": "model.step.create", "params": {"name": "Pull", "procedure": {"type": "nonlinear_static", "nonlinear_geometry": false, "max_increments": 3}, "boundary_conditions": ["clamp"], "loads": ["pull"]}}
+        ]))
+        .unwrap();
+
+        let n_count = s.model.nodes().len();
+        let e_count = s.model.elements().len();
+        std::fs::write(dir.join("model.inp"), "! fieldcraft-units: mm-t-s-N-MPa\n").unwrap();
+        let row26 = vec!["0.0"; 26].join(" ");
+        for (tag, u_tip, rx) in [("0000001", 0.2, -2000.0), ("0000002", 0.5, -3500.0), ("0000003", 0.8, -5000.0)] {
+            let wnd = (1..=n_count)
+                .map(|lbl| if tip.contains(&(lbl as u32)) { format!("{u_tip} 0.0 0.0") } else { "0.0 0.0 0.0".into() })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let wnr = (1..=n_count)
+                .map(|lbl| if clamp.contains(&(lbl as u32)) { format!("{rx} 0.0 0.0") } else { "0.0 0.0 0.0".into() })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(dir.join(format!("wnd{tag}_text")), format!("#\n{wnd}\n")).unwrap();
+            std::fs::write(dir.join(format!("wnr{tag}_text")), format!("#\n{wnr}\n")).unwrap();
+            std::fs::write(dir.join(format!("wns{tag}_text")), format!("#\n{}", vec![row26.as_str(); n_count].join("\n"))).unwrap();
+            std::fs::write(dir.join(format!("wes{tag}_text")), format!("#\n{}", vec![row26.as_str(); e_count].join("\n"))).unwrap();
+        }
+
+        let r0 = ring_start;
+        let r1 = ring_start + 1;
+        let r2 = ring_start + 2;
+        let r3 = ring_start + 3;
+        let domain_block = |id: &str, step: usize, node: u32, j_base: f64, k_base: f64| -> String {
+            let (j0, j1, j2, j3) = (j_base * 0.80, j_base, j_base * 1.01, j_base * 1.02);
+            let (k0, k1, k2, k3) = (k_base * 0.80, k_base, k_base * 1.01, k_base * 1.02);
+            format!(
+                "\
+ loading: pull  step: {step}
+     Domain definition:  {id}
+
+        Number of front nodes:    1 Nodes on front:
+              {node}
+        Direction cosines:   0.000000  1.000000  0.000000
+        Tangent vector direction cosines:   0.000000  0.000000  1.000000
+        Front order:  1     Verify front: T Domain type:  4
+     ** end of domain definition **
+
+                         domain-integral post-processing
+                         -------------------------------
+ step:     {step}
+ domain id: {id}
+ area under q along front:        2.500000E+01
+
+                                             J-integral components
+                                          ===========================
+ domain        dm1          dm2          dm3          dm4          dm5          dm6          dm7          dm8       total J   killed ele
+    {r0}     {j0:.4E}   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {j0:.4E}   (  0)
+    {r1}     {j1:.4E}   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {j1:.4E}   (  0)
+    {r2}     {j2:.4E}   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {j2:.4E}   (  0)
+    {r3}     {j3:.4E}   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {j3:.4E}   (  0)
+
+    average:  {j1:.4E}   minimum:  {j0:.4E}   maximum: {j3:.4E}     ({id})
+
+               Static I-values
+                          -- KI = 1, KII = 0, KIII = 0, plane strain --
+ domain        II1          II2          II3          II4          II5          II6          II7          II8       total I     KI (pstrn) killed ele
+    {r0}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {k0:.4E}   (  0)
+    {r1}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {k1:.4E}   (  0)
+    {r2}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {k2:.4E}   (  0)
+    {r3}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {k3:.4E}   (  0)
+    average:  {k1:.4E}   minimum:  {k0:.4E}   maximum: {k3:.4E}     ({id})
+  {k1:.4E}  {k0:.4E}  {k3:.4E}
+
+                          -- KI = 0, KII = 1, KIII = 0, plane strain --
+ domain        II1          II2          II3          II4          II5          II6          II7          II8       total I     KII (pstrn) killed ele
+    {r0}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {:.4E}   (  0)
+    {r1}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {:.4E}   (  0)
+    {r2}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {:.4E}   (  0)
+    {r3}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {:.4E}   (  0)
+    average:  {:.4E}   minimum:  {:.4E}   maximum: {:.4E}     ({id})
+  {:.4E}  {:.4E}  {:.4E}
+
+                          -- KI = 0, KII = 0, KIII = 1 --
+ domain        II1          II2          II3          II4          II5          II6          II7          II8       total I     KIII        killed ele
+    {r0}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {:.4E}   (  0)
+    {r1}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {:.4E}   (  0)
+    {r2}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {:.4E}   (  0)
+    {r3}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   {:.4E}   (  0)
+    average:  {:.4E}   minimum:  {:.4E}   maximum: {:.4E}     ({id})
+  {:.4E}  {:.4E}  {:.4E}
+
+                          --T-stress (\"plane strain\" auxiliary fields)--
+ domain        II1          II2          II3          II4          II5          II6          II7          II8       total I     T11 (pstrn)      T33     killed ele
+    {r0}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00  -1.2000E+01  -3.5000E+00   (  0)
+    {r1}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00  -1.4000E+01  -4.0000E+00   (  0)
+    {r2}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00  -1.4200E+01  -4.1000E+00   (  0)
+    {r3}     0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00   0.0000E+00  -1.4400E+01  -4.2000E+00   (  0)
+    average:     minimum:     maximum:     ({id})
+ -1.4000E+01 -1.2000E+01 -1.4400E+01
+ -4.0000E+00 -3.5000E+00 -4.2000E+00
+",
+                k0 * 0.2,
+                k1 * 0.2,
+                k2 * 0.2,
+                k3 * 0.2,
+                k1 * 0.2,
+                k0 * 0.2,
+                k3 * 0.2,
+                k1 * 0.2,
+                k0 * 0.2,
+                k3 * 0.2,
+                k0 * 0.1,
+                k1 * 0.1,
+                k2 * 0.1,
+                k3 * 0.1,
+                k1 * 0.1,
+                k0 * 0.1,
+                k3 * 0.1,
+                k1 * 0.1,
+                k0 * 0.1,
+                k3 * 0.1,
+            )
+        };
+        // Step 1 and Step 3 evaluated; Step 2 intentionally omitted (sparse increment schedule).
+        let stdout = [
+            domain_block("cf_0001", 1, n_a, 5.0, 250.0),
+            domain_block("cf_0002", 1, n_b, 8.0, 320.0),
+            domain_block("cf_0001", 3, n_a, 15.0, 450.0),
+            domain_block("cf_0002", 3, n_b, 24.0, 580.0),
+        ]
+        .join("\n");
+        std::fs::write(dir.join("warp3d.out"), stdout).unwrap();
+        s.execute("results.read", &json!({"format": "warp3d", "step": "Pull", "path": dir.to_string_lossy()})).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut app = ModelApp::new(s);
+        app.run("results.deformed", json!({"step": "Pull", "show": true, "scale": 10.0})).unwrap();
+        (app, n_a, n_b)
+    }
+
+    #[test]
+    fn mixed_mode_tabs_ring_bounds_jump_banner_and_build_params() {
+        let (mut app, _, _) = build_sparse_mixed_mode_fracture_app(1);
+        app.open_ffs();
+        let ctx = egui::Context::default();
+        let t = Tokens::dark();
+
+        // 1. Mixed-mode ProfileQuantity (K_II, K_III, T_33), Plane strain badge, and local-axis legend render cleanly.
+        for q in [ProfileQuantity::Kii, ProfileQuantity::Kiii, ProfileQuantity::T33] {
+            app.ffs.as_mut().unwrap().quantity = q;
+            let plot = app.plot().unwrap();
+            let mut out = ctx.run_ui(
+                egui::RawInput { time: Some(1.0), screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 420.0))), ..Default::default() },
+                |ui| show_contents(&mut app, &plot, ui, &t),
+            );
+            out.textures_delta.clear();
+            let mut texts = Vec::new();
+            collect_texts(&out.shapes, &mut texts);
+            assert!(texts.iter().any(|s| s.contains(q.label())), "missing {} in {texts:?}", q.label());
+            assert!(texts.iter().any(|s| s == "Plane strain"), "missing Plane strain badge in {texts:?}");
+            assert!(texts.iter().any(|s| s.contains(LOCAL_AXIS_LEGEND)), "missing local axis legend in {texts:?}");
+            assert!(texts.iter().any(|s| s == "Rings 1–4"), "missing Rings 1–4 label in {texts:?}");
+        }
+
+        // 2. Ring Convergence tab renders kept & excluded rings and inspect_json reports chart_tab.
+        app.ffs.as_mut().unwrap().chart_tab = FfsChartTab::RingConvergence;
+        let plot = app.plot().unwrap();
+        let mut ring_out = ctx.run_ui(
+            egui::RawInput { time: Some(2.0), screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 420.0))), ..Default::default() },
+            |ui| show_contents(&mut app, &plot, ui, &t),
+        );
+        ring_out.textures_delta.clear();
+        let mut ring_texts = Vec::new();
+        collect_texts(&ring_out.shapes, &mut ring_texts);
+        assert!(ring_texts.iter().any(|s| s.contains("Ring convergence")), "{ring_texts:?}");
+        assert!(ring_texts.iter().any(|s| s.contains("● kept (3)") && s.contains("○ excluded (1)")), "{ring_texts:?}");
+        assert_eq!(app.ffs.as_ref().unwrap().inspect_json(true)["chart_tab"], "ring_convergence");
+
+        // 3. Load History tab renders across evaluated increments and clicking an earlier point syncs results.frame.
+        {
+            let ffs = app.ffs.as_mut().unwrap();
+            ffs.chart_tab = FfsChartTab::LoadHistory;
+            ffs.quantity = ProfileQuantity::Kii;
+            ffs.selected_domain = Some("cf_0002".into());
+        }
+        let mut hist_out = ctx.run_ui(
+            egui::RawInput { time: Some(3.0), screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 420.0))), ..Default::default() },
+            |ui| show_contents(&mut app, &plot, ui, &t),
+        );
+        hist_out.textures_delta.clear();
+        let mut hist_texts = Vec::new();
+        collect_texts(&hist_out.shapes, &mut hist_texts);
+        assert!(hist_texts.iter().any(|s| s.contains("2 evaluated increment(s)")), "{hist_texts:?}");
+        let mut hist_circles = Vec::new();
+        collect_circles(&hist_out.shapes, &mut hist_circles);
+        // Step 1 point has radius 3.5 (inactive while frame 3 is active); leftmost is Step 1.
+        let step1_dot = hist_circles
+            .iter()
+            .filter(|(_, r, _)| (*r - 3.5).abs() < 0.2)
+            .map(|(c, _, _)| *c)
+            .min_by(|a, b| a.x.total_cmp(&b.x))
+            .expect("step 1 load history dot");
+        let mut hist_click_out = ctx.run_ui(
+            egui::RawInput {
+                time: Some(4.0),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 420.0))),
+                events: vec![
+                    egui::Event::PointerMoved(step1_dot),
+                    egui::Event::PointerButton { pos: step1_dot, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                    egui::Event::PointerButton {
+                        pos: step1_dot,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| show_contents(&mut app, &plot, ui, &t),
+        );
+        hist_click_out.textures_delta.clear();
+        assert_eq!(app.plot().unwrap().frame().map(|(k, ..)| k), Some(1), "clicking Load History step 1 syncs results.frame");
+
+        // 4. Scrubbing to unevaluated frame 2 preserves selected_domain, renders jump banner, and jumping returns to an evaluated frame.
+        app.run("results.frame", json!({"step": "Pull", "frame": 2})).unwrap();
+        let plot_f2 = app.plot().unwrap();
+        let mut empty_out = ctx.run_ui(
+            egui::RawInput { time: Some(5.0), screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 420.0))), ..Default::default() },
+            |ui| show_contents(&mut app, &plot_f2, ui, &t),
+        );
+        empty_out.textures_delta.clear();
+        assert_eq!(app.ffs.as_ref().and_then(|f| f.selected_domain.as_deref()), Some("cf_0002"), "unevaluated frame preserves selected_domain");
+        let mut empty_texts = Vec::new();
+        collect_texts(&empty_out.shapes, &mut empty_texts);
+        let jump_label = empty_texts.iter().find(|s| s.starts_with("Jump to Inc ")).cloned().expect("jump banner button");
+        let jump_pos = find_button_center(&empty_out.shapes, &jump_label).expect("jump button center");
+        let mut jump_out = ctx.run_ui(
+            egui::RawInput {
+                time: Some(6.0),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 420.0))),
+                events: vec![
+                    egui::Event::PointerMoved(jump_pos),
+                    egui::Event::PointerButton { pos: jump_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                    egui::Event::PointerButton { pos: jump_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+                ],
+                ..Default::default()
+            },
+            |ui| show_contents(&mut app, &plot_f2, ui, &t),
+        );
+        jump_out.textures_delta.clear();
+        assert_ne!(app.plot().unwrap().frame().map(|(k, ..)| k), Some(2), "jump banner switches away from unevaluated frame 2");
+
+        // 5. build_params omits top-level domain_id only when complete FAD already sets station_mode: domain_id.
+        let mut st = FfsState { selected_domain: Some("cf_0002".into()), ..Default::default() };
+        let (p_no_fad, _) = st.build_params("Pull", None, &plot.units, true);
+        assert_eq!(p_no_fad["domain_id"], "cf_0002");
+
+        st.fad_enabled = true;
+        st.station_mode = StationModeChoice::SelectedStation;
+        st.sigma_ref_full_si = Some(200.0e6);
+        st.k_mat_si = Some(80.0e6);
+        let (p_fad_sel, inc) = st.build_params("Pull", None, &plot.units, true);
+        assert!(!inc);
+        assert!(p_fad_sel.get("domain_id").is_none(), "must omit top-level domain_id when fad sets station_mode=domain_id");
+        assert_eq!(p_fad_sel["fad"]["station_mode"], "domain_id");
+        assert_eq!(p_fad_sel["fad"]["domain_id"], "cf_0002");
+
+        // 6. When ring_start > 1 (rings 5..=8), Exclude Ring 1 is disabled and Rings 5–8 is displayed.
+        let (mut app_outer, _, _) = build_sparse_mixed_mode_fracture_app(5);
+        app_outer.open_ffs();
+        let plot_outer = app_outer.plot().unwrap();
+        let mut outer_out = ctx.run_ui(
+            egui::RawInput { time: Some(7.0), screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 420.0))), ..Default::default() },
+            |ui| show_contents(&mut app_outer, &plot_outer, ui, &t),
+        );
+        outer_out.textures_delta.clear();
+        let mut outer_texts = Vec::new();
+        collect_texts(&outer_out.shapes, &mut outer_texts);
+        assert!(outer_texts.iter().any(|s| s == "Rings 5–8"), "{outer_texts:?}");
+        // Try clicking "Exclude Ring 1" — since it's disabled, ring_exclusion stays Auto!
+        let ex_pos = find_button_center(&outer_out.shapes, "Exclude Ring 1").expect("Exclude Ring 1 label");
+        let mut ex_click = ctx.run_ui(
+            egui::RawInput {
+                time: Some(8.0),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 420.0))),
+                events: vec![
+                    egui::Event::PointerMoved(ex_pos),
+                    egui::Event::PointerButton { pos: ex_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                    egui::Event::PointerButton { pos: ex_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+                ],
+                ..Default::default()
+            },
+            |ui| show_contents(&mut app_outer, &plot_outer, ui, &t),
+        );
+        ex_click.textures_delta.clear();
+        assert_eq!(app_outer.ffs.as_ref().unwrap().ring_exclusion, RingExclusionChoice::Auto);
     }
 }
