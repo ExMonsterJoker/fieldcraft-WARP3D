@@ -9,7 +9,7 @@ use crate::{CommandKind, CommandSpec, EngineError, Result, Session};
 pub const CHECK: CommandSpec = CommandSpec {
     id: "warp3d.check",
     label: "Check WARP3D Model",
-    params: r#"{"step"?: "Step-1", "crack_front"?: {"set": "crack_front", "normal"?: [0, 1, 0], "symmetric"?: true, "rings"?: 4, "interaction_integral"?: true, "function_type"?: "pointwise"}, "crack_face"?: "crack_face"}"#,
+    params: r#"{"step"?: "Step-1", "crack_front"?: {"set": "crack_front", "normal"?: [0, 1, 0], "symmetric"?: true, "ring_start"?: 1, "rings"?: 4, "interaction_integral"?: true, "interaction_stress_state"?: "plane_strain", "function_type"?: "pointwise", "increment_interval"?: 2}, "crack_face"?: "crack_face"}"#,
     form: Some(forms::WARP3D_CHECK),
     kind: CommandKind::Session,
     requires: &[],

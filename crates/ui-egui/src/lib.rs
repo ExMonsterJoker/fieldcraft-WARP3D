@@ -403,60 +403,31 @@ type RelaxPreview = (Option<(u64, String)>, Option<Arc<fieldcraft_engine::cmd::R
 type FluidNote = (Option<(u64, String)>, Option<(String, Option<String>)>);
 /// Cached in-session WARP3D crack-front settings (not written to `.fieldcraft` or `prefs.json`).
 #[derive(Clone, Debug, PartialEq)]
-struct CachedCrackFront {
-    set: String,
-    normal: Option<[f64; 3]>,
-    symmetric: Option<bool>,
-    rings: Option<usize>,
-    interaction_integral: Option<bool>,
-    every_step: Option<bool>,
-    function_type: String,
-}
+struct CachedCrackFront(serde_json::Map<String, Value>);
 
 impl CachedCrackFront {
     fn from_json(v: &Value) -> Option<Self> {
-        let obj = v.as_object()?;
-        let set = obj.get("set").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?.to_string();
-        let normal = match obj.get("normal") {
-            Some(Value::Array(arr)) if arr.len() == 3 => {
-                let x = arr.first().and_then(Value::as_f64).filter(|n| n.is_finite())?;
-                let y = arr.get(1).and_then(Value::as_f64).filter(|n| n.is_finite())?;
-                let z = arr.get(2).and_then(Value::as_f64).filter(|n| n.is_finite())?;
-                Some([x, y, z])
-            }
-            _ => None,
+        let Value::Object(map) = fieldcraft_engine::canonicalize_crack_front(v)? else {
+            return None;
         };
-        let symmetric = obj.get("symmetric").and_then(Value::as_bool);
-        let rings = obj.get("rings").and_then(Value::as_u64).and_then(|r| usize::try_from(r).ok()).filter(|r| (1..=20).contains(r));
-        let interaction_integral = obj.get("interaction_integral").and_then(Value::as_bool);
-        let every_step = obj.get("every_step").and_then(Value::as_bool);
-        let function_type = match obj.get("function_type").and_then(Value::as_str) {
-            Some("front_average") => "front_average".to_string(),
-            _ => "pointwise".to_string(),
-        };
-        Some(Self { set, normal, symmetric, rings, interaction_integral, every_step, function_type })
+        Some(Self(map))
     }
 
     fn to_json(&self) -> Value {
-        let mut obj = serde_json::Map::new();
-        obj.insert("set".into(), json!(self.set));
-        if let Some(n) = self.normal {
-            obj.insert("normal".into(), json!(n));
-        }
-        if let Some(sym) = self.symmetric {
-            obj.insert("symmetric".into(), json!(sym));
-        }
-        if let Some(r) = self.rings {
-            obj.insert("rings".into(), json!(r));
-        }
-        if let Some(ii) = self.interaction_integral {
-            obj.insert("interaction_integral".into(), json!(ii));
-        }
-        if let Some(es) = self.every_step {
-            obj.insert("every_step".into(), json!(es));
-        }
-        obj.insert("function_type".into(), json!(self.function_type));
-        Value::Object(obj)
+        Value::Object(self.0.clone())
+    }
+
+    fn set(&self) -> &str {
+        self.0.get("set").and_then(Value::as_str).unwrap_or("")
+    }
+
+    fn set_name(&mut self, name: &str) {
+        self.0.insert("set".into(), Value::String(name.to_string()));
+    }
+
+    #[cfg(test)]
+    fn field(&self, key: &str) -> Option<&Value> {
+        self.0.get(key)
     }
 }
 
@@ -1625,16 +1596,16 @@ impl ModelApp {
     /// Return the in-session `crack_front` parameters if valid against current model sets.
     pub(crate) fn valid_crack_front_json(&self) -> Option<Value> {
         let cf = self.active_crack_front.as_ref()?;
-        self.session.model.set(&cf.set).is_some().then(|| cf.to_json())
+        self.session.model.set(cf.set()).is_some().then(|| cf.to_json())
     }
 
     fn sync_warp3d_crack_front(&mut self, id: &str, params: &Value, v: &Value) {
         if id == "model.rename"
             && v["kind"].as_str() == Some("set")
             && let (Some(from), Some(to), Some(cf)) = (v["from"].as_str(), v["name"].as_str(), &mut self.active_crack_front)
-            && cf.set == from
+            && cf.set() == from
         {
-            cf.set = to.to_string();
+            cf.set_name(to);
             return;
         }
         let is_export_or_solve = match id {
@@ -1645,7 +1616,7 @@ impl ModelApp {
             "warp3d.check" => {
                 if let Some(raw) = params.get("crack_front").filter(|val| !val.is_null())
                     && let Some(cf) = CachedCrackFront::from_json(raw)
-                    && self.session.model.set(&cf.set).is_some()
+                    && self.session.model.set(cf.set()).is_some()
                 {
                     self.active_crack_front = Some(cf);
                 }
@@ -1658,7 +1629,7 @@ impl ModelApp {
                 .get("crack_front")
                 .filter(|val| !val.is_null())
                 .and_then(CachedCrackFront::from_json)
-                .filter(|cf| self.session.model.set(&cf.set).is_some());
+                .filter(|cf| self.session.model.set(cf.set()).is_some());
         }
     }
 
@@ -4735,7 +4706,10 @@ mod tests {
 
         // Valid set caches in session, survives rename past early-return branch, and clears on crack-free export.
         app.run("warp3d.check", json!({"crack_front": {"set": "cf_old", "rings": 6, "symmetric": true}})).unwrap();
-        assert_eq!(app.active_crack_front.as_ref().map(|c| c.set.as_str()), Some("cf_old"));
+        assert_eq!(app.active_crack_front.as_ref().map(CachedCrackFront::set), Some("cf_old"));
+
+        // Unknown keys are rejected cleanly by canonicalize_crack_front delegation.
+        assert!(CachedCrackFront::from_json(&json!({"set": "cf_old", "bogus_key": 1})).is_none());
 
         // `every_step` survives CachedCrackFront round-trip on WARP3D deck.write / solve forms.
         app.active_crack_front = CachedCrackFront::from_json(&json!({
@@ -4745,10 +4719,10 @@ mod tests {
             "every_step": true,
             "function_type": "pointwise"
         }));
-        assert_eq!(app.active_crack_front.as_ref().and_then(|c| c.every_step), Some(true));
+        assert_eq!(app.active_crack_front.as_ref().and_then(|c| c.field("every_step")).and_then(Value::as_bool), Some(true));
 
         app.run("model.rename", json!({"kind": "set", "from": "cf_old", "to": "cf_new"})).unwrap();
-        assert_eq!(app.active_crack_front.as_ref().map(|c| c.set.as_str()), Some("cf_new"));
+        assert_eq!(app.active_crack_front.as_ref().map(CachedCrackFront::set), Some("cf_new"));
 
         // Prefill gated strictly on WARP3D forms/backends; never prefill crack_face or non-WARP3D.
         app.open_form("warp3d.check", json!({}));
@@ -4756,6 +4730,29 @@ mod tests {
         assert_eq!(check_params["crack_front"]["set"], "cf_new");
         assert_eq!(check_params["crack_front"]["every_step"], true);
         assert!(check_params.get("crack_face").is_none_or(Value::is_null));
+
+        // PR 2 additive fields survive CachedCrackFront, rename, and WARP3D form prefill.
+        app.active_crack_front = CachedCrackFront::from_json(&json!({
+            "set": "cf_new",
+            "ring_start": 2,
+            "rings": 32,
+            "interaction_integral": true,
+            "interaction_stress_state": "plane_stress",
+            "increment_interval": 5,
+            "function_type": "pointwise"
+        }));
+        let cached = app.active_crack_front.as_ref().expect("PR 2 crack_front fields must canonicalize");
+        assert_eq!(cached.field("ring_start"), Some(&json!(2)));
+        assert_eq!(cached.field("rings"), Some(&json!(32)));
+        assert_eq!(cached.field("interaction_stress_state"), Some(&json!("plane_stress")));
+        assert_eq!(cached.field("increment_interval"), Some(&json!(5)));
+
+        app.open_form("warp3d.check", json!({}));
+        let check_pr2: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();
+        assert_eq!(check_pr2["crack_front"]["ring_start"], 2);
+        assert_eq!(check_pr2["crack_front"]["rings"], 32);
+        assert_eq!(check_pr2["crack_front"]["interaction_stress_state"], "plane_stress");
+        assert_eq!(check_pr2["crack_front"]["increment_interval"], 5);
 
         app.open_form("deck.write", json!({"format": "warp3d"}));
         let dw_warp: Value = serde_json::from_str(&app.dialog.as_ref().unwrap().text).unwrap();

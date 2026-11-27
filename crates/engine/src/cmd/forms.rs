@@ -2746,20 +2746,25 @@ pub const SAMPLE: &[Field] = &[choice(
 pub const COUNT: &[Field] = &[int("count", "Count", 1, 1_000_000).help("How many steps.").def("1")];
 
 pub const CRACK_FRONT: &[Field] = &[
-    reference("set", "Crack front set", C::Set).req().help("Ordered or unordered node set lying along the 3D Hex8/Hex20 crack front."),
+    reference("set", "Crack front set", C::Set).req().help("Ordered or unordered node set lying along the 3D Hex8/Hex20/Wedge6 crack front."),
     xyz("normal", "Crack plane normal", D::None)
         .help("Unit or non-zero vector normal to the crack plane (x2); inferred from an active symmetry BC on the front when omitted.")
         .hint("from symmetry BC"),
     flag("symmetric", "Half symmetry")
         .help("True when only half the crack geometry is modeled across a symmetry plane; defaults to true when inferred from a symmetry BC."),
-    int("rings", "Domain rings", 1, 20).def("4").help("Number of automatic q-function rings for domain integral evaluation (1 to 20)."),
-    flag("interaction_integral", "Interaction integrals")
-        .help("Also emit `plane strain output for interaction integral` and `compute domain interaction integral` for K_I, K_II, K_III, T11, T33."),
+    int("ring_start", "First ring", 1, 64).def("1").help("First automatic q-function ring index (1 to rings)."),
+    int("rings", "Domain rings", 1, 64).def("4").help("Outer automatic q-function ring index (1 to 64)."),
+    flag("interaction_integral", "Interaction integrals").help(
+        "Also emit plane strain / plane stress interaction integral output and `compute domain interaction integral` for K_I, K_II, K_III, T11, T33.",
+    ),
+    choice("interaction_stress_state", "Interaction stress state", &[("plane_strain", "Plane strain"), ("plane_stress", "Plane stress")])
+        .hint("plane_strain")
+        .help("Stress state emitted for interaction integral output (requires interaction_integral: true)."),
     choice("function_type", "q-function type", &[("pointwise", "Pointwise (types a/b/c per station)"), ("front_average", "Front average (type d)")])
         .def("\"pointwise\"")
         .help("Virtual crack extension q-function along the front."),
-    flag("every_step", "Every increment")
-        .help("Emit WARP3D domain integral commands inside every nonlinear increment instead of only after the loading block."),
+    int("increment_interval", "Evaluate every N increments", 1, 10_000)
+        .help("Evaluate domain integrals at increment 1, every Nth increment, and the final increment (omitted: final increment only)."),
 ];
 
 pub const DECK: &[Field] = &[
@@ -3881,5 +3886,31 @@ mod tests {
     fn image_form_types_its_size() {
         assert!(matches!(field_of("view.image.save", "size").kind, Kind::Tuple { min_len: 2, whole: true, .. }));
         assert!(matches!(field_of("view.image.save", "path").kind, Kind::Path { mode: PathMode::SaveFile }));
+    }
+
+    #[test]
+    fn crack_front_form_prefill_omits_stress_state_and_parses() {
+        assert!(CRACK_FRONT.iter().all(|f| !matches!(f.kind, Kind::Group(_))));
+        let keys: Vec<&str> = CRACK_FRONT.iter().map(|f| f.key).collect();
+        assert!(keys.contains(&"ring_start"));
+        assert!(keys.contains(&"rings"));
+        assert!(keys.contains(&"interaction_stress_state"));
+        assert!(keys.contains(&"increment_interval"));
+        assert!(!keys.contains(&"every_step"));
+
+        let rings_field = CRACK_FRONT.iter().find(|f| f.key == "rings").unwrap();
+        assert!(matches!(rings_field.kind, Kind::Integer { min: 1, max: 64 }));
+
+        let prefilled = crate::schema::prefill(CRACK_FRONT, &json!({"set": "front"}));
+        assert!(prefilled.get("interaction_stress_state").is_none());
+        assert!(prefilled.get("increment_interval").is_none());
+        assert_eq!(prefilled["ring_start"], 1);
+        assert_eq!(prefilled["rings"], 4);
+
+        let canonical = crate::canonicalize_crack_front(&prefilled).expect("prefilled CRACK_FRONT must canonicalize cleanly");
+        assert_eq!(canonical["set"], "front");
+        assert_eq!(canonical["ring_start"], 1);
+        assert_eq!(canonical["rings"], 4);
+        assert!(canonical.get("interaction_stress_state").is_none());
     }
 }

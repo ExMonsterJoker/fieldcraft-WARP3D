@@ -3782,15 +3782,11 @@ elements
         let mut app = ModelApp::new(Session::default());
         let custom = PathBuf::from("/opt/custom/warp3d");
         app.session.warp3d_bin = Some(custom.clone());
-        app.active_crack_front = Some(crate::CachedCrackFront {
-            set: "cf".into(),
-            normal: None,
-            symmetric: None,
-            rings: Some(4),
-            interaction_integral: None,
-            every_step: None,
-            function_type: "pointwise".into(),
-        });
+        app.active_crack_front = crate::CachedCrackFront::from_json(&json!({
+            "set": "cf",
+            "rings": 4,
+            "function_type": "pointwise"
+        }));
 
         let next = Box::new(Session::default());
         let prebuilt = Box::new(Prebuilt::of(&next, &None));
@@ -3906,9 +3902,9 @@ elements
         });
         app.poll_loading();
         let cf = app.active_crack_front.as_ref().expect("async WARP3D solve caches active_crack_front");
-        assert_eq!(cf.set, "cf");
-        assert_eq!(cf.rings, Some(6));
-        assert_eq!(cf.function_type, "front_average");
+        assert_eq!(cf.set(), "cf");
+        assert_eq!(cf.field("rings"), Some(&json!(6)));
+        assert_eq!(cf.field("function_type"), Some(&json!("front_average")));
     }
 
     #[test]
@@ -3917,15 +3913,12 @@ elements
         app.run("mesh.node.add", json!({"label": 1, "xyz": [0, 0, 0]})).unwrap();
         app.run("model.set.create", json!({"name": "front", "nodes": [1]})).unwrap();
         app.services.pick_save = Some(Box::new(|_, _| Some("/tmp/should_not_bypass.inp".into())));
-        app.active_crack_front = Some(crate::CachedCrackFront {
-            set: "front".into(),
-            normal: None,
-            symmetric: Some(true),
-            rings: Some(5),
-            interaction_integral: None,
-            every_step: None,
-            function_type: "pointwise".into(),
-        });
+        app.active_crack_front = crate::CachedCrackFront::from_json(&json!({
+            "set": "front",
+            "symmetric": true,
+            "rings": 5,
+            "function_type": "pointwise"
+        }));
 
         let ctx = egui::Context::default();
         let mut out = ctx.run_ui(
