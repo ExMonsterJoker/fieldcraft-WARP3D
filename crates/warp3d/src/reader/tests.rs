@@ -724,7 +724,7 @@ stop
     let imported = read_limited("wedge.inp", collapsed_deck.as_bytes(), None, Preset::MKgS, ReadLimits::default()).unwrap();
     let elem = imported.model.element(1).unwrap();
     assert_eq!(elem.kind, ElementKind::Wedge6);
-    assert_eq!(elem.nodes, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(elem.nodes, vec![2, 3, 1, 5, 6, 4]);
     assert!(imported.warnings.iter().any(|w| w.contains("wedge6")));
     let p_faces: std::collections::BTreeMap<u8, f64> = imported
         .model
@@ -735,8 +735,8 @@ stop
             _ => None,
         })
         .collect();
-    assert_eq!(p_faces.get(&3), Some(&10.0));
-    assert_eq!(p_faces.get(&4), Some(&20.0));
+    assert_eq!(p_faces.get(&5), Some(&10.0));
+    assert_eq!(p_faces.get(&3), Some(&20.0));
 
     // 3. Loading the collapsed crease face (hex face 6 = nodes {1, 4}) rejects with Parse.
     let bad_face = format!(

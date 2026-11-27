@@ -919,34 +919,38 @@ fn build_constraints(
 
 /// Collapse a degenerate 8-node `l3disop` hex into a right-handed 6-node `Wedge6` when one quad
 /// side has collapsed to two opposite edges (`a == b && c == d`) leaving 6 distinct vertices.
+///
+/// Every collapse pattern is cyclically canonicalized so the collapsed edge always lands on
+/// `(w2, w5)` (`candidate[2]` and `candidate[5]`), keeping round-trip `l3disop` exports aligned
+/// even when no crack-front node set is specified.
 fn collapse_hex8_to_wedge6(nodes: &[u32]) -> Option<([u32; 8], [u32; 6])> {
     let [h0, h1, h2, h3, h4, h5, h6, h7] =
         [*nodes.first()?, *nodes.get(1)?, *nodes.get(2)?, *nodes.get(3)?, *nodes.get(4)?, *nodes.get(5)?, *nodes.get(6)?, *nodes.get(7)?];
     let hex_orig = [h0, h1, h2, h3, h4, h5, h6, h7];
     let candidate = if h0 == h3 && h4 == h7 {
-        [h0, h1, h2, h4, h5, h6]
+        [h1, h2, h0, h5, h6, h4]
     } else if h1 == h2 && h5 == h6 {
-        [h0, h1, h3, h4, h5, h7]
+        [h3, h0, h1, h7, h4, h5]
     } else if h0 == h1 && h4 == h5 {
-        [h0, h2, h3, h4, h6, h7]
+        [h2, h3, h0, h6, h7, h4]
     } else if h2 == h3 && h6 == h7 {
         [h0, h1, h2, h4, h5, h6]
     } else if h0 == h4 && h1 == h5 {
-        [h0, h3, h7, h1, h2, h6]
+        [h3, h7, h0, h2, h6, h1]
     } else if h2 == h6 && h3 == h7 {
-        [h0, h3, h4, h1, h2, h5]
+        [h4, h0, h3, h5, h1, h2]
     } else if h0 == h4 && h3 == h7 {
-        [h0, h5, h1, h3, h6, h2]
+        [h5, h1, h0, h6, h2, h3]
     } else if h1 == h5 && h2 == h6 {
         [h0, h4, h1, h3, h7, h2]
     } else if h0 == h3 && h1 == h2 {
-        [h0, h7, h4, h1, h6, h5]
+        [h7, h4, h0, h6, h5, h1]
     } else if h4 == h7 && h5 == h6 {
         [h0, h3, h4, h1, h2, h5]
     } else if h0 == h1 && h3 == h2 {
-        [h0, h4, h5, h3, h7, h6]
+        [h4, h5, h0, h7, h6, h3]
     } else if h4 == h5 && h7 == h6 {
-        [h0, h4, h1, h3, h7, h2]
+        [h1, h0, h4, h2, h3, h7]
     } else {
         return None;
     };
@@ -1201,4 +1205,79 @@ fn build_loads(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn signed_tet_vol(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3]) -> f64 {
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let ad = [d[0] - a[0], d[1] - a[1], d[2] - a[2]];
+        let cross = [ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]];
+        cross[0] * ad[0] + cross[1] * ad[1] + cross[2] * ad[2]
+    }
+
+    #[test]
+    fn collapse_hex8_to_wedge6_canonicalizes_all_12_patterns_onto_w2_w5_with_positive_jacobian() {
+        let hex_coords =
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0]];
+
+        // All 12 opposite-edge collapse pairs: ((a0, b0), (a1, b1)) where a0==b0 and a1==b1.
+        let patterns: [((usize, usize), (usize, usize)); 12] = [
+            ((0, 3), (4, 7)),
+            ((1, 2), (5, 6)),
+            ((0, 1), (4, 5)),
+            ((2, 3), (6, 7)),
+            ((0, 4), (1, 5)),
+            ((3, 7), (2, 6)),
+            ((0, 4), (3, 7)),
+            ((1, 5), (2, 6)),
+            ((0, 3), (1, 2)),
+            ((4, 7), (5, 6)),
+            ((0, 1), (3, 2)),
+            ((4, 5), (7, 6)),
+        ];
+
+        for ((a0, b0), (a1, b1)) in patterns {
+            let mut coords: BTreeMap<u32, [f64; 3]> = BTreeMap::new();
+            let mut inc = [0u32; 8];
+            let mut next_id = 1u32;
+            let mid = |u: usize, v: usize| [0, 1, 2].map(|k| 0.5 * (hex_coords[u][k] + hex_coords[v][k]));
+            let id_c0 = next_id;
+            next_id += 1;
+            coords.insert(id_c0, mid(a0, b0));
+            let id_c1 = next_id;
+            next_id += 1;
+            coords.insert(id_c1, mid(a1, b1));
+
+            for i in 0..8 {
+                if i == a0 || i == b0 {
+                    inc[i] = id_c0;
+                } else if i == a1 || i == b1 {
+                    inc[i] = id_c1;
+                } else {
+                    let id = next_id;
+                    next_id += 1;
+                    coords.insert(id, hex_coords[i]);
+                    inc[i] = id;
+                }
+            }
+
+            let (_, wedge) = collapse_hex8_to_wedge6(&inc).expect("pattern should collapse to wedge6");
+            // Collapsed edge must land on canonical (w2, w5).
+            assert_eq!((wedge[2], wedge[5]), (id_c0, id_c1), "pattern (({a0},{b0}),({a1},{b1})) -> {wedge:?}");
+
+            // Right-handed positive Jacobian at both triangular end caps.
+            let p: Vec<[f64; 3]> = wedge.iter().map(|id| coords[id]).collect();
+            assert!(signed_tet_vol(p[0], p[1], p[2], p[3]) > 0.0, "negative Jacobian at base for {wedge:?}");
+            assert!(signed_tet_vol(p[3], p[5], p[4], p[0]) > 0.0, "negative Jacobian at top for {wedge:?}");
+
+            // Default rot=0 expansion puts the canonical collapsed edge back onto (h2==h3, h6==h7).
+            let expanded = crate::wedge6::expand_wedge6_to_l3disop(&wedge, 0).unwrap();
+            assert_eq!((expanded[2], expanded[3], expanded[6], expanded[7]), (id_c0, id_c0, id_c1, id_c1));
+        }
+    }
 }

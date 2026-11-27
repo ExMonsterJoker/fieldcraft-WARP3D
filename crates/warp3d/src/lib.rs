@@ -21,6 +21,7 @@ pub mod fracture;
 pub mod reader;
 pub mod results;
 pub mod runner;
+pub(crate) mod wedge6;
 
 use std::collections::BTreeMap;
 
@@ -92,10 +93,11 @@ pub struct LabelMap {
 fn kind_rank(kind: ElementKind) -> u8 {
     match kind {
         ElementKind::Hex8 => 0,
-        ElementKind::Hex20 => 1,
-        ElementKind::Tet4 => 2,
-        ElementKind::Tet10 => 3,
-        _ => 4,
+        ElementKind::Wedge6 => 1,
+        ElementKind::Hex20 => 2,
+        ElementKind::Tet4 => 3,
+        ElementKind::Tet10 => 4,
+        _ => 5,
     }
 }
 
@@ -302,15 +304,24 @@ mod tests {
         model.set_element(30, ElementKind::Hex8, h_nodes.clone()).unwrap();
         model.set_element(20, ElementKind::Tet4, vec![5, 7, 10, 42]).unwrap();
         model.set_element(10, ElementKind::Hex8, h_nodes).unwrap();
+        model.set_element(25, ElementKind::Wedge6, vec![5, 7, 10, 42, 60, 88]).unwrap();
+        model.add_set("s_wedge", Set { elements: vec![25], ..Set::default() }).unwrap();
+        model
+            .add_section(
+                "sec_w",
+                Section { set: "s_wedge".into(), material: "Steel".into(), kind: SectionKind::Solid {}, formulation: Default::default() },
+            )
+            .unwrap();
 
         let map = LabelMap::from_model(&model);
         assert_eq!(map.warp_node_to_fc, vec![5, 7, 10, 12, 42, 60, 88, 100, 101, 102, 103, 104]);
         assert_eq!(map.fc_node_to_warp.get(&5), Some(&1));
         assert_eq!(map.fc_node_to_warp.get(&104), Some(&12));
-        // Hex8 sec_a (10), Hex8 sec_b (30), Tet4 sec_t (20).
-        assert_eq!(map.warp_elem_to_fc, vec![10, 30, 20]);
+        // Hex8 sec_a (10), Hex8 sec_b (30), Wedge6 sec_w (25), Tet4 sec_t (20).
+        assert_eq!(map.warp_elem_to_fc, vec![10, 30, 25, 20]);
         assert_eq!(map.fc_elem_to_warp.get(&10), Some(&1));
         assert_eq!(map.fc_elem_to_warp.get(&30), Some(&2));
-        assert_eq!(map.fc_elem_to_warp.get(&20), Some(&3));
+        assert_eq!(map.fc_elem_to_warp.get(&25), Some(&3));
+        assert_eq!(map.fc_elem_to_warp.get(&20), Some(&4));
     }
 }
